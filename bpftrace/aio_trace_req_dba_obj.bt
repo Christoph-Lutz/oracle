@@ -61,7 +61,7 @@
 BEGIN
 {
     if ($# < 2 || $# > 3) {
-        printf("\nUsage: aio_reqs <dba> <obj> [<print_stack>]\n"); 
+        printf("\nUsage: aio_trace_req_dba_obj.bt <dba> <obj> [<print_stack>]\n"); 
         exit();
     }
     printf("Tracing aio reqs ... Hit ^C to stop.\n");
