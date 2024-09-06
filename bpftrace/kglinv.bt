@@ -1,0 +1,162 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   This is an experimental proof of concept script that 
+ *   traces library cache object invalidations with bpftrace.
+ *
+ *   When oracle invalidates an object in the library cache,
+ *   kglSetHandleStatus() sets its status to INVL (0x5). So, 
+ *   this script hooks into kglSetHandleStatus() and pulls 
+ *   additional context data from internal library cache (kglhd) 
+ *   and session (ksuse) structures in the sga.
+ * 
+ * Author:
+ *   Christoph Lutz
+ *
+ * Date:
+ *   Dec-19 2023
+ *
+ * Tested on: 
+ *   Oracle 19.20 (oel 8.8, bpftrace 0.16.0) 
+ * 
+ * Usage: 
+ *   BPFTRACE_STRLEN=40 ./kglinv.bt <oracle_sid>
+ *
+ * Notes: 
+ *   Must run with BPFTRACE_STRLEN=40 (or lower) as the script
+ *   will exceed the bpf max stack size of 512 bytes otherwise.
+ *
+ * This program is potentially dangerous, use it at your own risk!
+ *
+ */
+
+#include <linux/sched.h>
+
+#define KSQGDN_ADDR            0x60006d30   /* db name                       */
+#define KSPSSIDST_ADDR         0x60009628   /* sid name                      */
+
+#define TLS_SADDR_OFF          0xff78       /* tls session addr offset       */
+
+#define KSUSE_KSUUDNAM_OFF     0x44         /* username offset               */
+#define KSUSE_KSUSENUM_OFF     0x878        /* sid offset                    */
+#define KSUSE_KSUSESER_OFF     0x87c        /* serial offset                 */
+#define KSUSE_SQL_OFF          0x978        /* sql address                   */
+#define KSUSE_SQLFH_OFF        0x980        /* sql full hash offset          */
+#define KSUSE_SQLH_OFF         0x984        /* sql hash offset               */    
+
+#define KGLHD_STATUS_INVL      0x5          /* status INVL                   */
+#define KGLHD_NSP_OFF          0x20         /* namespace offset              */
+#define KGLHD_HSH_OFF          0x160        /* hash offset                   */
+#define KGLHD_OBJ_STRLEN_OFF   0x1b0        /* object name strlen offset     */
+#define KGLHD_OWN_STRLEN_OFF   0x1b8        /* owner strlen offset           */
+#define KGLHD_PDB_STRLEN_OFF   0x1bd        /* pdb name strlen offset        */
+#define KGLHD_NAME_OFF         0x1e0        /* object name offset            */
+#define KGLHD_REFLIST_OFF      0xa0         /* reflist offset                */
+#define KGLHD_REFLIST_PAR_OFF  0x18         /* parent offset in reflist      */
+#define KGLHD_PAR_SQL_OFF      0x1c0        /* parent cursor sql text offset */
+
+BEGIN
+{
+	if ($# < 1) {
+        	printf("\nUsage: kglinv.bt <oracle_sid>\n");
+        	exit();
+    	}
+        printf("Tracing kgl obj invalidations. Hit ^C to stop.\n\n");
+
+        printf("%-19s %-13s %6s %6s %-10s %10s %20s %-40s %-2s %-6s %11s %10s %3s %-40s\n",
+            "TIME", "INSTANCE", "SID", "SERIAL", "USERNAME", "SQL_HASH", "SQL_FULL_HASH",
+            "SQL_TEXT", "  ", "TYPE", "KGLHDADR", "KGLNAHSH", "NSP", "OBJ_NAME");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1920_1/bin/oracle:kglSetHandleStatus
+/ str(uptr(KSPSSIDST_ADDR)) == str($1) && arg2 == KGLHD_STATUS_INVL /
+{
+        /* 
+         * KSUSE data:
+         *
+         * In more recent versions (>=12c?), oracle 
+         * uses thread local storage (tls) to access 
+         * the ksuse session struct.
+         * On x86-64, tls is managed via the %fs 
+         * register, which we can access in bpftrace 
+         * with curtask->thread.fsbase.
+         * From there, we can pull out the saddr and 
+         * then use it as a starting point to access
+         * the ksuse members of interest. 
+         */ 
+        $fsbase = uptr(curtask->thread.fsbase);
+        $saddr = *(uint64 *) uptr($fsbase - TLS_SADDR_OFF);
+        $sid = *(uint64 *) uptr($saddr + KSUSE_KSUSENUM_OFF);
+        $ser = *(uint64 *) uptr($saddr + KSUSE_KSUSESER_OFF);
+        $user_p = uptr($saddr + KSUSE_KSUUDNAM_OFF);
+        $sqlh = *(uint32 *) uptr($saddr + KSUSE_SQLH_OFF);
+        $sqlfh = *(uint64 *) uptr($saddr + KSUSE_SQLFH_OFF);
+        $sql_addr = *(uint64 *) uptr($saddr + KSUSE_SQL_OFF);
+        $sql_p = uptr($sql_addr + KGLHD_PAR_SQL_OFF);
+
+        /* KGLHD data */
+        $kglhdadr = (uint64) arg1;
+        $kglhdnsp = *(uint8 *)($kglhdadr + KGLHD_NSP_OFF);
+        $kglnahsh = *(uint32 *)($kglhdadr + KGLHD_HSH_OFF);
+
+        /*
+         * Note: the reference from a child to its 
+         * parent cursor is retrieved via the child 
+         * cursor's ReferenceList, assuming that the
+         * first ReferenceList entry in a child always 
+         * points to the parent cursor (kglhdpar). Not 
+         * sure if this is always true and if there's 
+         * a better way (needs further research).
+         */
+        $reflist = *(uint64 *)($kglhdadr + KGLHD_REFLIST_OFF);
+        $kglhdpar = *(uint64 *)($reflist + KGLHD_REFLIST_PAR_OFF);
+        $kglnahsh_par = *(uint32 *)($kglhdpar + KGLHD_HSH_OFF);
+        $sql_par_p = (uint64)($kglhdpar + KGLHD_PAR_SQL_OFF);
+
+        /*
+         * Show invalidations of child cursors 
+         * (child cursors have kglhdnsp == 0 
+         * and kglhdadr != kglhdpar).
+         */
+        if($kglhdnsp == 0 && $kglhdadr != $kglhdpar) { 
+            time("%Y-%m-%d %H:%M:%S ");
+            printf("%-13s %6d %6d %-10s %10u %20lx %-40s %-2s %-6s %11lx %10u %3d %-40s\n",
+                str(uptr(KSPSSIDST_ADDR)), $sid, $ser, str($user_p), $sqlh, $sqlfh, str($sql_p),
+                "->", "cursor", $kglhdadr, $kglnahsh_par, $kglhdnsp, str($sql_par_p));
+        }
+
+        /* 
+         * Show invalidations of non-cursor objects 
+         * (non-cursor objects have kglhdnsp > 0).
+         */
+        if($kglhdnsp > 0) {
+            $obj_len = *(uint8 *)($kglhdadr + KGLHD_OBJ_STRLEN_OFF);
+            $own_len = *(uint8 *)($kglhdadr + KGLHD_OWN_STRLEN_OFF);
+            $pdb_len = *(uint8 *)($kglhdadr + KGLHD_PDB_STRLEN_OFF);
+
+            $obj_p = uptr($kglhdadr + KGLHD_NAME_OFF);
+            $own_p = uptr($kglhdadr + KGLHD_NAME_OFF + $obj_len);
+            $pdb_p = uptr($kglhdadr + KGLHD_NAME_OFF + $obj_len + $own_len);
+
+            /*
+             * Note the workaround for the following problem:
+             * On oel 8.8, bpftrace 0.16 fails with an error 
+             * when the second parameter ('length') in the str() 
+             * builtin is a variable.
+             * So, this will not work: str($obj_p, $len) 
+             * However, we can work around this issue by just 
+             * adding 0 to $len. Yes, kinda like cheating the 
+             * oracle optimizer ... :-)
+             */
+              time("%Y-%m-%d %H:%M:%S ");
+              printf("%-13s %6d %6d %-10s %10u %20lx %-40s %-2s %-6s %11lx %10u %3d %s.%s.%s\n",
+                  str(uptr(KSPSSIDST_ADDR)), $sid, $ser, str($user_p), $sqlh, $sqlfh, str($sql_p),
+                  "->", "obj", $kglhdadr, $kglnahsh, $kglhdnsp,
+                  str($pdb_p, (int8) $pdb_len + (int8) 0),
+                  str($own_p, (int8) $own_len + (int8) 0),
+                  str($obj_p, (int8) $obj_len + (int8) 0));
+        }
+}
+
+END {
+}
