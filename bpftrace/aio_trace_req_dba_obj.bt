@@ -1,0 +1,196 @@
+#!/usr/bin/env -S bpftrace -k
+/* 
+ * Purpose:
+ *   Trace aio read and write requests for a given Oracle data 
+ *   block. The script uses the data block address (dba) and
+ *   data_object_id (obj) to identify the target block to be 
+ *   traced.   
+ *   The dba and obj are both stored in the Oracle data block 
+ *   header, which this script inspects at runtime. Note that 
+ *   the combination of dba and obj is not guaranteed to be 
+ *   unique in a shared environment. However, the dba/obj 
+ *   combination can be considered "reasonably unique" for 
+ *   most practical purposes.
+ *   When the target data block is found in an aio iocb 
+ *   struct, the script prints out aio request details and
+ *   a stack trace.
+ *
+ * Author:
+ *   Christoph Lutz 
+ * 
+ * Date:
+ *   Sep-02 2024
+ *
+ * Usage:
+ *   aio_trace_req_dba_obj.bt <dba> <obj> [<print_stack>]
+ *
+ * Examples:
+ *   Print aio req details and stack traces when dba 0x5c9adb
+ *   with obj 0x66e63 is read or written:
+ *       BPFTRACE_CACHE_USER_SYMBOLS=1 aio_trace_req_dba_obj.bt 0x5c9adb 0x66e63 yes
+ * 
+ *   Print aio req details, but no stack traces when dba 0x5c9adb 
+ *   with obj 0x66e63 is read or written:
+ *       BPFTRACE_CACHE_USER_SYMBOLS=1 aio_trace_req_dba_obj.bt 0x5c9adb 0x66e63 no 
+ *
+ * Notes:
+ *   This script was written to trace cellsrv aio requests on
+ *   Exadata (tested with cellsrv 24.1.2).).
+ * 
+ *   The .debug_info section in the cellsrv binary is not compatible 
+ *   with perf and bpf symbol resolution and breaks stack sampling.
+ *   However, you can work around this issue by manually creating a
+ *   perf map file in /tmp before tracing:
+ *
+ *     objdump -C -t /opt/oracle/cell/cellsrv/bin/cellsrv  | 
+ *     egrep " F .text|  F text.unlikely| F text.hot"      | 
+ *     awk '{print $1 " " $5 " " substr($0,index($0,$6))}' \
+ *     > /tmp/perf-<cellsrv_pid>.map
+ *
+ *   The script hooks into libaio userspace functions to get full
+ *   user space stack traces.
+ *
+ *   The script only supports the aio PREAD and PWRITE cmds. 
+ *
+ *   This program is potentially dangerous, use it at your own risk!
+ */
+
+#define BLOCK_DBA_OFFSET 0x4
+#define BLOCK_OBJ_OFFSET 0x18
+
+BEGIN
+{
+    if ($# < 2 || $# > 3) {
+        printf("\nUsage: aio_reqs <dba> <obj> [<print_stack>]\n"); 
+        exit();
+    }
+    printf("Tracing aio reqs ... Hit ^C to stop.\n");
+    printf("dba=0x%x obj=0x%x\n", (uint32) $1, (uint32) $2); 
+}
+
+uprobe:/usr/lib64/libaio.so.1.0.1:io_submit
+{
+    $ctx_id = (uint64) arg0;
+    $nr = (int64) arg1;
+    $iocbpp = (struct iocb **) arg2;
+
+    /*
+     * Limit the max nr of iterations to 128 as
+     * the bpf verifier will explode otherwise.
+     */
+    $i=0;
+    while($i < 128 && $i < $nr) {
+        $iocbp = (struct iocb *) *($iocbpp + $i);
+
+        /* 
+         * Check if the iocb is an aio write operation.
+         * Write details can be checked on io_submit
+         * entry.
+         */
+        $aio_lio_opcode = $iocbp->aio_lio_opcode;
+        if ($aio_lio_opcode == IOCB_CMD_PWRITE) {
+            $aio_data = $iocbp->aio_data;
+            $aio_fildes = $iocbp->aio_fildes;
+            $aio_buf = $iocbp->aio_buf;
+            $aio_nbytes = $iocbp->aio_nbytes;
+            $aio_offset = $iocbp->aio_offset;
+            $file_name = ((struct file *) *(curtask->files->fdt->fd + (uint64) $aio_fildes))->f_path.dentry->d_name.name;
+
+            $dba = *(uint32 *) uptr($aio_buf + BLOCK_DBA_OFFSET);
+            $obj = *(uint32 *) uptr($aio_buf + BLOCK_OBJ_OFFSET);
+            if ($dba == $1 && $obj == $2) {
+                printf("%ld/%ld %s -> io_submit: %s\n",
+                       pid, tid, comm, $aio_lio_opcode == IOCB_CMD_PWRITE ? "PWRITE" : "PWRITEV");
+                printf("%ld/%ld %s    iocb[%d]: aio_data=%lu aio_fildes=%d aio_buf=%lu aio_nbytes=%lu aio_offset=%lu file=%s\n",
+                       pid, tid, comm, $i, $aio_data, $aio_fildes, $aio_buf, $aio_nbytes, $aio_offset, str($file_name));
+                if (str($3) == "yes") { printf("%s\n", ustack()); }
+            }
+
+        }
+
+        /* 
+        * Save the iocb and stack into maps
+        * for processing at a later stage.
+        */
+        @iocbs[(uint64) $iocbp] = (uint64) $iocbp;
+        @io_submit_tid[(uint64) $iocbp] = tid;
+        @io_submit_stack[(uint64) $iocbp] = ustack();
+
+        $i++;
+    }
+}
+
+uprobe:/usr/lib64/libaio.so.1.0.1:io_getevents
+{
+    @ctx_id[tid] = (uint64) arg0;
+    @events[tid] = (struct io_event *) arg3;
+}
+
+uretprobe:/usr/lib64/libaio.so.1.0.1:io_getevents
+/ @ctx_id[tid] /
+{
+    $nr = (int32) retval;
+
+    /*
+     * Cellsrv seems to use nr=20 most of the
+     * time, so limit the max nr of iterations
+     * to 20, as this will also help the bpf
+     * verifier.
+     */
+    $i = 0;
+    while((int32) $i < 20 && (int32) $i < $nr) {
+        $events = (@events[tid] + (uint64) $i);
+        $ev_data = (*(struct io_event *) (@events[tid] + (uint64) $i)).data;
+        $ev_obj =  (*(struct io_event *) (@events[tid] + (uint64) $i)).obj;
+        $iocbp = (uint64) $ev_obj;
+
+        if(@iocbs[$iocbp]) {
+            $aio_data = ((struct iocb *) $iocbp)->aio_data;
+            $aio_fildes = ((struct iocb *) $iocbp)->aio_fildes;
+            $aio_buf = ((struct iocb *) $iocbp)->aio_buf;
+            $aio_nbytes = ((struct iocb *) $iocbp)->aio_nbytes;
+            $aio_offset = ((struct iocb *) $iocbp)->aio_offset;
+            $file_name = ((struct file *) *(curtask->files->fdt->fd + (uint64) $aio_fildes))->f_path.dentry->d_name.name;
+
+            $dba = *(uint32 *) uptr($aio_buf + BLOCK_DBA_OFFSET);
+            $obj = *(uint32 *) uptr($aio_buf + BLOCK_OBJ_OFFSET);
+
+            if ($dba == $1 && $obj == $2) {
+                /* 
+                 * Check if the iocb is an aio read operation.
+                 * Read details are not available unless io_
+                 * getevents completes. This means, we can only
+                 * check read details in the retprobe! In that
+                 * sense, consider this block here an io_submit
+                 * "pseudo probe hit".
+                 */
+                $aio_lio_opcode = ((struct iocb *) $iocbp)->aio_lio_opcode;
+                if ($aio_lio_opcode == IOCB_CMD_PREAD) {
+                    printf("%ld/%ld %s -> io_submit   : %s\n",
+                           pid, @io_submit_tid[$iocbp], comm, $aio_lio_opcode == IOCB_CMD_PREAD ? "PREAD" : "PREADV");
+                    if (str($3) == "yes") { printf("%s\n", @io_submit_stack[$iocbp]); }
+                }
+
+                /* Print io_getevents details for aio reads and writes */
+                printf("%ld/%ld %s <- io_getevents:\n", pid, tid, comm);
+                printf("%ld/%ld %s    iocb[%d] ctx_id=%p iocbp=%p aio_data=%p aio_fildes=%u aio_nbytes=%lu aio_buf=%p file_name=%s\n", 
+                       pid, tid, comm, $i, @ctx_id[tid], $iocbp, $aio_data, $aio_fildes, $aio_nbytes, $aio_buf, str($file_name));
+                if (str($3) == "yes") { printf("%s\n", ustack()); }
+            }
+            delete(@iocbs[$iocbp]);
+            delete(@io_submit_tid[$iocbp]);
+            delete(@io_submit_stack[$iocbp]);
+        }
+        $i++;
+    }
+    delete(@ctx_id[tid]);
+    delete(@events[tid]);
+}
+
+END {
+    clear(@ctx_id);
+    clear(@events);
+    clear(@iocbs);
+    clear(@io_submit_tid);
+    clear(@io_submit_stack);
+}
