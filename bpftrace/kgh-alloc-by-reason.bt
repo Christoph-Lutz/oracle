@@ -1,0 +1,162 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Trace kgh memory allocations by reason.
+ *
+ *   Based on dtrace_kghal_pga_code.sh by Stefan Koehler:
+ *   https://github.com/skoehler-soocs/soocs-scripts/blob/main/Oracle_DTrace/dtrace_kghal_pga_code.sh
+ *
+ * Author:
+ *   Christoph Lutz
+ * 
+ * Date:
+ *   Apr-30 2024
+ *
+ * Tested on:
+ *   Oracle 19.23
+ *
+ * Usage:
+ *   BPFTRACE_CACHE_USER_SYMBOLS=1 ./kgh-alloc-by-reason.bt <oracle_sid>
+ *
+ * Example:
+ *   BPFTRACE_CACHE_USER_SYMBOLS=1 ./kgh-alloc-by-reason.bt "PLSQL Collection Bind"
+ *
+ * Notes:
+ *   The script pulls context information from ksuse (v$session) 
+ *   and ksupr (v$process) when kghalf and kghalp return. Based on 
+ *   this, we can observe pga allocations over time and break them 
+ *   down by sid, sqh hash, plsql object and plsql subprogram.
+ * 
+ *   You can look up the plsql object and subprogram ids in dba_
+ *   objects and dba_procedures.
+ * 
+ *   The script traces all processes for a given oracle sid. However, 
+ *   you could also adjust the script to only trace allocations of 
+ *   only a given session or use other filters as needed. 
+ */
+
+#define KSPSSIDST_ADDR 0x60009628
+
+BEGIN
+{
+    if ($# < 2) {
+        printf("\nUsage: kgh-alloc-by-reason.bt <oracle_sid> <reason_str>\n");
+        exit();
+    }
+
+    printf("Tracing kgh calls ... Hit ^C to stop.\n");
+
+    printf("\n%-19s %7s %6s %12s %10s %10s %14s %14s %14s %14s %14s %14s %-21s %-30s %-10s\n", 
+        "TIME", "PID", "SID", "SQLH", "PLSQL_OBJ", "PLSQL_SUB", "PGA_USED", "USED_FUNC",
+        "U_DIFF_RUN", "PGA_ALLOC", "ALLOC_FUNC", "A_DIFF_RUN", "USER", "REASON", "FUNCTION");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kghalf,
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kghalp,
+/ str(uptr(KSPSSIDST_ADDR)) == str($1) && str(uptr(arg5)) == str($2) / 
+{
+    @in_trace[tid] = 1;
+    @func[tid] = func;
+    @reason[tid] = (uint64) arg5;
+    $reason = @reason[tid];
+    $fsbase = uptr(curtask->thread.fsbase);
+
+    /* x$ksupr offsets */
+    $paddr_off = (uint64) 0xff90;    /* tls offset */
+    $ksuprpum_off = (uint64) 0xe90;  /* pga used   */
+    $ksuprpnam_off = (uint64) 0xe70; /* pga alloc1 */
+    $ksuprpram_off = (uint64) 0xe58; /* pga alloc2 */ 
+
+    /* x$ksupr data */
+    $paddr_p = uptr($fsbase - $paddr_off);
+    $paddr = *(uint64 *) uptr($paddr_p);
+    $pga_used = *(uint64 *) uptr($paddr + $ksuprpum_off);
+    $pga_alloc1 = *(uint64 *) uptr($paddr + $ksuprpnam_off);
+    $pga_alloc2 = *(uint64 *) uptr($paddr + $ksuprpram_off);
+    $pga_alloc = (uint64) ($pga_alloc1 + $pga_alloc2);
+
+    @used_entry[tid,$reason] = (uint64) $pga_used;
+    @alloc_entry[tid,$reason] = (uint64) ($pga_alloc1 + $pga_alloc2);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kghalf,
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kghalp,
+/ @in_trace[tid] /
+{
+    $fsbase = uptr(curtask->thread.fsbase);
+
+    /* x$ksuse offsets */
+    $saddr_off = (uint64) 0xff78;    /* tls offset */
+    $ksuudnam_off = (uint64) 0x44;   /* username   */
+    $ksusenum_off = (uint64) 0x878;  /* sid        */
+    $ksusesqh_off = (uint64) 0x984;  /* sql_hash   */
+    $ksusepco_off = (uint64) 0x9b4;  /* plsql obj  */
+    $ksusepcs_off = (uint64) 0x9b8;  /* plsql sub  */
+
+    /* x$ksupr offsets */
+    $paddr_off = (uint64) 0xff90;    /* tls offset */
+    $ksuprpum_off = (uint64) 0xe90;  /* pga used   */
+    $ksuprpnam_off = (uint64) 0xe70; /* pga alloc1 */
+    $ksuprpram_off = (uint64) 0xe58; /* pga alloc2 */ 
+
+    /* x$ksuse data */
+    $saddr_p = uptr($fsbase - $saddr_off);
+    $saddr = *(uint64 *) uptr($saddr_p);
+    $user = str($saddr + $ksuudnam_off);
+    $sid = *(uint64 *)($saddr + $ksusenum_off);
+    $sql_hash = *(uint32 *) uptr($saddr + $ksusesqh_off);
+    $plsql_obj = *(uint32 *) uptr($saddr + $ksusepco_off);
+    $plsql_sub = *(uint32 *) uptr($saddr + $ksusepcs_off);
+
+    /* x$ksupr data */
+    $paddr_p = uptr($fsbase - $paddr_off);
+    $paddr = *(uint64 *) uptr($paddr_p);
+    $pga_used = *(uint64 *) uptr($paddr + $ksuprpum_off);
+    $pga_alloc1 = *(uint64 *) uptr($paddr + $ksuprpnam_off);
+    $pga_alloc2 = *(uint64 *) uptr($paddr + $ksuprpram_off);
+    $pga_alloc = (uint64) ($pga_alloc1 + $pga_alloc2);
+ 
+    /* pga delta calculations */
+    $reason = @reason[tid];
+    $delta_used_prev = (int64) ($pga_used - @used_entry[tid,$reason]);
+    $delta_alloc_prev = (int64) ($pga_alloc - @alloc_entry[tid,$reason]);
+
+    /* emit stack if alloc has grown */
+    if ($delta_alloc_prev > 0) {
+        printf("%ld: %s\n", pid, ustack());
+    }
+
+    $delta_used_start = (int64) 0;
+    if (!@used_start[tid]) {
+        @used_start[tid] = $pga_used;
+    } else {
+        $delta_used_start = (int64) ($pga_used - @used_start[tid]);
+    }
+
+    $delta_alloc_start = (int64) 0;
+    if (!@alloc_start[tid]) {
+        @alloc_start[tid] = $pga_alloc;
+    } else {
+        $delta_alloc_start = (int64) ($pga_alloc - @alloc_start[tid]);
+    }
+
+    time("%Y-%m-%dT%H:%M:%S ");
+    printf("%7u %6u %12u %10u %10u %14lu %14ld %14ld %14lu %14ld %14ld %-21s %-30s %-10s\n",
+        pid, $sid, $sql_hash, $plsql_obj, $plsql_sub, $pga_used, $delta_used_prev, 
+        $delta_used_start, $pga_alloc, $delta_alloc_prev, $delta_alloc_start, $user, 
+        str($reason), @func[tid]);
+
+    @in_trace[tid] = 0;
+    @reason[tid] = 0;
+}
+
+END
+{
+    clear(@in_trace);
+    clear(@func);
+    clear(@reason);
+    clear(@used_entry);
+    clear(@alloc_entry); 
+    clear(@alloc_start);
+    clear(@used_start);
+}
