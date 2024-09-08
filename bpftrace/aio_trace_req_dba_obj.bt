@@ -35,7 +35,7 @@
  *
  * Notes:
  *   This script was written to trace cellsrv aio requests on
- *   Exadata (tested with cellsrv 24.1.2).).
+ *   Exadata (tested with cellsrv 24.1.2).
  * 
  *   The .debug_info section in the cellsrv binary is not compatible 
  *   with perf and bpf symbol resolution and breaks stack sampling.
