@@ -22,16 +22,16 @@
  *   Sep-02 2024
  *
  * Usage:
- *   aio_trace_req_dba_obj.bt <dba> <obj> [<print_stack>]
+ *   aio-trace-req-dba-obj.bt <dba> <obj> [<print_stack>]
  *
  * Examples:
  *   Print aio req details and stack traces when dba 0x5c9adb
  *   with obj 0x66e63 is read or written:
- *       BPFTRACE_CACHE_USER_SYMBOLS=1 aio_trace_req_dba_obj.bt 0x5c9adb 0x66e63 yes
+ *       BPFTRACE_CACHE_USER_SYMBOLS=1 aio-trace-req-dba-obj.bt 0x5c9adb 0x66e63 yes
  * 
  *   Print aio req details, but no stack traces when dba 0x5c9adb 
  *   with obj 0x66e63 is read or written:
- *       BPFTRACE_CACHE_USER_SYMBOLS=1 aio_trace_req_dba_obj.bt 0x5c9adb 0x66e63 no 
+ *       BPFTRACE_CACHE_USER_SYMBOLS=1 aio-trace-req-dba-obj.bt 0x5c9adb 0x66e63 no 
  *
  * Notes:
  *   This script was written to trace cellsrv aio requests on
@@ -61,7 +61,7 @@
 BEGIN
 {
     if ($# < 2 || $# > 3) {
-        printf("\nUsage: aio_trace_req_dba_obj.bt <dba> <obj> [<print_stack>]\n"); 
+        printf("\nUsage: aio-trace-req-dba-obj.bt <dba> <obj> [<print_stack>]\n"); 
         exit();
     }
     printf("Tracing aio reqs ... Hit ^C to stop.\n");
