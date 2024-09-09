@@ -39,7 +39,7 @@
 
 BEGIN
 {
-    if ($# < 2) {
+    if ($# != 2) {
         printf("\nUsage: kgh-alloc-by-reason.bt <oracle_sid> <reason_str>\n");
         exit();
     }
@@ -52,7 +52,7 @@ BEGIN
 }
 
 uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kghalf,
-uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kghalp,
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kghalp
 / str(uptr(KSPSSIDST_ADDR)) == str($1) && str(uptr(arg5)) == str($2) / 
 {
     @in_trace[tid] = 1;
@@ -80,7 +80,7 @@ uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kghalp,
 }
 
 uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kghalf,
-uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kghalp,
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kghalp
 / @in_trace[tid] /
 {
     $fsbase = uptr(curtask->thread.fsbase);
