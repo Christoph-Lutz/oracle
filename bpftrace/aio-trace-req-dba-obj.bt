@@ -27,15 +27,15 @@
  * Examples:
  *   Print aio req details and stack traces when dba 0x5c9adb
  *   with obj 0x66e63 is read or written:
- *       BPFTRACE_CACHE_USER_SYMBOLS=1 aio-trace-req-dba-obj.bt 0x5c9adb 0x66e63 yes
+ *       BPFTRACE_CACHE_USER_SYMBOLS=1 aio_trace_req_dba_obj.bt 0x5c9adb 0x66e63 yes
  * 
  *   Print aio req details, but no stack traces when dba 0x5c9adb 
  *   with obj 0x66e63 is read or written:
- *       BPFTRACE_CACHE_USER_SYMBOLS=1 aio-trace-req-dba-obj.bt 0x5c9adb 0x66e63 no 
+ *       BPFTRACE_CACHE_USER_SYMBOLS=1 aio_trace_req_dba_obj.bt 0x5c9adb 0x66e63 no 
  *
  * Notes:
  *   This script was written to trace cellsrv aio requests on
- *   Exadata (tested with cellsrv 24.1.2).
+ *   Exadata (tested with cellsrv 24.1.2).).
  * 
  *   The .debug_info section in the cellsrv binary is not compatible 
  *   with perf and bpf symbol resolution and breaks stack sampling.
@@ -61,7 +61,7 @@
 BEGIN
 {
     if ($# < 2 || $# > 3) {
-        printf("\nUsage: aio-trace-req-dba-obj.bt <dba> <obj> [<print_stack>]\n"); 
+        printf("\nUsage: aio_reqs <dba> <obj> [<print_stack>]\n"); 
         exit();
     }
     printf("Tracing aio reqs ... Hit ^C to stop.\n");
@@ -84,8 +84,11 @@ uprobe:/usr/lib64/libaio.so.1.0.1:io_submit
 
         /* 
          * Check if the iocb is an aio write operation.
-         * Write details can be checked on io_submit
-         * entry.
+         * With a write, the block of interest can 
+         * be checked on io_submit entry, whereas for a
+         * read, the dba/obj pair can only be checked on
+         * return of io_getevents (s. also io_getevents
+         * retprobe further down below.
          */
         $aio_lio_opcode = $iocbp->aio_lio_opcode;
         if ($aio_lio_opcode == IOCB_CMD_PWRITE) {
@@ -101,8 +104,8 @@ uprobe:/usr/lib64/libaio.so.1.0.1:io_submit
             if ($dba == $1 && $obj == $2) {
                 printf("%ld/%ld %s -> io_submit: %s\n",
                        pid, tid, comm, $aio_lio_opcode == IOCB_CMD_PWRITE ? "PWRITE" : "PWRITEV");
-                printf("%ld/%ld %s    iocb[%d]: aio_data=%lu aio_fildes=%d aio_buf=%lu aio_nbytes=%lu aio_offset=%lu file=%s\n",
-                       pid, tid, comm, $i, $aio_data, $aio_fildes, $aio_buf, $aio_nbytes, $aio_offset, str($file_name));
+                printf("%ld/%ld %s    iocb[%d]: ctx_id=%p aio_data=%lu aio_fildes=%d aio_buf=%lu aio_nbytes=%lu aio_offset=%lu file=%s\n",
+                       pid, tid, comm, $i, $ctx_id, $aio_data, $aio_fildes, $aio_buf, $aio_nbytes, $aio_offset, str($file_name));
                 if (str($3) == "yes") { printf("%s\n", ustack()); }
             }
 
@@ -134,8 +137,8 @@ uretprobe:/usr/lib64/libaio.so.1.0.1:io_getevents
     /*
      * Cellsrv seems to use nr=20 most of the
      * time, so limit the max nr of iterations
-     * to 20, as this will also help the bpf
-     * verifier.
+     * to 20, as this will also help to keep the 
+     * bpf verifier under control.
      */
     $i = 0;
     while((int32) $i < 20 && (int32) $i < $nr) {
@@ -152,19 +155,25 @@ uretprobe:/usr/lib64/libaio.so.1.0.1:io_getevents
             $aio_offset = ((struct iocb *) $iocbp)->aio_offset;
             $file_name = ((struct file *) *(curtask->files->fdt->fd + (uint64) $aio_fildes))->f_path.dentry->d_name.name;
 
+            /* 
+             * Check if this is our data block of interest
+             * and then also if this is an aio read request.
+             * Note that with a read, data in the aio_buf 
+             * is not available, unless io_getevents reaps 
+             * the read request. This means, we cannot check 
+             * the dba/obj pair for a read earlier in the 
+             * io_submit entry probe above. Therefore, we use 
+             * this retprobe on io_getevents to also print the 
+             * io_submit call for the read request (consider 
+             * this an io_submit "pseudo probe"). 
+             */
             $dba = *(uint32 *) uptr($aio_buf + BLOCK_DBA_OFFSET);
             $obj = *(uint32 *) uptr($aio_buf + BLOCK_OBJ_OFFSET);
 
             if ($dba == $1 && $obj == $2) {
-                /* 
-                 * Check if the iocb is an aio read operation.
-                 * Read details are not available unless io_
-                 * getevents completes. This means, we can only
-                 * check read details in the retprobe! In that
-                 * sense, consider this block here an io_submit
-                 * "pseudo probe hit".
-                 */
                 $aio_lio_opcode = ((struct iocb *) $iocbp)->aio_lio_opcode;
+
+                /* "Pseudo probe" hit for previous io_submit */
                 if ($aio_lio_opcode == IOCB_CMD_PREAD) {
                     printf("%ld/%ld %s -> io_submit   : %s\n",
                            pid, @io_submit_tid[$iocbp], comm, $aio_lio_opcode == IOCB_CMD_PREAD ? "PREAD" : "PREADV");
@@ -173,8 +182,8 @@ uretprobe:/usr/lib64/libaio.so.1.0.1:io_getevents
 
                 /* Print io_getevents details for aio reads and writes */
                 printf("%ld/%ld %s <- io_getevents:\n", pid, tid, comm);
-                printf("%ld/%ld %s    iocb[%d] ctx_id=%p iocbp=%p aio_data=%p aio_fildes=%u aio_nbytes=%lu aio_buf=%p file_name=%s\n", 
-                       pid, tid, comm, $i, @ctx_id[tid], $iocbp, $aio_data, $aio_fildes, $aio_nbytes, $aio_buf, str($file_name));
+                printf("%ld/%ld %s    iocb[%d] ctx_id=%p iocbp=%p aio_data=%p aio_fildes=%u aio_buf=%p aio_nbytes=%lu aio_offset=%lu file_name=%s\n", 
+                       pid, tid, comm, $i, @ctx_id[tid], $iocbp, $aio_data, $aio_fildes, $aio_buf, $aio_nbytes, $aio_offset, str($file_name));
                 if (str($3) == "yes") { printf("%s\n", ustack()); }
             }
             delete(@iocbs[$iocbp]);
