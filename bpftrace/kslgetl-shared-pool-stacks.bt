@@ -1,0 +1,84 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Emit a stack trace when kslgetl is called
+ *   to aquire a 'shared pool' latch. The result-
+ *   ing stack samples can then be charted with
+ *   flamegraph.pl for further analysis.
+ *   The flame graph will show the Oracle code 
+ *   paths with high demand for the 'shared 
+ *   pool' latches.
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Date:
+ *   Apr-14 2024
+ *
+ * Tested on:
+ *   Oracle 19.22
+ *   Oracle 19.23
+ *
+ * Usage:
+ *   BPFTRACE_CACHE_USER_SYMBOLS=1 \
+ *   ./kslgetl-shared-pool-stacks.bt <oracle_sid> 
+ * 
+ * Notes:
+ *   You must check and adjust KSPSSIDST_ADDR 
+ *   and all latch addresses (LADDRs) for your 
+ *   environment and your version of Oracle 
+ *   accordingly.
+ *
+ *   The latch addresses can be queried like 
+ *   so:
+ *
+ *     select addr from v$latch 
+ *     where name = 'shared pool'
+ *     union
+ *     select addr from v$latch_children 
+ *     where name = 'shared pool';
+ *
+ *   The script can be changed for use with
+ *   other latches than the 'shared pool' 
+ *   latches.
+ */
+
+#define KSPSSIDST 0x60009628
+#define LADDR0    0x60079380
+#define LADDR1    0x604746d8
+#define LADDR2    0x60474778
+#define LADDR3    0x60474818
+#define LADDR4    0x604748b8
+#define LADDR5    0x60474958
+#define LADDR6    0x604749f8
+#define LADDR7    0x60474a98
+
+BEGIN 
+{
+    if ($# != 1) {
+        printf("\nUsage: kslgetl-shared-pool-stacks.bt <oracle_sid>\n");
+        exit();
+    }
+
+    printf("Tracing kslgetl calls... Hit ^C to stop.\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kslgetl
+/ str(uptr(KSPSSIDST)) == str($1) /
+{
+    if (arg0 == LADDR0 ||
+        arg0 == LADDR1 ||
+        arg0 == LADDR2 ||
+        arg0 == LADDR3 ||
+        arg0 == LADDR4 ||
+        arg0 == LADDR5 ||
+        arg0 == LADDR6 ||
+        arg0 == LADDR7 )
+    {
+       @[ustack()] = count();
+    }
+}
+
+END
+{
+}
