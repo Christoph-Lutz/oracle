@@ -1,0 +1,25 @@
+#!/usr/bin/env bpftrace
+/*
+ * Purpose:
+ *   Example that demonstrates how to read the process
+ *   name in a uprobe via the curtask->mm->arg_start
+ *   field from the Linux kernel.
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Date:
+ *   Sep-21 2024
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *
+ * Tested on:
+ *   Oracle 19.23, OEL 8.10, kernel 5.4.17-2136.330.7.5, bpftrace 0.16
+ */
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:opiexe
+{
+    $proc_name = curtask->mm->arg_start;
+    printf("pid: %ld %s opiexe: enter\n", pid, str(uptr($proc_name)));
+}
