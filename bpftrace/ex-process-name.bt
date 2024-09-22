@@ -21,5 +21,5 @@
 uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:opiexe
 {
     $proc_name = curtask->mm->arg_start;
-    printf("pid: %ld %s opiexe: enter\n", pid, str(uptr($proc_name)));
+    printf("pid: %lu %s opiexe: enter\n", pid, str(uptr($proc_name)));
 }
