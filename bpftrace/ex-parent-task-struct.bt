@@ -1,0 +1,25 @@
+#!/usr/bin/env bpftrace
+/*
+ * Purpose:
+ *   Example that demonstrates how to access the parent
+ *   process task_struct in a uprobe. The example reads 
+ *   the parent's pid via curtask->parent->pid.
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Date:
+ *   Sep-22 2024
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *
+ * Tested on:
+ *   Oracle 19.23, OEL 8.10, kernel 5.4.17-2136.330.7.5, bpftrace 0.16
+ */
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:opiexe
+{
+    $ppid= curtask->parent->pid;
+    printf("pid: %ld ppid: %ld %s opiexe: enter\n", pid, $ppid, comm);
+}
