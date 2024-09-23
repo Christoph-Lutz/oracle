@@ -1,0 +1,91 @@
+#!/usr/bin/env bpftrace
+/*
+ * nae-times-pid.bt  Measure naeaac and naedacc function call elapsed
+ *                   times and print a summary every second (sqlnet 
+ *                   encryption and decryption).
+ *
+ * USAGE: nae-times-intvl-pid.bt <pid>
+ *
+ * 24-Mar-2024  Christoph Lutz  Created this.
+ *
+ * Tested on:	Oracle 19.20
+ */
+
+BEGIN
+{
+    printf("Tracing naeeaac and naedacc calls ... Hit ^C to stop.\n");
+    printf("\n%-8s %9s %9s %9s %9s %9s %9s %10s %10s %10s %10s %10s %10s\n", 
+        "Time", "Tot Calls", "Enc Calls", "Dec Calls", "Tot ns", "Enc ns", "Dec ns",
+        "Min Enc ns", "Min Dec ns", "Max Enc ns", "Max Dec ns", "Avg Enc ns", "Avg Dec ns");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1920_1/bin/oracle:naeeaac
+/ pid == $1 /
+{
+    @calls_enc++;
+    @start_enc[tid] = nsecs;
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1920_1/bin/oracle:naeeaac
+/ pid == $1 && @start_enc[tid] /
+{
+    $delta_enc = nsecs - @start_enc[tid];
+    @sum_enc += $delta_enc;
+    // @min_enc = (@min_enc == 0 ? $delta_enc : @min_enc);
+    @min_enc = (@min_enc == 0 || $delta_enc < @min_enc ? $delta_enc : @min_enc);
+    @max_enc = ($delta_enc > @max_enc ? $delta_enc : @max_enc);
+    @start_enc[tid] = 0;
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1920_1/bin/oracle:naedacc
+/ pid == $1 /
+{
+    @calls_dec++;
+    @start_dec[tid] = nsecs;
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1920_1/bin/oracle:naedacc
+/ pid == $1 && @start_dec[tid] /
+{
+    $delta_dec = nsecs - @start_dec[tid];
+    @sum_dec += $delta_dec;
+    // @min_dec = (@min_dec == 0 ? $delta_dec : @min_dec);
+    @min_dec = (@min_dec == 0 || $delta_dec < @min_dec ? $delta_dec : @min_dec);
+    @max_dec = ($delta_dec > @max_dec ? $delta_dec : @max_dec);
+    @start_dec[tid] = 0;
+}
+
+interval:s:1
+{
+    $calls_tot = @calls_enc + @calls_dec;
+    $sum_tot = @sum_enc + @sum_dec;
+    $avg_enc = (uint64) @sum_enc / (uint64) @calls_enc;
+    $avg_dec = (uint64) @sum_dec / (uint64) @calls_dec;
+
+    time("%H:%M:%S ");
+    printf("%9lu %9lu %9lu %9lu %9lu %9lu %10lu %10lu %10lu %10lu %10lu %10lu\n", 
+        $calls_tot, @calls_enc, @calls_dec, $sum_tot, @sum_enc, @sum_dec, 
+        @min_enc, @min_dec, @max_enc, @max_dec, $avg_enc, $avg_dec);
+
+    clear(@calls_enc);
+    clear(@calls_dec);
+    clear(@sum_enc);
+    clear(@sum_dec);
+    clear(@min_enc);
+    clear(@min_dec);
+    clear(@max_enc);
+    clear(@max_dec);
+}
+
+END
+{
+    clear(@calls_enc);
+    clear(@start_enc);
+    clear(@min_enc);
+    clear(@max_enc);
+
+    clear(@calls_dec);
+    clear(@start_dec);
+    clear(@min_dec);
+    clear(@max_dec);
+}

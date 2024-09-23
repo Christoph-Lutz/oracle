@@ -1,0 +1,32 @@
+#!/usr/bin/env bpftrace
+/*
+ * nae-call-cnt-pid.bt  Count calls to nsbsend, nsbrecv, naeaac and naedacc
+ *                      (encrpytion and decryption).
+ *
+ * USAGE: nae-call-cnt-pid.bt <pid>
+ *
+ * 24-Mar-2024  Christoph Lutz	Created this.
+ *
+ * Tested on:	Oracle 19.20
+ */
+
+BEGIN
+{
+    printf("Tracing naeeaac and naedacc calls ... Hit ^C to stop.\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1920_1/bin/oracle:nsbsend,
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1920_1/bin/oracle:naeeaac,
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1920_1/bin/oracle:nsbrecv,
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1920_1/bin/oracle:naedacc
+/ pid == $1 /
+{
+    @call_cnt_func[func]++;
+}
+
+END
+{
+    printf("\nCall count by function:\n");
+    print(@call_cnt_func);
+    clear(@call_cnt_func);
+}

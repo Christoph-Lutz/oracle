@@ -1,0 +1,90 @@
+#!/usr/bin/env bpftrace
+/*
+ * nae-times-pid.bt  Measure naeaac and naedacc function call elapsed 
+ *                   times (sqlnet encryption and decryption).
+ *
+ * USAGE: nae-times-pid.bt <pid>
+ *
+ * 24-Mar-2024  Christoph Lutz	Created this.
+ *
+ * Tested on: Oracle 19.20
+ */
+
+BEGIN
+{
+    printf("Tracing naeeaac and naedacc calls ... Hit ^C to stop.\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1920_1/bin/oracle:naeeaac
+/ pid == $1 /
+{
+    @calls_enc++;
+    @start_enc[tid] = nsecs;
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1920_1/bin/oracle:naeeaac
+/ pid == $1 && @start_enc[tid] /
+{
+    $delta_enc = nsecs - @start_enc[tid];
+    // printf("DEBUG: naeeaac delta ns: %lu\n", $delta_enc);
+    @min_enc = min($delta_enc);
+    @max_enc = max($delta_enc);
+    @avg_enc = avg($delta_enc);
+    @hist_enc = hist($delta_enc);
+    @start_enc[tid] = 0;
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1920_1/bin/oracle:naedacc
+/ pid == $1 /
+{
+    @calls_dec++;
+    @start_dec[tid] = nsecs;
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1920_1/bin/oracle:naedacc
+/ pid == $1 && @start_dec[tid] /
+{
+    $delta_dec = nsecs - @start_dec[tid];
+    // printf("DEBUG: naedaac delta ns: %lu\n", $delta_dec);
+    @min_dec = min($delta_dec);
+    @max_dec = max($delta_dec);
+    @avg_dec = avg($delta_dec);
+    @hist_dec = hist($delta_dec);
+    @start_dec[tid] = 0;
+}
+
+END
+{
+    printf("\n\n"); 
+    printf("Encryption\n");
+    printf("~~~~~~~~~~\n");
+    print(@calls_enc);
+    print(@min_enc);
+    print(@max_enc);
+    print(@avg_enc);
+    print(@hist_enc);
+
+    printf("\n");
+    printf("Decryption\n");
+    printf("~~~~~~~~~~\n");
+    print(@calls_dec);
+    print(@min_enc);
+    print(@min_dec);
+    print(@max_dec);
+    print(@avg_dec);
+    print(@hist_dec);
+
+    clear(@calls_enc);
+    clear(@start_enc);
+    clear(@min_enc);
+    clear(@max_enc);
+    clear(@avg_enc);
+    clear(@hist_enc);
+
+    clear(@calls_dec);
+    clear(@start_dec);
+    clear(@min_dec);
+    clear(@max_dec);
+    clear(@avg_dec);
+    clear(@hist_dec);
+}
