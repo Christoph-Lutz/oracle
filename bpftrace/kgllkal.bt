@@ -1,0 +1,50 @@
+#!/usr/bin/env bpftrace
+/*
+ * kgllkal.bt - Trace Oracle kgllkal calls (Kernel Generic Library 
+ *              Cache Lock Allocate). This will show in what mode
+ *              library cache locks are requested.
+ *
+ * Usage:
+ *  BPFTRACE_CACHE_USER_SYMBOLS=1 kgllkal.bt <pid> [<print_stack>] 
+ *
+ * 12-Nov-2022:  Christoph Lutz   Created this.
+ *
+ * Tested on: 
+ *   Oracle 19.14, 19.17 and 19.23
+ *
+ * Notes:
+ *  Adjust the ORACLE_HOME path for your environment. 
+ *
+ *  You may also add additional filters to the kgllkal probe to
+ *  check for certain kgl lock handles or lock modes (s. also 
+ *  x$kglob).
+ */
+
+#define KSPSSIDST_ADDR 0x60009628
+
+BEGIN
+{
+    if ($# < 1 || $# > 2) {
+        printf("\nUsage: kgllkal.bt <pid> [<print_stack>]\n");
+        exit();
+    }
+
+    printf("Tracing kgllkal calls ... Hit ^C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kgllkal
+/ pid == $1 /
+{
+    $kglhdadr = (uint64) arg2;
+    $lkreq = (uint16) arg3;
+    printf("%d/%d %s -> kgllkal: hdl=%p lkreq=%p\n", 
+           pid, tid, str(uptr(KSPSSIDST_ADDR)), $kglhdadr, $lkreq);
+
+    if (str($2) == "yes") {
+        print(ustack());
+    }
+}
+
+END
+{
+}
