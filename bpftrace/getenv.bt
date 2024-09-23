@@ -1,0 +1,58 @@
+#!/usr/bin/env -S bpftrace
+/*
+ * Purpose:
+ *   Trace getenv calls to see environment variables
+ *   and their values.
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Date:
+ *   Sep-23 2024
+ *
+ * Usage:
+ *   Default (no stack samples):
+ *     BPFTRACE_CACHE_USER_SYMBOLS=1 ./getenv.bt
+ *
+ *   To take stack sample:
+ *     BPFTRACE_CACHE_USER_SYMBOLS=1 ./getenv.bt yes
+ *
+ * Notes:
+ *   The script hooks into libc, so you may need
+ *   to adjust the libc path for your environment.
+ *
+ * Tested on:
+ *   Oracle 19.23, OEL 8.10, kernel 5.4.17-2136.330.7.5, bpftrace 0.16
+ */
+
+BEGIN
+{
+    printf("Tracing getenv calls ... Hit ^C to stop.\n");
+}
+
+uprobe:/lib64/libc-2.28.so:getenv
+{
+    @getenv[tid] = (uint64) arg0;
+}
+
+uretprobe:/lib64/libc-2.28.so:getenv
+/ @getenv[tid] /
+{
+    $proc = uptr(curtask->mm->arg_start);
+    $var = uptr(@getenv[tid]); 
+
+    printf("%lu/%lu %s getenv: %s=", pid, tid, str($proc), str($var));
+
+    /* Note: bpftrace 0.16 crashes if this ternary expr is used in printf */
+    retval ? printf("%s\n", str(uptr(retval))) : printf("(null)\n");
+
+    if (str($1) == "yes") {
+        print(ustack());
+    }
+
+    @getenv[tid] = 0;
+}
+
+END {
+    clear(@getenv);
+}
