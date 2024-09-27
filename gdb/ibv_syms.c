@@ -1,5 +1,5 @@
 /* 
- * Symbol for gdb, compile with:
+ * Symbol file for use with gdb, compile with:
  * gcc -c -g ibv_syms.c -o /tmp/ibv_syms.o
  */
 #include <stdio.h>
