@@ -1,0 +1,64 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Show the number of logons to a db instance per second 
+ *   by counting the number of calls to function ksucre 
+ *   (Kernel Service User Create session).
+ *
+ * Date:
+ *   Sep-27 2024
+ *
+ * Tested on:
+ *   Oracle 19.23
+ * 
+ * Usage: 
+ *   ./ksucre-sid.bt <oracle_sid>
+ *
+ * Notes:
+ *   ksucre is also invoked by PX processes (and possibly 
+ *   by different background processes as well), so just 
+ *   counting the number ksucre calls will not perfectly 
+ *   reflect 'end user logons'. Therefore, just consider 
+ *   this a reasonable approximation.
+ *
+ *   Adjust the ORACLE_HOME path for your environment. 
+ */
+
+#define KSPSSIDST_ADDR   0x60009628
+
+BEGIN
+{
+   if ($# < 1) {
+        printf("\nUsage: ksucre-sid.bt <oracle_sid>\n");
+        exit();
+    } else {
+        @arg_set=1;
+    }
+
+    printf("Tracing ksucre calls ... Hit ^C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:ksucre
+/ str(uptr(KSPSSIDST_ADDR)) == str($1) /
+{
+    @logons++;
+    @logons_tot++;
+}
+
+interval:s:1 {
+    time("%H:%M:%S: ");
+    printf("%lu\n", @logons);
+    clear(@logons);
+}
+
+END 
+{
+    /* Don't print this block if no arg passed to the script */
+    if (@arg_set) {
+        printf("\nTotal logons: %lu\n", @logons_tot);
+        clear(@logons);
+        clear(@logons_tot);
+    }
+
+    clear(@arg_set);
+}
