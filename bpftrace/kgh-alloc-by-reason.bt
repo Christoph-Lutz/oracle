@@ -3,9 +3,13 @@
  * Purpose:
  *   Trace kgh memory allocations by reason.
  *
- *   Based on dtrace_kghal_pga_code.sh by Stefan Koehler:
- *   https://github.com/skoehler-soocs/soocs-scripts/blob/main/Oracle_DTrace/dtrace_kghal_pga_code.sh
- *
+* Credits:
+ *   Based on the following scripts: 
+ *     - dtrace_kghal_pga_code.sh by Stefan Koehler:
+ *       https://github.com/skoehler-soocs/soocs-scripts/blob/main/Oracle_DTrace/dtrace_kghal_pga_code.sh
+ *     - trace_kghal.sh by Tanel Poder:
+ *       https://github.com/tanelpoder/tpt-oracle/blob/master/dtrace/trace_kghal.sh
+ *       
  * Author:
  *   Christoph Lutz
  * 
