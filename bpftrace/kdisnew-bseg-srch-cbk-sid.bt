@@ -1,0 +1,116 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Oracle kernel function kdisnew_bseg_srch_cbk is called 
+ *   when an index block is split and space for a new block 
+ *   is searched. Idea of this script is to trace the calls 
+ *   of this function to identify oracle sessions that are 
+ *   incurring block splits and related space issues in 
+ *   real-time.
+ * 
+ *   Some of the information is also provided by oracle trace
+ *   event 10224 (s. also MOS doc id 2281781.1), but the 
+ *   trace doesn't show sql statement level details.
+ *
+ *   The script reads various fields from the internal sga
+ *   structures underlying v$session (x$ksuse) and provides
+ *   the following summary information when it terminates:
+ *   - Total nr of kdisnew_bseg_srch_cbk calls 
+ *     by sid and sql_hash_value
+ *   - Total nr of kdisnew_bseg_srch_cbk calls 
+ *     by sid, sql_hash_value and call stack
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Date:
+ *  May-04 2023
+ * 
+ * Usage:
+ *   BPFTRACE_CACHE_USER_SYMBOLS=1 ./kdisnew-bseg-srch-cbk-sid.bt <oracle_sid>
+ *
+ *   The script can be changed to filter and aggregate in
+ *   different ways.
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.  
+ * 
+ * Tested on: 
+ *   Oracle 19.17 and Oracle 19.23
+ */
+
+#define KSUSENUM_OFF      0x878     /* session id offset      */
+#define KSUSESER_OFF      0x87c     /* session serial# offset */
+#define KSUSESQL_OFF      0x978     /* sql addr offset        */
+#define KSUSESQL_TEXT_OFF 0x1c0     /* sql text offset        */
+#define KSUSESQH_OFF      0x984     /* sql hash offset        */
+#define KSUUDNAM_OFF      0x44      /* username offset        */
+
+#define DBA_OFF           0x14
+#define SADDR_TLS_OFF     0xff78
+#define KSPSSIDST_ADDR    0x60009628
+
+BEGIN
+{
+    if ($# < 1) { 
+        printf("\nUsage: kdisnew-bseg-srch-cbk-sid.bt <oracle_sid>\n\n");
+        exit();
+    } else {
+        @arg_set = 1;
+    }
+
+    printf("Tracing kdisnew_bseg_srch_cbk calls ... Hit ^C to stop.\n\n");
+
+    printf("%-8s %-7s %-15s %-10s %-6s %-6s %-10s %-10s %-64s\n",
+           "TIME", "PID", "COMM", "DBA", "SID", "SERIAL", "USERNAME", "SQL_HASH", "SQL_TEXT");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kdisnew_bseg_srch_cbk
+/ str(uptr(KSPSSIDST_ADDR)) == str($1) /
+{
+    @kdisnew[pid] = 1;
+    $dba = *(uint32 *) uptr(arg0 + (uint64) DBA_OFF);              
+    $fsbase = uptr(curtask->thread.fsbase);                    
+    $saddr = *(uint64 *) uptr($fsbase - (uint64) SADDR_TLS_OFF); 
+    $sid = *(uint16 *) uptr($saddr + (uint64) KSUSENUM_OFF);  
+    $serial = *(uint16 *) uptr($saddr + (uint64) KSUSESER_OFF); 
+    $sql_addr = *(uint64 *) uptr($saddr + (uint64) KSUSESQL_OFF); 
+    $sql_text = uptr($sql_addr + (uint64) KSUSESQL_TEXT_OFF);          
+    $sql_hash = *(uint32 *) uptr($saddr + (uint64) KSUSESQH_OFF);  
+    $username = uptr($saddr + (uint64) KSUUDNAM_OFF); 
+
+    time("%H:%M:%S ");
+    printf("%-7lu %-15s %-10u %-6u %-6u %-10s %-10lu %-64s\n",
+           pid, comm, $dba, $sid, $serial, str($username), $sql_hash, str($sql_text));
+
+    /* 
+     * Remove comments to print call stacks
+     * in real-time - this is very verbose!
+     */
+     // printf("%lu %s\n", pid, ustack());
+
+     @call_cnt_tot[$sid, $sql_hash]++;
+     @stack_cnt_tot[$sid, $sql_hash, ustack()]++;
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kdisnew_bseg_srch_cbk
+/ @kdisnew[pid] / 
+{
+    @kdisnew[pid] = 0;
+}
+
+END {
+    /* Don't print this block if no arg passed to the script */
+    if (@arg_set) {
+        print("\n\nTotal call count by sid and sql_hash_value:\n");
+        print(@call_cnt_tot);
+        clear(@call_cnt_tot);
+
+        print("\n\nTotal stack count by sid and sql_hash_value:\n");
+        print(@stack_cnt_tot);
+        clear(@stack_cnt_tot);
+
+        clear(@kdisnew);
+        clear(@arg_set);
+    }
+}
