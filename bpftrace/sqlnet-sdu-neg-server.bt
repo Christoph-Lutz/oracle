@@ -1,0 +1,224 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Show the sdu size negotiated between client and server
+ *   without resorting to sqlnet trace.
+ *
+ * Date:
+ *   Oct-01 2024
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./sdu-neg-server.bt
+ *
+ * Tested on:
+ *   Oracle 19.22 and 19.23
+ *
+ * Notes:
+ *   In short, the sdu negotiation between client and server
+ *   goes as follows:
+ *
+ *   1. Client: Send the requested sdu size in a NSTPCN packet
+ *              to the server
+ *   2. Server: Check if the requested sdu size is less than or
+ *              equal to the server sdu size
+ *   3. Server: Send the accepted sdu size in a NSTPAC packet
+ *              to the client
+ *
+ *   By probing the snttread (read) and snttwrite (write) calls
+ *   on the sqlnet sockets in steps 1. and 3., we can trace the
+ *   requested and accepted sdu size between client and server.
+ *
+ *   This script also works with shared servers and drcp, but it
+ *   has mostly been tested and used with dedicated server conn-
+ *   ections and with OCI based clients (sqlplus). So, it may not
+ *   work with different client libraries!
+ *
+ *   If you need to restrict/filter the sdu negotiations to a
+ *   particular db instance, refer to script sdu-neg-server-sid.bt.
+ *
+ *   You can also use this script to test and observe how Oracle
+ *   behaves with different client and server sdu size settings.
+ *
+ *   Extreme cases: 
+ *     - sdu < 512 bytes: Oracle rounds up to 512 bytes
+ *     - sdu > 2 MB: Oracle rounds down to 2 MB
+ *
+ *   Adjust the ORACLE_HOME path for your environment.
+ *
+ * Further details:
+ *   With dedicated server connections, the logic is straight-
+ *   forward: 
+ *     - The listener handles the initial NSPTCN/NSPTRS part of
+ *       the tns handshake 
+ *     - The client sends an NSPTCN packet with the requested
+ *       sdu size to the server
+ *     - The server acknowledges the clients NSPTCN with an 
+ *      NSPTAC packet with the server's sdu size
+ *
+ *  As the listener handles the inital part of the tns handshake,
+ *  it suffices to probe snttread in the Oracle binary to check
+ *  if an NSPTCN packet arrives. In other words, there's no need
+ *  to probe the listener in the dedicated server case, because 
+ *  the second NSPTCN packet of the tns handshake is sent to the
+ *  dedicated server directly, rather than the listener.
+ *
+ *  Note that the tracing 'starts' in nsrcvreq for the following
+ *  reasons:
+ *    - This funtion gets invoked when a new connection is 
+ *      created.
+ *    - We can use this function as a 'marker' to only trace
+ *      trace snttread calls in the context of the nsrcvreq 
+ *      code path. This means, we won't have to trace all
+ *      snttread calls.
+ *    - This function is invoked in the shared server and drcp 
+ *      code paths as well.
+ *
+ *  With drcp, things are a bit different and two snttread
+ *  calls are issued in the nsrcvreq code path like so:
+ * 
+ *  nsrcvreq
+ *     nsrecv
+ *       nsdo
+ *         nscon
+ *           nsprecv
+ *             nttrd
+ *               snttread  <<< First read - pkt type: NSPTCN (0x1),
+ *                 read        read 8 bytes only!
+ *             ntctst
+ *               ntctbld
+ *               sntpoltst
+ *                 poll@plt
+ *             nttrd
+ *               snttread  <<< Second read - pkt type: ? (0xc),
+ *                 read        sdu offset: 0x32
+ *
+ *  In this case, the sdu size is read on the second snttread 
+ *  call and the script logic caters for this scenario by count-
+ *  ing snttread calls in the context of nsrcvreqg. Moreover,
+ *  also note that with drcp, the packet type and sdu offset in
+ *  the tns packet differes from the dedicated and share server
+ *  case. 
+ * 
+ * Changes in 23ai:
+ *   In 23ai the tns handshake protocol seems to have changed 
+ *   and oracle introduced the new "FAST-NS handoff", which is 
+ *   (not yet) publically documented. The FAST-NS is controlled 
+ *   by the (also undocumented) FAST_NS_CONNECT listener.ora set- 
+ *   ting that default to TRUE. So, if testing on 23ai, you may 
+ *   want to set FAST_NS_CONNECT=false in your listener.ora.
+ */
+
+#define AF_INET          0x2
+
+#define NSPTCN           0x1
+#define NSPTAC           0x2
+#define NSPTCN_DRCP      0xc
+#define NSPT_OFF         0x4
+
+#define SDU_OFF_AC       0x20
+#define SDU_OFF_CN       0x3a
+#define SDU_OFF_CN_DRCP  0x32
+
+#define KSPSSIDST_ADDR   0x60009628
+
+BEGIN
+{
+    printf("Tracing sdu negotiation ... Hit ^C to stop.\n\n");
+
+    printf("%-8s %-15s %-7s %-15s %-15s %5s %-15s %5s %10s %10s\n",
+           "TIME", "SID", "PID", "COMM", "SRC_IP", "SPORT", "DST_IP", "DPORT", "REQ_SDU", "ACC_SDU");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:nsrcvreq
+{
+    @nsrcvreq[tid] = 1;
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:nsrcvreq
+/ @nsrcvreq[tid] /
+{
+    delete(@nsrcvreq[tid]);
+    delete(@snttread[tid]);
+}
+
+/* 
+ * snttread() is a vos wrapper function 
+ * around read() and takes the same args
+ * (on linux).
+ */
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:snttread
+/ @nsrcvreq[tid] /
+{
+    @fd[tid] = (int32) arg0;
+    @buf[tid] = (uint64) arg1;
+    @snttread[tid]++;
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:snttread
+/ @snttread[tid] / {
+    $nsp_type = *(uint8 *)(@buf[tid] + NSPT_OFF);
+
+    /* Dedicated and shared server case */
+    if (@snttread[tid] == 1 && $nsp_type == NSPTCN) {
+        // printf("%lu %s <- snttread NSPTCN\n", tid, comm);
+        $sdu_offset = (uint64) SDU_OFF_CN;
+        @sdu_client[tid] = bswap(*(uint32 *)(@buf[tid] + $sdu_offset));
+    }
+
+    /* Drcp case */
+    if (@snttread[tid] == 2 && $nsp_type == NSPTCN_DRCP) {
+        // printf("%lu %s <- snttread NSPTCN_DRCP\n", pid, comm);
+        $sdu_offset = (uint64) SDU_OFF_CN_DRCP;
+        @sdu_client[tid] = bswap(*(uint32 *)(@buf[tid] + $sdu_offset));
+    }
+
+    delete(@fd[tid]);
+    delete(@buf[tid]);
+}
+
+/*
+ * snnwrite() is a vos wrapper function
+ * around write() and takes the same args
+ * (on linux).
+ */
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:snttwrite
+/ @sdu_client[tid] /
+{
+    $fd = (int32) arg0;
+    $buf = (uint64) arg1;
+    $nsp_type = *(uint8 *)($buf + NSPT_OFF);
+
+    if($nsp_type == NSPTAC) {
+        $sock = (struct socket *)((struct file *) *(curtask->files->fdt->fd + (uint64) $fd))->private_data;
+        $sk = $sock->sk;
+        $inet_family = $sk->__sk_common.skc_family;
+
+        /* Code below copied from tcpaccept.bt by Dale Hamel */
+        if ($inet_family == AF_INET) {
+            $daddr = ntop(0);
+            $saddr = ntop(0);
+            $daddr = ntop($sk->__sk_common.skc_daddr);
+            $saddr = ntop($sk->__sk_common.skc_rcv_saddr);
+            $lport = $sk->__sk_common.skc_num;
+            $dport = bswap($sk->__sk_common.skc_dport);
+            $sdu_server = bswap(*(uint32 *)($buf + SDU_OFF_AC));
+
+            time("%H:%M:%S ");
+            printf("%-15s %-7lu %-15s %-15s %5u %-15s %5u %10d %10d\n", str(uptr(KSPSSIDST_ADDR)),
+                   pid, comm, $daddr, $dport, $saddr, $lport, @sdu_client[tid], $sdu_server);
+
+            delete(@sdu_client[tid]);
+        }
+    }
+}
+
+END {
+    clear(@nsrcvreq);
+    clear(@fd);
+    clear(@buf);
+    clear(@snttread);
+    clear(@sdu_client);
+}
