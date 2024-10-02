@@ -1,0 +1,74 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Trace the sqlnet read and write buffer sizes and then
+ *   provide a visual break-down of the buffer size distri-
+ *   bution in a histogram. You can use this to gauge the 
+ *   sdu size effectiveness.
+ *
+ * Date:
+ *   Sep-25 2024
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./sqlnet-rw-sz-hist.bt
+ *
+ * Tested on:
+ *   Oracle 19.23
+ *
+ * Notes:
+ *   This script traces the sqlnet read and write calls 
+ *   of all oracle sids running from the same oracle home.
+ *   If you need to filter by a particular oracle sid, 
+ *   refer to script sqlnet-rw-sz-hist-sid.bd.
+ * 
+ *   Adjust the ORACLE_HOME path for your environment.
+ */
+
+#define KSPSSIDST_ADDR   0x60009628
+
+BEGIN
+{
+    printf("Tracing snttread and snttwrite calls ... Hit ^C to stop.\n\n");
+}
+
+/* 
+ * snttread() is a vos wrapper function 
+ * around read() and takes the same args
+ * (on linux) and has the same retval.
+ */
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:snttread
+{
+    $sid = str(uptr(KSPSSIDST_ADDR));
+    @r_sz_hist[$sid] = hist(retval);
+}
+
+/*
+ * snnwrite() is a vos wrapper function
+ * around write() and takes the same args
+ * (on linux) and has the same retval.
+ */
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:snttwrite
+{
+    $sid = str(uptr(KSPSSIDST_ADDR));
+    @w_sz_hist[$sid] = hist(retval);
+}
+
+END {
+    printf("\n\n");
+    printf("Read Size Histograms:\n");
+    printf("~~~~~~~~~~~~~~~~~~~~~\n");
+    printf("\n");
+    print(@r_sz_hist);
+
+    printf("\n");
+    printf("Write Size Histograms:\n");
+    printf("~~~~~~~~~~~~~~~~~~~~~~\n");
+    printf("\n");
+    print(@w_sz_hist);
+
+    clear(@r_sz_hist);
+    clear(@w_sz_hist);
+}
