@@ -1,0 +1,96 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Trace the sqlnet read and write buffer sizes and then
+ *   provide a visual break-down of the buffer size distri-
+ *   bution in a histogram. You can use this to gauge the
+ *   sdu size effectiveness. This script filters the output
+ *   by a given db instance.
+ *
+ * Date:
+ *   Sep-25 2024
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./sqlnet-rw-sz-hist-sid <oracle_sid>
+ *
+ * Tested on:
+ *   Oracle 19.23
+ *
+ * Notes:
+ *   This script allows you to filter the read and write calls
+ *   by a particular oracle sid. Refer to script sqlnet-rw-sz-hist.bt
+ *   to trace all oracle sids running from an oracle home.
+ * 
+ *   Adjust the ORACLE_HOME path for your environment.
+ */
+
+#define KSPSSIDST_ADDR   0x60009628
+
+BEGIN
+{
+    if ($# < 1) {
+        printf("\nUsage: sqlnet-rw-sz-hist-sid.bt <oracle_sid>\n\n");
+        exit();
+    } else {
+        @arg_set = 1;
+    }
+
+    printf("Tracing snttread and snttwrite calls for database instance %s ... Hit ^C to stop.\n\n", str($1));
+}
+
+/* 
+ * snttread() is a vos wrapper function 
+ * around read() and takes the same args
+ * (on linux) and has the same retval.
+ */
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:snttread
+/ str(uptr(KSPSSIDST_ADDR)) == str($1) /
+{
+    $sid = str(uptr(KSPSSIDST_ADDR));
+    @r_sz_hist[$sid] = hist(retval);
+    @r_tot[$sid] = count();
+}
+
+/*
+ * snnwrite() is a vos wrapper function
+ * around write() and takes the same args
+ * (on linux) and has the same retval.
+ */
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:snttwrite
+/ str(uptr(KSPSSIDST_ADDR)) == str($1) /
+{
+    $sid = str(uptr(KSPSSIDST_ADDR));
+    @w_sz_hist[$sid] = hist(retval);
+    @w_tot[$sid] = count();
+}
+
+END {
+
+    /* Don't print this block if no arg passed to the script */
+    if (@arg_set) {
+        printf("\n\n");
+        printf("Read Size Histogram:\n");
+        printf("~~~~~~~~~~~~~~~~~~~~\n");
+        printf("\n");
+        print(@r_sz_hist);
+        printf("Total reads:\n");
+        print(@r_tot);
+
+        printf("\n");
+        printf("Write Size Histogram:\n");
+        printf("~~~~~~~~~~~~~~~~~~~~~\n");
+        printf("\n");
+        print(@w_sz_hist);
+        printf("Total writes:\n");
+        print(@w_tot);
+    }
+
+    clear(@arg_set);
+    clear(@r_sz_hist);
+    clear(@w_sz_hist);
+    clear(@r_tot);
+    clear(@w_tot);
+}
