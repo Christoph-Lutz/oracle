@@ -1,0 +1,196 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Trace sqlnet ns packets for a given oracle sid 
+ *   by probing the tns read and write functions. 
+ *
+ * Date:
+ *   Oct-03 2024
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./nsp-trace-sid.bt <oracle_sid> [<listener?>]
+ * 
+ *   - oracle_sid: name of the oracle sid to trace
+ *   - listener? : supply 'yes' to also trace the
+ *                 listener processes (default: 'no')
+ *
+ *   Examples:
+ *     Trace sid and listener:
+ *     ./nsp-trace-sid-23ai-free.bt FREE yes
+ * 
+ *     Trace sid only:
+ *     ./nsp-trace-sid-23ai-free.bt FREE
+ *
+ * Tested on:
+ *   Oracle 23ai free (23.5.0.24.07), VirtualBox Image,
+ *   kernel 5.15.0-210.163.7, bpftrace 0.16
+ *
+ * Notes:
+ *   Important: Tracing with the UEK7 kernel version
+ *   5.15.0-3.60.5.1 is hopelessly broken. Either upgrade
+ *   to the more recent UEK7/u2 kernel version 5.15.0-210.163.7
+ *   or use an older one, like 4.18.0-553.16.1.
+ *
+ *   Adjust the ORACLE_HOME paths for your environment. 
+ *
+ *   With grid infrastructure, the oracle listener is
+ *   running from a different oracle home than the rdbms
+ *   intance and you need to set both oracle home paths
+ *   accordingly.
+ *   
+ *   The tns NSPT (ns packet type) definitions are taken 
+ *   from MOS doc id 1007807.6. Hopefully they are still 
+ *   accurate (haven't verified all of them). 
+ */
+
+#define NSPTCN     0x1         /* connect             */
+#define NSPTAC     0x2         /* accept              */
+#define NSPTAK     0x3         /* acknowledge         */
+#define NSPTRF     0x4         /* refuse              */
+#define NSPTDA     0x6         /* data                */
+#define NSPTNL     0x7         /* null/empty data     */
+#define NSPTAB     0x9         /* abort               */
+#define NSPTRS     0xb         /* resend              */
+#define NSPTMK     0xc         /* marker              */
+#define NSPTAT     0xd         /* attention           */
+#define NSPTCNL    0xe         /* control information */
+
+#define AF_INET    0x2
+#define NSPT_OFF   0x4
+
+#define KSPSSIDST  0x6000b760
+
+BEGIN
+{
+    if ($# < 1 || $# > 2) {
+        printf("\nUsage: nsp-trace-sid.bt <oracle_sid> [<listener?>]\n");
+        exit();
+    } 
+
+    @lsnr_trc = str($2) == "yes" ? 1 : 0;
+    
+    printf("Tracing ns packets for db instance %s ... Hit ^C to stop.\n\n", str($1));
+
+    printf("%-15s %-15s %-7s %-15s %-15s %-5s %-15s %-5s %-9s %-11s %-7s\n",
+           "TIME", "SID", "PID", "COMM", "SRC_IP", "SPORT", "DST_IP", 
+           "DPORT", "DIRECTION", "NSPT", "SIZE");
+
+    @nspt2str[NSPTCN]  = "CONNECT";
+    @nspt2str[NSPTAC]  = "ACCEPT";
+    @nspt2str[NSPTAK]  = "ACKNOWLEDGE";
+    @nspt2str[NSPTRF]  = "REFUSE";
+    @nspt2str[NSPTRF]  = "REFUSE";
+    @nspt2str[NSPTDA]  = "DATA";
+    @nspt2str[NSPTNL]  = "NULL";
+    @nspt2str[NSPTAB]  = "ABORT";
+    @nspt2str[NSPTRS]  = "RESEND";
+    @nspt2str[NSPTMK]  = "MARKER";
+    @nspt2str[NSPTAT]  = "ATTENTION";
+    @nspt2str[NSPTCNL] = "CONTROL";
+}
+
+/* 
+ * snttread() is a vos wrapper function around read() and takes the same 
+ * args (on linux).
+ */
+uprobe:/opt/oracle/product/23ai/dbhomeFree/bin/oracle:snttread,
+uprobe:/opt/oracle/product/23ai/dbhomeFree/lib/libclntsh.so.23.1:snttread
+/ (comm == "tnslsnr" && @lsnr_trc) || str(uptr(KSPSSIDST)) == str($1) /
+{
+    @fd[pid] = (int32) arg0;
+    @buf[pid] = (uint64) arg1;
+    @snttread[pid] = 1;
+}
+
+uretprobe:/opt/oracle/product/23ai/dbhomeFree/bin/oracle:snttread,
+uretprobe:/opt/oracle/product/23ai/dbhomeFree/lib/libclntsh.so.23.1:snttread
+/ @snttread[pid] / 
+{
+    $fd = @fd[pid];
+    $nspt = *(uint8 *)(@buf[tid] + NSPT_OFF);
+    $sock = (struct socket *)((struct file *) *(curtask->files->fdt->fd + (uint64) $fd))->private_data;
+    $sk = $sock->sk;
+    $inet_family = $sk->__sk_common.skc_family;
+
+    /* Code below copied from tcpaccept.bt by Dale Hamel */
+    if ($inet_family == AF_INET) {
+        $daddr = ntop(0);
+        $saddr = ntop(0);
+        $daddr = ntop($sk->__sk_common.skc_daddr);
+        $saddr = ntop($sk->__sk_common.skc_rcv_saddr);
+        $lport = $sk->__sk_common.skc_num;
+        $dport = bswap($sk->__sk_common.skc_dport);
+
+        if (comm == "tnslsnr" ) {
+            $sid = "(tnslsnr)";
+        } else {
+            $sid = str(uptr(KSPSSIDST));
+        }
+
+        printf("%s ", strftime("%H:%M:%S.%f", nsecs));
+        printf("%-15s %-7lu %-15s %-15s %-5u %-15s %-5u %-9s %-11s %-7d\n",
+               $sid, pid, comm, $daddr, $dport, $saddr, $lport, "RCV", @nspt2str[$nspt], retval);
+    }
+    delete(@fd[pid]);
+    delete(@buf[pid]);
+    delete(@snttread[pid]);
+}
+
+/*
+ * snttwrite() is a vos wrapper function around write() and takes the same 
+ * args (on linux).
+ */
+uprobe:/opt/oracle/product/23ai/dbhomeFree/bin/oracle:snttwrite,
+uprobe:/opt/oracle/product/23ai/dbhomeFree/lib/libclntsh.so.23.1:snttwrite
+/ (comm == "tnslsnr" && @lsnr_trc) || str(uptr(KSPSSIDST)) == str($1) /
+{
+    @fd[pid] = (int32) arg0;
+    @buf[pid] = (uint64) arg1;
+    @snttwrite[pid] = 1;
+}
+
+uretprobe:/opt/oracle/product/23ai/dbhomeFree/bin/oracle:snttwrite,
+uretprobe:/opt/oracle/product/23ai/dbhomeFree/lib/libclntsh.so.23.1:snttwrite
+/ @snttwrite[pid] /
+{
+    $fd = @fd[pid];
+    $nspt = *(uint8 *)(@buf[pid] + NSPT_OFF);
+    $sock = (struct socket *)((struct file *) *(curtask->files->fdt->fd + (uint64) $fd))->private_data;
+    $sk = $sock->sk;
+    $inet_family = $sk->__sk_common.skc_family;
+
+    /* Code below copied from tcpaccept.bt by Dale Hamel */
+    if ($inet_family == AF_INET) {
+        $daddr = ntop(0);
+        $saddr = ntop(0);
+        $daddr = ntop($sk->__sk_common.skc_daddr);
+        $saddr = ntop($sk->__sk_common.skc_rcv_saddr);
+        $lport = $sk->__sk_common.skc_num;
+        $dport = bswap($sk->__sk_common.skc_dport);
+
+        if (comm == "tnslsnr" ) {
+            $sid = "(tnslsnr)";
+        } else {
+            $sid = str(uptr(KSPSSIDST));
+        }
+
+        printf("%s ", strftime("%H:%M:%S.%f", nsecs));
+        printf("%-15s %-7lu %-15s %-15s %-5u %-15s %-5u %-9s %-11s %-7d\n", 
+                $sid, pid, comm, $saddr, $lport, $daddr, $dport, "SND", @nspt2str[$nspt], retval);
+    }
+    delete(@fd[pid]);
+    delete(@buf[pid]);
+    delete(@snttwrite[pid]);
+}
+
+END {
+    clear(@fd);
+    clear(@buf);
+    clear(@lsnr_trc);
+    clear(@snttread);
+    clear(@snttwrite);
+    clear(@nspt2str);
+}
