@@ -151,9 +151,8 @@ uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:nsrcvreq
 }
 
 /* 
- * snttread() is a vos wrapper function 
- * around read() and takes the same args
- * (on linux).
+ * snttread() is a vos wrapper function around read() and takes the same 
+ * args (on linux).
  */
 uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:snttread
 / @nsrcvreq[tid] /
@@ -164,7 +163,8 @@ uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:snttread
 }
 
 uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:snttread
-/ @snttread[tid] / {
+/ @snttread[tid] / 
+{
     $nsp_type = *(uint8 *)(@buf[tid] + NSPT_OFF);
 
     /* Dedicated and shared server case */
@@ -186,9 +186,8 @@ uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:snttread
 }
 
 /*
- * snnwrite() is a vos wrapper function
- * around write() and takes the same args
- * (on linux).
+ * snttwrite() is a vos wrapper function around write() and takes the same 
+ * args (on linux).
  */
 uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:snttwrite
 / @sdu_client[tid] /
