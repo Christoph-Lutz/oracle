@@ -1,0 +1,166 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Show the sdu size negotiated between client and server
+ *   without resorting to sqlnet trace.
+ *
+ * Date:
+ *   Oct-04 2024
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./sqlnet-sdu-neg-server-sid-23ai-fast-ns.bt <oracle_sid>
+ *
+ * Tested on:
+ *   Oracle 23ai free (23.5.0.24.07), VirtualBox Image,
+ *   kernel 5.15.0-210.163.7, bpftrace 0.16
+ *
+ *   Important: Tracing with the UEK7 kernel version
+ *   5.15.0-3.60.5.1 is hopelessly broken. Either upgrade
+ *   to the more recent UEK7/u2 kernel version 5.15.0-210.163.7
+ *   or use an older one, like 4.18.0-553.16.1.
+ *
+ * Notes:
+ *   This is a slightly modified and updated version of script
+ *   sqlnet-sdu-neg-server.bt that works with the new FAST-NS
+ *   handoff / handshake introduced in 23ai. Note that FAST-NS
+ *   can be switched off by setting FAST_NS_CONNECT=FALSE in 
+ *   the listener.ora configuration file.
+ *
+ *   This script also works with shared servers and drcp, but 
+ *   it has mostly been tested and used with dedicated server 
+ *   connections and with OCI based clients (sqlplus). So, it 
+ *   may not work with different client libraries!
+ *
+ *   Adjust the ORACLE_HOME paths for your environment.
+ */
+
+#define AF_INET          0x2
+
+#define NSPTCN           0x1
+#define NSPTAC           0x2
+#define NSPTCN_DRCP      0xc
+#define NSPT_OFF         0x4
+
+#define SDU_OFF_AC       0x20
+#define SDU_OFF_CN       0x3a
+#define SDU_OFF_CN_DRCP  0x32
+
+#define KSPSSIDST_ADDR   0x6000b760
+
+BEGIN
+{
+    if ($# < 1) {
+        printf("\nUsage: sdu-neg-server-sid.bt <oracle_sid>\n\n");
+        exit();
+    }
+
+    printf("Tracing sdu negotiation for database instance %s ... Hit ^C to stop.\n\n", str($1));
+
+    printf("%-8s %-15s %-7s %-15s %-15s %5s %-15s %5s %10s %10s\n",
+           "TIME", "SID", "PID", "COMM", "SRC_IP", "SPORT", "DST_IP", "DPORT", "REQ_SDU", "ACC_SDU");
+}
+
+uprobe:/opt/oracle/product/23ai/dbhomeFree/lib/libclntsh.so.23.1:nsrcvreq
+{
+    @nsrcvreq[tid] = 1;
+}
+
+uretprobe:/opt/oracle/product/23ai/dbhomeFree/lib/libclntsh.so.23.1:nsrcvreq
+/ @nsrcvreq[tid] /
+{
+    delete(@nsrcvreq[tid]);
+    delete(@snttread[tid]);
+}
+
+/* 
+ * snttread() is a vos wrapper function around read() and takes the same 
+ * args (on linux).
+ */
+uprobe:/opt/oracle/product/23ai/dbhomeFree/lib/libclntsh.so.23.1:snttread
+/ @nsrcvreq[tid] /
+{
+    @fd[tid] = (int32) arg0;
+    @buf[tid] = (uint64) arg1;
+    @snttread[tid]++;
+}
+
+uretprobe:/opt/oracle/product/23ai/dbhomeFree/lib/libclntsh.so.23.1:snttread
+/ @snttread[tid] / 
+{
+    $fd = @fd[tid];
+    $buf = @buf[tid];
+    $nsp_type = *(uint8 *)(@buf[tid] + NSPT_OFF);
+
+    $sock = (struct socket *)((struct file *) *(curtask->files->fdt->fd + (uint64) $fd))->private_data;
+    $sk = $sock->sk;
+    $inet_family = $sk->__sk_common.skc_family;
+
+    if ($inet_family == AF_INET) {
+        $daddr = $sk->__sk_common.skc_daddr;
+        $dport = bswap($sk->__sk_common.skc_dport);
+
+        /* Dedicated and shared server case */
+        if (@snttread[tid] == 1 && $nsp_type == NSPTCN) {
+            $sdu_offset = (uint64) SDU_OFF_CN;
+            @sdu_client[$daddr,$dport] = bswap(*(uint32 *)(@buf[tid] + $sdu_offset));
+        }
+
+        /* Drcp case */
+        if (@snttread[tid] == 2 && $nsp_type == NSPTCN_DRCP) {
+            printf("%lu %s <- snttread NSPTCN_DRCP\n", pid, comm);
+            $sdu_offset = (uint64) SDU_OFF_CN_DRCP;
+            @sdu_client[$daddr,$dport] = bswap(*(uint32 *)(@buf[tid] + $sdu_offset));
+        }
+    }
+
+    delete(@fd[tid]);
+    delete(@buf[tid]);
+}
+
+/*
+ * snttwrite() is a vos wrapper function around write() and takes the same 
+ * args (on linux).
+ */
+uprobe:/opt/oracle/product/23ai/dbhomeFree/bin/oracle:snttwrite
+/ str(uptr(KSPSSIDST_ADDR)) == str($1) /
+{
+    $fd = (int32) arg0;
+    $buf = (uint64) arg1;
+    $nsp_type = *(uint8 *)($buf + NSPT_OFF);
+
+    if($nsp_type == NSPTAC) {
+        $sock = (struct socket *)((struct file *) *(curtask->files->fdt->fd + (uint64) $fd))->private_data;
+        $sk = $sock->sk;
+        $inet_family = $sk->__sk_common.skc_family;
+
+        if ($inet_family == AF_INET) {
+            $saddr = ntop(0);
+            $daddr = $sk->__sk_common.skc_daddr;
+            $dport = bswap($sk->__sk_common.skc_dport);
+            $saddr = ntop($sk->__sk_common.skc_rcv_saddr);
+            $lport = $sk->__sk_common.skc_num;
+
+            $sdu_server = bswap(*(uint32 *)($buf + SDU_OFF_AC));
+            $sdu_client = @sdu_client[$daddr,$dport];
+
+            if ($sdu_client) {
+                time("%H:%M:%S ");
+                printf("%-15s %-7lu %-15s %-15s %5u %-15s %5u %10d %10d\n", str(uptr(KSPSSIDST_ADDR)),
+                       pid, comm, ntop($daddr), $dport, $saddr, $lport, @sdu_client[$daddr,$dport], $sdu_server);
+            }
+
+        }
+        delete(@sdu_client[$daddr,$dport]);
+    }
+}
+
+END {
+    clear(@nsrcvreq);
+    clear(@fd);
+    clear(@buf);
+    clear(@snttread);
+    clear(@sdu_client);
+}
