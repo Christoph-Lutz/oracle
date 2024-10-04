@@ -36,9 +36,6 @@
  *   ections and with OCI based clients (sqlplus). So, it may not
  *   work with different client libraries!
  *
- *   If you need to restrict/filter the sdu negotiations to a
- *   particular db instance, refer to script sdu-neg-server-sid.bt.
- *
  *   You can also use this script to test and observe how Oracle
  *   behaves with different client and server sdu size settings.
  *
