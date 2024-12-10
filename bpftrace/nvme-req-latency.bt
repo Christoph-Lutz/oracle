@@ -1,0 +1,81 @@
+#!/usr/bin/env -S bpftrace
+/* 
+ * Purpose:
+ *   Trace nvme request latencies and summarize them in histograms
+ *   by device and nvme request type. 
+ *  
+ * Author:
+ *   Christoph Lutz 
+ * 
+ * Date:
+ *   Nov-25 2024
+ *
+ * Tested on:
+ *   Exadata 24.1.2.0.0.240711
+ *   Kernel 5.4.17-2136.330.7.5
+ *
+ * Credits:
+ *   This script is based on the following work:
+ *   - John Mazzie, Understanding Applications Through NVMe Driver Tracing 
+ *     Using BPF, 2023-09-18 (t.ly/XbfLj)
+ *   - Rajan Shanmugavelu, Measuring NVMe Latency, 2024-06-13 (t.ly/iuM8e) 
+ *
+ * Usage:
+ *   ./nvme-req-latency.bt
+ *
+ * Notes:
+ *   This script was written to trace nvme request latency on 
+ *   Exadata storage cells. It only supports tracing of flush,
+ *   read, and write operations.
+ *
+ *   This is experimental, use it at your own risk!
+ */
+
+#include <linux/blkdev.h>
+#include <linux/nvme.h>
+
+struct nvme_request {
+	struct nvme_command	*cmd;
+	union nvme_result	result;
+	u8			retries;
+	u8			flags;
+	u16			status;
+	struct nvme_ctrl	*ctrl;
+};
+
+BEGIN 
+{
+    printf("Tracing nvme reqs... Hit ^C to stop.\n");
+
+    /* nvme command opcodes (nvme.h) */
+    @cmdstr[nvme_cmd_flush] = "FLUSH";
+    @cmdstr[nvme_cmd_write] = "WRITE";
+    @cmdstr[nvme_cmd_read]  = "READ";
+}
+
+kprobe:nvme_setup_cmd
+{
+    $req = (struct request *) arg1;
+    @cmd[$req] = (struct nvme_command *) arg2;
+    @req_start[$req] = ($req->rq_disk != 0) ? nsecs : 0;
+}
+
+kprobe:nvme_complete_rq
+/ @req_start[(struct request *) arg0] / 
+{
+    $req = (struct request *) arg0;
+    $disk = $req->rq_disk->disk_name;
+    $cmd = (struct nvme_command *) @cmd[$req];
+    $opcode = $cmd->rw.opcode & 0xff;
+    if ($opcode == nvme_cmd_flush || $opcode == nvme_cmd_write || $opcode == nvme_cmd_read) {
+        @latency_us[$disk, @cmdstr[$opcode]] = hist((nsecs - @req_start[$req])/1e3);
+    }
+    delete(@req_start[$req]);
+}
+
+END
+{
+    clear(@cmdstr);
+    clear(@cmd);
+    clear(@req_start);
+}
