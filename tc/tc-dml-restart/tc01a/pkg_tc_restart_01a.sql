@@ -14,6 +14,7 @@
  *   write consistency reasons.
  * 
  *   Eventually, session 1 will fail with an ORA-600 [13013][5001]
+ *
  *   error, which means that it finally gave up after 5,000 attempts.
  * 
  *   You can enable DML tracing to trace the Oracle three pass 
@@ -35,7 +36,7 @@
  *
  *   @setup.sql
  *
- *   When setup is complete, open two new session and start 
+ *   When setup is complete, open two new sessions and start 
  *   the test procedures:
  *  
  *   Session 1: @ses1.sql
