@@ -23,7 +23,7 @@
  * 
  *   Adjust the ORACLE_HOME path for your environment. 
  * 
- *   This script is potentially dangerous, use at your onw risk!
+ *   This script is potentially dangerous, use at your own risk!
  *  
  * Background information:
  *   Oracle may restart update statements for write consistency 
@@ -125,9 +125,9 @@
  *   Note: We're using the hash_value, because the sql_id
  *   is not stored anywhere, but dynamically computed from 
  *   the hash_value at runtime (a hash to sql_id conversion
- *   function would be straight-forwrd to write in native, 
- *   but is quite cumbersom with bpftrace; therefore, we 
- *   keep it very simplke and just log the hash_value).
+ *   function would be straight-forwrad to write in native
+ *   bpf, but it is quite cumbersome with bpftrace; therefore, 
+ *   we keep it very simplke and just log the hash_value).
  *
  *   OCT:
  *   Oracle command type (v$session.command).
@@ -174,6 +174,9 @@
  *   The number of current gets performed by a restarted
  *   update statement (technically this counts the number of
  *   calls to kcbgcur in updThreePhaseExe).
+ * 
+ *   ELA:
+ *   Elapsed time of a restarted update statement (in ms).
  */
 
 /* version dependent: may change in every RU!   */
