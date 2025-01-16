@@ -14,7 +14,6 @@
  *   write consistency reasons.
  * 
  *   Eventually, session 1 will fail with an ORA-600 [13013][5001]
- *
  *   error, which means that it finally gave up after 5,000 attempts.
  * 
  *   You can enable DML tracing to trace the Oracle three pass 
@@ -42,9 +41,12 @@
  *   Session 1: @ses1.sql
  *   Session 2: @ses2.sql
  *
+ * Notes:
+ *   To enable printing debug output change the G_DEBUG flag.
+ *   Debug output will be written to the alert log.
  */
 create or replace package pkg_tc_restart_01a as
-    G_DEBUG      boolean               := TRUE;
+    G_DEBUG      boolean               :=  FALSE;
     PIPE_SES1    constant varchar2(32) := 'PIPE_SES1';
     PIPE_SES2    constant varchar2(32) := 'PIPE_SES2';
     CMD_UPDATE   constant varchar2(32) := 'UPDATE';
@@ -110,15 +112,15 @@ create or replace package body pkg_tc_restart_01a as
          * as the processing order will not be deterministic otherwise).
          */
         if p_n = 1 then
-            debug(to_char(systimestamp, 'hh24:mi:ss.ff9') ||': test_func: send: p_n='||p_n);
+            debug(to_char(systimestamp, 'hh24:mi:ss.ff9') ||': ses1: test_func: send: p_n='||p_n);
             send(PIPE_SES2, CMD_UPDATE);
          
             /* Note: no need to check what msg exactly we're receiving here. */
             receive(PIPE_SES1, l_msg);
-            debug(to_char(systimestamp, 'hh24:mi:ss.ff9') ||': test_func: received: l_msg='||l_msg);
+            debug(to_char(systimestamp, 'hh24:mi:ss.ff9') ||': ses1: test_func: received: l_msg='||l_msg);
         end if;
 
-        debug(to_char(systimestamp, 'hh24:mi:ss.ff9') ||': test_func: ret: p_n='||p_n);
+        debug(to_char(systimestamp, 'hh24:mi:ss.ff9') ||': ses1: test_func: ret: p_n='||p_n);
         return p_n;
     end test_func;
 
