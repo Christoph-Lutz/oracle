@@ -36,10 +36,10 @@
  *   @setup.sql
  *
  *   When setup is complete, open two new sessions and start 
- *   the test procedures:
+ *   the test procedures (ses2 must be started first).
  *  
- *   Session 1: @ses1.sql
  *   Session 2: @ses2.sql
+ *   Session 1: @ses1.sql
  *
  * Notes:
  *   To enable printing debug output change the G_DEBUG flag.
