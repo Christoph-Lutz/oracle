@@ -1,0 +1,72 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Trace fetch calls (qertbFetch) and plot the fetch size
+ *   distribution by oracle sid in a histogram.
+ *
+ * Date:
+ *   Jan-17 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   fetch-size-hist-by-sid.bt [singleRowFetch?]
+ *
+ *   Arguments:
+ *     oracle_sid     : oracle sid / instance name
+ *     singleRowFetch?: option to filter out single-
+ *                      row fetches as these are mostly
+ *                      used by v8 bundled execution.
+ *                      Can be yes or no (default: yes).
+ *
+ * Tested on:
+ *   Oracle Oracle 19.22 and 19.23
+ *
+ * Notes:
+ *   Adjust KSPSSIDST_ADDR and ksuse offsets for your
+ *   Oracle version.
+ *
+ *   Adjust the ORACLE_HOME path for your environment.
+ *
+ *   You can easily adjust the group-by columns in the 
+ *   fetch size histogram as needed.
+ *
+ *   Use at your own risk!
+ */
+
+/* version dependent: may change in every RU!   */
+#define KSPSSIDST_ADDR 0x60009628  /* sid name   */
+
+BEGIN
+{
+    @OPT_SINGLE_ROW_FETCH = 1; 
+    if ($# == 1) {
+        if (str($1) == "no" || str($1) == "n") {
+            @OPT_SINGLE_ROW_FETCH = 0;
+        } 
+    }
+
+    printf("\n%s: ", strftime("%Y-%m-%dT%H:%M:%S", nsecs));
+    printf("Tracing fetch calls ... Hit ^C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetch
+{
+    $fetch_sz = (uint32) arg4;
+
+    /* 
+     * Don't consider fetch sizes >= 32000, as these 
+     * values seem to be used by internal and recur-
+     * sive queries (this needs more research).
+     */
+    if ($fetch_sz < 32000 || ($fetch_sz == 1 && @OPT_SINGLE_ROW_FETCH)) {
+        $sid = str(uptr(KSPSSIDST_ADDR));
+        @fetch_sz[$sid] = lhist($fetch_sz, 0, 5000, 10);
+    }
+}
+
+END
+{
+    clear(@OPT_SINGLE_ROW_FETCH)
+}
