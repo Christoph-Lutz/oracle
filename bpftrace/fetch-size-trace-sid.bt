@@ -1,0 +1,98 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Trace fetch calls (qertbFetch) and show the fetch
+ *   size plus additional context information from 
+ *   v$session (ksuse), like sid, username, sql hash, etc.
+ *
+ * Date:
+ *   Jan-17 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ * 
+ * Usage:
+ *   fetch-size-trace-sid.bt <oracle_sid>
+ * 
+ * Tested on:
+ *   Oracle 19.22 and 19.23
+ *
+ * Notes:
+ *   Adjust KSPSSIDST_ADDR and ksuse offsets for your
+ *   Oracle version.
+ *
+ *   Adjust the ORACLE_HOME path for your environment.
+ * 
+ *   Use at your own risk!
+ */
+
+/* version dependent: may change in every RU!   */
+#define KSPSSIDST_ADDR 0x60009628  /* sid name   */
+#define SADDR_TLS_OFF  0xff78      /* tls offset */
+#define KSUUDLNA_OFF   0xc5        /* username   */
+#define KSUUDOCT_OFF   0x5d6       /* command    */
+#define KSUSENUM_OFF   0x878       /* sid        */
+#define KSUSESQH_OFF   0x984       /* sql hash   */
+#define KSUSEPCO_OFF   0x9b4       /* plsql obj  */
+#define KSUSEPCS_OFF   0x9b8       /* plsql sub  */
+
+BEGIN
+{
+    if ($# < 1) {
+        printf("\nUsage: fetch-size-trace-sid.bt <oracle_sid>\n");
+        exit();
+    }
+
+    printf("Tracing fetch calls ... Hit ^C to stop.\n\n");
+
+    printf("%-19s %-15s %-7s %-15s %-5s %-10s %-10s %9s %11s %8s %4s %10s\n",
+           "TIME", "INSTANCE", "PID", "COMM", "SID", "USERNAME", "SQL_HASH", 
+           "PLSQL_OBJ", "PLSQL_SUBID", "FETCH_SZ", "ROWS", "ELA_US");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetch
+/ str(uptr(KSPSSIDST_ADDR)) == str($1) /
+{
+    @start_ns[pid] = nsecs;
+    @fetch_sz[pid] = (uint32) arg4;
+
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetch
+/ @fetch_sz[pid] /
+{
+    $rows = (uint32) (@fetch_sz[pid] - retval);
+
+    /*
+     * Don't consider fetch sizes >= 32000, as these
+     * values seem to be used by internal and recur-
+     * sive queries (this needs more research).
+     */
+    if (@fetch_sz[pid] < 32000) {
+        $ela_us     = (uint64) (nsecs - @start_ns[pid]) / 1e3;
+        $fsbase     = uptr(curtask->thread.fsbase);
+        $saddr_p    = uptr($fsbase - SADDR_TLS_OFF);
+        $saddr      = *(uint64 *) uptr($saddr_p);
+        $sid        = *(uint64 *)($saddr + KSUSENUM_OFF);
+        $oct        = *(uint8 *) uptr($saddr + KSUUDOCT_OFF);
+        $sql_hash   = *(uint32 *) uptr($saddr + KSUSESQH_OFF);
+        $plsql_obj  = *(uint32 *) uptr($saddr + KSUSEPCO_OFF);
+        $plsql_sub  = *(uint32 *) uptr($saddr + KSUSEPCS_OFF);
+        $user_p     = uptr($saddr + KSUUDLNA_OFF);
+
+        time("%Y-%m-%d %H:%M:%S ");
+        printf("%-15s %-7d %-15s %-5d %-10s %-10lu %9u %11u %8u %4u %10lu\n",
+               str(uptr(KSPSSIDST_ADDR)), pid, comm, $sid, str($user_p), 
+               $sql_hash, $plsql_obj, $plsql_sub, @fetch_sz[pid], $rows,  
+               $ela_us);
+    }
+
+    delete(@start_ns[pid]);
+    delete(@fetch_sz[pid]);
+}
+
+END
+{
+    clear(@start_ns);
+    clear(@fetch_sz);
+}
