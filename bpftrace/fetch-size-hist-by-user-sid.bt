@@ -1,0 +1,110 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Trace fetch calls (qertbFetch) and plot the fetch size
+ *   distribution by db username (v$session.username) in a 
+ *   histogram.
+ *
+ * Date:
+ *   Jan-17 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   fetch-size-hist-by-user-sid.bt <oracle_sid> [singleRowFetch?]
+ *
+ *   Arguments:
+ *     oracle_sid     : oracle sid / instance name
+ *     singleRowFetch?: option to filter out single-
+ *                      row fetches as these are mostly
+ *                      used by v8 bundled execution.
+ *                      Can be yes or no (default: yes).
+ *
+ * Tested on:
+ *   Oracle 19.22 and 19.23
+ *
+ * Notes:
+ *   Adjust KSPSSIDST_ADDR and ksuse offsets for your
+ *   Oracle version.
+ *
+ *   Adjust the ORACLE_HOME path for your environment.
+ *
+ *   You can easily adjust the group-by columns in the 
+ *   fetch size histogram as needed.
+ *
+ *   Use at your own risk!
+ */
+
+/* version dependent: may change in every RU!   */
+#define KSPSSIDST_ADDR 0x60009628  /* sid name   */
+#define SADDR_TLS_OFF  0xff78      /* tls offset */
+#define KSUUDLNA_OFF   0xc5        /* username   */
+#define KSUUDOCT_OFF   0x5d6       /* command    */
+#define KSUSENUM_OFF   0x878       /* sid        */
+#define KSUSESQH_OFF   0x984       /* sql hash   */
+#define KSUSEPCO_OFF   0x9b4       /* plsql obj  */
+#define KSUSEPCS_OFF   0x9b8       /* plsql sub  */
+
+BEGIN
+{
+    if ($# < 1) {
+        printf("\nUsage: fetch-size-hist-by-user-sid.bt <oracle_sid> [singleRowFetch?]\n");
+        exit();
+    } else {
+        @OPT_SINGLE_ROW_FETCH = 1; 
+        if (str($2) == "no" || str($2) == "n") {
+            @OPT_SINGLE_ROW_FETCH = 0;
+        } 
+    }
+
+    printf("\n%s: ", strftime("%Y-%m-%dT%H:%M:%S", nsecs));
+    printf("Tracing fetch calls ... Hit ^C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetch
+/ str(uptr(KSPSSIDST_ADDR)) == str($1) /
+{
+    $fetch_sz = (uint32) arg4;
+
+    /* 
+     * Don't consider fetch sizes >= 32000, as these 
+     * values seem to be used by internal and recur-
+     * sive queries (this needs more research).
+     */
+    if ($fetch_sz < 32000 || ($fetch_sz == 1 && @OPT_SINGLE_ROW_FETCH)) {
+        $fsbase     = uptr(curtask->thread.fsbase);
+        $saddr_p    = uptr($fsbase - SADDR_TLS_OFF);
+        $saddr      = *(uint64 *) uptr($saddr_p);
+        $user_p     = uptr($saddr + KSUUDLNA_OFF);
+
+        /* 
+         * Note: The check below is a clumsy way to
+         * filter out null users (usually these are 
+         * used internally). You may also want to 
+         * adjust histogram range and buckets:
+         * lhist(value, min, max, step) 
+         */
+        if ( *(uint8 *) $user_p) {
+            $user = str($user_p);
+
+            /* 
+             * Note: You could also use any of the
+             * fields below to group the histogram.
+             */
+             //$sid        = *(uint64 *)($saddr + KSUSENUM_OFF);
+             //$oct        = *(uint8 *) uptr($saddr + KSUUDOCT_OFF);
+             //$sql_hash   = *(uint32 *) uptr($saddr + KSUSESQH_OFF);
+             //$plsql_obj  = *(uint32 *) uptr($saddr + KSUSEPCO_OFF);
+             //$plsql_sub  = *(uint32 *) uptr($saddr + KSUSEPCS_OFF);
+
+             // @fetch_sz[$user] = lhist($fetch_sz, 0, 5000, 100);
+             @fetch_sz[$user] = lhist($fetch_sz, 0, 5000, 10);
+        }
+    }
+}
+
+END
+{
+    clear(@OPT_SINGLE_ROW_FETCH)
+}
