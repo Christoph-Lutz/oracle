@@ -1,0 +1,84 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Trace kdsgnp1 calls (Kernel Data Scan Get Next Piece)
+ *   to identify sql statements (by hash value) that incur
+ *   row chaining.
+ *
+ *   The script is really simple and just counts the total
+ *   number of calls to kdsgnp1, which retrieves the next
+ *   row piece of a chained or migrated row (that is to say, 
+ *   a fetch of a very wide row could incur multiple calls
+ *   to kdsgnp1).
+ *
+ *   Interestingly, there are scenarios where kdsgnp1 doesn't  
+ *   increment the "table fetch continued row" statistic even
+ *   though the row at hand is chained or migrated. The rea-
+ *   sons for this are not known, so this is something to
+ *   be still investigated further. Therefore, use this script
+ *   to provide an indication and a reasonable starting point 
+ *   as more detailed analysis is probably needed when invest-
+ *   igating scenarios with chained and migrated rows.
+ *
+ * Date:
+ *   Jan-20 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ * 
+ * Usage:
+ *   get-next-row-piece-sid.bt
+ * 
+ * Tested on:
+ *   Oracle 19.23
+ *
+ * Notes:
+ *   Adjust KSPSSIDST_ADDR and ksuse offsets for your
+ *   Oracle version.
+ *
+ *   Adjust the ORACLE_HOME path for your environment.
+ * 
+ *   Use at your own risk!
+ */
+
+/* version dependent: may change in every RU!   */
+#define KSPSSIDST_ADDR 0x60009628  /* sid name   */
+#define SADDR_TLS_OFF  0xff78      /* tls offset */
+#define KSUUDLNA_OFF   0xc5        /* username   */
+#define KSUUDOCT_OFF   0x5d6       /* command    */
+#define KSUSENUM_OFF   0x878       /* sid        */
+#define KSUSESQH_OFF   0x984       /* sql hash   */
+#define KSUSEPCO_OFF   0x9b4       /* plsql obj  */
+#define KSUSEPCS_OFF   0x9b8       /* plsql sub  */
+
+BEGIN
+{
+    printf("\n%s: ", strftime("%Y-%m-%dT%H:%M:%S", nsecs));
+    printf("Tracing kdsgnp1 calls ... Hit ^C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kdsgnp1
+{
+    $oracle_sid = str(uptr(KSPSSIDST_ADDR));
+    $fsbase     = uptr(curtask->thread.fsbase);
+    $saddr_p    = uptr($fsbase - SADDR_TLS_OFF);
+    $saddr      = *(uint64 *) uptr($saddr_p);
+    $sql_hash   = *(uint32 *) uptr($saddr + KSUSESQH_OFF);
+
+    /* 
+     * Note: If needed, you could also adjust the script
+     * and enrich it with additional  v$session / ksuse 
+     * context based on the fields below.
+     */
+    // $sid        = *(uint64 *)($saddr + KSUSENUM_OFF);
+    // $oct        = *(uint8 *) uptr($saddr + KSUUDOCT_OFF);
+    // $plsql_obj  = *(uint32 *) uptr($saddr + KSUSEPCO_OFF);
+    // $plsql_sub  = *(uint32 *) uptr($saddr + KSUSEPCS_OFF);
+    // $user_p     = uptr($saddr + KSUUDLNA_OFF);
+    
+    @sql_hash[$oracle_sid,$sql_hash] = count();
+}
+
+END
+{
+}
