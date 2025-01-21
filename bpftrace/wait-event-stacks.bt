@@ -41,7 +41,7 @@
 BEGIN
 {
     if ($# < 1) {
-        printf("\nUsage: BPFTRACE_CACHE_USER_SYMBOLS=1 ex-25-wait-event-stacks.bt <wait_event>\n");
+        printf("\nUsage: BPFTRACE_CACHE_USER_SYMBOLS=1 wait-event-stacks.bt <wait_event>\n");
         exit();
     }
 
