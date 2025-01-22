@@ -12,7 +12,7 @@
  *   Christoph Lutz
  * 
  * Usage:
- *   fetch-size-trace-sid.bt <oracle_sid>
+ *   fetch-size-trace-sid.bt <oracle_sid> [singleRowFetch?]
  * 
  * Tested on:
  *   Oracle 19.22 and 19.23
@@ -26,7 +26,7 @@
  *   Use at your own risk!
  */
 
-/* version dependent: may change in every RU!   */
+/* version dependent: may change in every RU!    */
 #define KSPSSIDST_ADDR 0x60009628  /* sid name   */
 #define SADDR_TLS_OFF  0xff78      /* tls offset */
 #define KSUUDLNA_OFF   0xc5        /* username   */
@@ -39,10 +39,16 @@
 BEGIN
 {
     if ($# < 1) {
-        printf("\nUsage: fetch-size-trace-sid.bt <oracle_sid>\n");
+        printf("\nUsage: fetch-size-trace-sid.bt <oracle_sid> [singleRowFetch?]\n");
         exit();
+    } else {
+        @OPT_SINGLE_ROW_FETCH = 1;
+        if (str($2) == "no" || str($2) == "n") {
+            @OPT_SINGLE_ROW_FETCH = 0;
+        }
     }
 
+    printf("\n%s: ", strftime("%Y-%m-%dT%H:%M:%S", nsecs));
     printf("Tracing fetch calls ... Hit ^C to stop.\n\n");
 
     printf("%-19s %-15s %-7s %-15s %-5s %-10s %-10s %9s %11s %8s %4s %10s\n",
@@ -55,7 +61,6 @@ uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetch
 {
     @start_ns[pid] = nsecs;
     @fetch_sz[pid] = (uint32) arg4;
-
 }
 
 uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetch
@@ -64,11 +69,15 @@ uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetch
     $rows = (uint32) (@fetch_sz[pid] - retval);
 
     /*
-     * Don't consider fetch sizes >= 32000, as these
-     * values seem to be used by internal and recur-
-     * sive queries (this needs more research).
+     * Don't consider fetch sizes >= 32000 as these values
+     * seem to be used by internal and recursive queries
+     * (this needs further research). Also, don't include
+     * single row fetches, if the singleRowFetch option
+     * is set to 'no'.
      */
-    if (@fetch_sz[pid] < 32000) {
+    if ((@fetch_sz[pid]  > 1 && @fetch_sz[pid] < 32000) ||
+        (@fetch_sz[pid] == 1 && @OPT_SINGLE_ROW_FETCH))
+    {
         $ela_us     = (uint64) (nsecs - @start_ns[pid]) / 1e3;
         $fsbase     = uptr(curtask->thread.fsbase);
         $saddr_p    = uptr($fsbase - SADDR_TLS_OFF);

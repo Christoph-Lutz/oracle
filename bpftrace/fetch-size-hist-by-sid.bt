@@ -35,7 +35,7 @@
  *   Use at your own risk!
  */
 
-/* version dependent: may change in every RU!   */
+/* version dependent: may change in every RU!    */
 #define KSPSSIDST_ADDR 0x60009628  /* sid name   */
 
 BEGIN
@@ -55,12 +55,16 @@ uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetch
 {
     $fetch_sz = (uint32) arg4;
 
-    /* 
-     * Don't consider fetch sizes >= 32000, as these 
-     * values seem to be used by internal and recur-
-     * sive queries (this needs more research).
+    /*
+     * Don't consider fetch sizes >= 32000 as these values
+     * seem to be used by internal and recursive queries
+     * (this needs further research). Also, don't include
+     * single row fetches, if the singleRowFetch option
+     * is set to 'no'.
      */
-    if ($fetch_sz < 32000 || ($fetch_sz == 1 && @OPT_SINGLE_ROW_FETCH)) {
+    if (($fetch_sz  > 1 && $fetch_sz < 32000) ||
+        ($fetch_sz == 1 && @OPT_SINGLE_ROW_FETCH))
+    {
         $sid = str(uptr(KSPSSIDST_ADDR));
         @fetch_sz[$sid] = lhist($fetch_sz, 0, 5000, 10);
     }
