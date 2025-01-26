@@ -1,9 +1,9 @@
 #!/usr/bin/env -S bpftrace --no-warnings
 /*
  * Purpose:
- *   Trace fetch calls (qertbFetch) and plot the fetch size
- *   distribution by db username (v$session.username) in a 
- *   histogram.
+ *   Trace fetch calls (qertbFetch and qertbFetchByRowID) for a given
+ *   oracle sid and plot the fetch size distribution by db username 
+ *   (v$session.username) in a histogram.
  *
  * Date:
  *   Jan-17 2025
@@ -62,7 +62,8 @@ BEGIN
     printf("Tracing fetch calls ... Hit ^C to stop.\n\n");
 }
 
-uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetch
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetch,
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetchByRowID
 / str(uptr(KSPSSIDST_ADDR)) == str($1) /
 {
     $fetch_sz = (uint32) arg4;

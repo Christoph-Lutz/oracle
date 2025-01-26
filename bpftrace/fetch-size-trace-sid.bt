@@ -1,9 +1,10 @@
 #!/usr/bin/env -S bpftrace --no-warnings
 /*
  * Purpose:
- *   Trace fetch calls (qertbFetch) and show the fetch
- *   size plus additional context information from 
- *   v$session (ksuse), like sid, username, sql hash, etc.
+ *   Trace fetch calls (qertbFetch and qertbFetchByRowID) 
+ *   and show the fetch size, how many rows they fetched
+ *   plus additional context information from v$session 
+ *   (ksuse), like sid, username, sql hash, etc.
  *
  * Date:
  *   Jan-17 2025
@@ -13,6 +14,14 @@
  * 
  * Usage:
  *   fetch-size-trace-sid.bt <oracle_sid> [singleRowFetch?]
+ *
+ *   Arguments:
+ *     singleRowFetch: yes|no (default: yes)
+ *                     Oracle piggy-backs single row fetches
+ *                     in kpoal8 (v8 bundled exec). This op- 
+ *                     tion will filter out these single row
+ *                     fetches (note: it will filter out
+ *                     index unique fetches as well).
  * 
  * Tested on:
  *   Oracle 19.22 and 19.23
@@ -24,6 +33,53 @@
  *   Adjust the ORACLE_HOME path for your environment.
  * 
  *   Use at your own risk!
+ * 
+ * Output columns:
+ *   The script prints the following output columns:
+ *
+ *   TIME: 
+ *   Current time
+ *
+ *   INSTANCE:
+ *   Oracle sid / instance name 
+ *
+ *   PID:
+ *   Oracle os pid
+ *
+ *   COMM:
+ *   Oracle command name
+ *
+ *   SID:
+ *   Oracle session id
+ *
+ *   USERNAME:
+ *   Oracle username
+ *
+ *   SQL_HASH:
+ *   Sql hash value (v$sql.hash_value)
+ * 
+ *   PLSQL_OBJ:
+ *   Plsql object id (v$session.plsql_cobject_id).
+ *   This maps to dba_objects.object_id.
+ *
+ *   PLSQL_SUBID:
+ *   Plsql subprogram id (v$session.plsql_subprogram_id).
+ *   This this maps to dba_procedures.subprogram_id.
+ *
+ *   FETCH_SIZE:
+ *   Fetch size
+ *     
+ *   ROWS:
+ *   Number of rows fetched
+ *
+ *   FETCH_TYPE:
+ *   Table (qertbFetch) or index (qertbFetchByRowID) 
+ *   fetch. Note: index fetches are subdivided into 
+ *   non-unique (qerixtFetch) and unique index 
+ *   (qertbFetchByRowID) fetches.
+ *
+ *   ELA_US:
+ *   Fetch elapsed time in usec
  */
 
 /* version dependent: may change in every RU!    */
@@ -51,9 +107,9 @@ BEGIN
     printf("\n%s: ", strftime("%Y-%m-%dT%H:%M:%S", nsecs));
     printf("Tracing fetch calls ... Hit ^C to stop.\n\n");
 
-    printf("%-19s %-15s %-7s %-15s %-5s %-10s %-10s %9s %11s %8s %4s %10s\n",
+    printf("%-19s %-15s %-7s %-15s %-5s %-10s %-10s %9s %11s %8s %4s %10s %10s\n",
            "TIME", "INSTANCE", "PID", "COMM", "SID", "USERNAME", "SQL_HASH", 
-           "PLSQL_OBJ", "PLSQL_SUBID", "FETCH_SZ", "ROWS", "ELA_US");
+           "PLSQL_OBJ", "PLSQL_SUBID", "FETCH_SZ", "ROWS", "FETCH_TYPE", "ELA_US");
 }
 
 uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetch
@@ -90,18 +146,90 @@ uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetch
         $user_p     = uptr($saddr + KSUUDLNA_OFF);
 
         time("%Y-%m-%d %H:%M:%S ");
-        printf("%-15s %-7d %-15s %-5d %-10s %-10lu %9u %11u %8u %4u %10lu\n",
-               str(uptr(KSPSSIDST_ADDR)), pid, comm, $sid, str($user_p), 
-               $sql_hash, $plsql_obj, $plsql_sub, @fetch_sz[pid], $rows,  
-               $ela_us);
+        printf("%-15s %-7d %-15s %-5d %-10s %-10lu %9u %11u %8u %4u %10s %10lu\n",
+               str(uptr(KSPSSIDST_ADDR)), pid, comm, $sid, str($user_p), $sql_hash, 
+               $plsql_obj, $plsql_sub, @fetch_sz[pid], $rows, "TABLE", $ela_us);
     }
 
     delete(@start_ns[pid]);
     delete(@fetch_sz[pid]);
 }
 
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetchByRowID
+/ str(uptr(KSPSSIDST_ADDR)) == str($1) /
+{
+    @fetchByRowID[pid] = 1;
+    @start_ns[pid] = nsecs;
+    @fetch_sz[pid] = (uint32) arg4;
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetchByRowID
+/ @fetch_sz[pid] /
+{
+    /* 
+     * The qertbFetchByRowID path must deal with the
+     * following two two cases:
+     *   1. qerixFetchUniqueIndex (unique index)
+     *   2. qerixtFetch (normal index)
+     * The first one is a special case and therefore,
+     * the expressions below check if there was a un-
+     * ique index access and if it returned a row (a 
+     * unique index access only ever return 1 row max-
+     * imum). The variables checked here are set in 
+     * the qerixFetchUniqueIndex return probe further
+     * down below.
+     */ 
+    $type = @fetchUniqueIndex[pid] ? "UQ_INDEX" : "INDEX";
+    $rows = @fetchUniqueRow[pid] ? 1 : (@fetch_sz[pid] - retval); 
+
+    /*
+     * Don't consider fetch sizes >= 32000 as these values
+     * seem to be used by internal and recursive queries
+     * (this needs further research). Also, don't include
+     * single row fetches, if the singleRowFetch option
+     * is set to 'no'.
+     */
+    if ((@fetch_sz[pid]  > 1 && @fetch_sz[pid] < 32000) ||
+        (@fetch_sz[pid] == 1 && @OPT_SINGLE_ROW_FETCH))
+    {
+        $ela_us     = (uint64) (nsecs - @start_ns[pid]) / 1e3;
+        $fsbase     = uptr(curtask->thread.fsbase);
+        $saddr_p    = uptr($fsbase - SADDR_TLS_OFF);
+        $saddr      = *(uint64 *) uptr($saddr_p);
+        $sid        = *(uint64 *)($saddr + KSUSENUM_OFF);
+        $oct        = *(uint8 *) uptr($saddr + KSUUDOCT_OFF);
+        $sql_hash   = *(uint32 *) uptr($saddr + KSUSESQH_OFF);
+        $plsql_obj  = *(uint32 *) uptr($saddr + KSUSEPCO_OFF);
+        $plsql_sub  = *(uint32 *) uptr($saddr + KSUSEPCS_OFF);
+        $user_p     = uptr($saddr + KSUUDLNA_OFF);
+
+        time("%Y-%m-%d %H:%M:%S ");
+        printf("%-15s %-7d %-15s %-5d %-10s %-10lu %9u %11u %8u %4u %10s %10lu\n",
+               str(uptr(KSPSSIDST_ADDR)), pid, comm, $sid, str($user_p),
+               $sql_hash, $plsql_obj, $plsql_sub, @fetch_sz[pid], $rows,
+               $type, $ela_us);
+    }
+
+    delete(@fetchByRowID[pid]);
+    delete(@fetchUniqueIndex[pid]);
+    delete(@fetchUniqueRow[pid]);
+    delete(@start_ns[pid]);
+    delete(@fetch_sz[pid]);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qerixFetchUniqueIndex
+/ @fetchByRowID[pid] /
+{
+    @fetchUniqueIndex[pid] = 1;
+
+    if (retval == 0) {
+        @fetchUniqueRow[pid] = 1;
+    }
+}
+
 END
 {
+    clear(@OPT_SINGLE_ROW_FETCH);
     clear(@start_ns);
     clear(@fetch_sz);
 }
