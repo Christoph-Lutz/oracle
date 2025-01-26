@@ -67,7 +67,7 @@ uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kdsgnp1
 
     /* 
      * Note: If needed, you could also adjust the script
-     * and enrich it with additional  v$session / ksuse 
+     * and enrich it with additional v$session / ksuse 
      * context based on the fields below.
      */
     // $sid        = *(uint64 *)($saddr + KSUSENUM_OFF);
