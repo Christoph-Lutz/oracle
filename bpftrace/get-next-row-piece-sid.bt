@@ -59,11 +59,11 @@ BEGIN
     }
 
     printf("\n%s: ", strftime("%Y-%m-%dT%H:%M:%S", nsecs));
-    printf("Tracing kdsgnp1 calls ... Hit ^C to stop.\n\n");
+    printf("Tracing kdsgnp1 calls for sid %s ... Hit ^C to stop.\n\n", str($1));
 }
 
 uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kdsgnp1
-// / str(uptr(KSPSSIDST_ADDR)) == str($1) /
+/ str(uptr(KSPSSIDST_ADDR)) == str($1) /
 {
     $fsbase     = uptr(curtask->thread.fsbase);
     $saddr_p    = uptr($fsbase - SADDR_TLS_OFF);
@@ -81,8 +81,7 @@ uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kdsgnp1
     // $plsql_sub  = *(uint32 *) uptr($saddr + KSUSEPCS_OFF);
     // $user_p     = uptr($saddr + KSUUDLNA_OFF);
     
-    $sid = str(uptr(KSPSSIDST_ADDR));
-    @sql_hash[$sid,$sql_hash] = count();
+    @sql_hash[$sql_hash] = count();
 }
 
 END
