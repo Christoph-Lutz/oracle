@@ -1,0 +1,89 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ *  Purpose:
+ *    Trace the cellsrv scrub request rate per second by grid 
+ *    disk. A scrub request is a call to ScrubbingJob::submitIO().
+ *
+ * Date:
+ *   Jan-26 2025
+ *
+ *  Author:
+ *    Christoph Lutz
+ * 
+ *  Usage: 
+ *    BPFTRACE_CACHE_USER_SYMBOLS=1 ./cellsrv-scrub-reqs-by-grid-disk.bt [scrubStacks?]
+ *
+ *    Arguments:
+ *      scrubStacks: yes or no (default: no)
+ *                   Collect scrub call stacks.
+ *
+ *  Tested on:
+ *    Exadata system sw 24.1.7.0.0.241204
+ *    Kernel 5.4.17-2136.336.5.3.1.el8uek.x86_64
+ *
+ *  Notes: 
+ *    The cellsrv binary dynamically remaps its text segment into 
+ *    hugepages at startup (osshugetlbtext_relocate). This breaks 
+ *    tracing probes ... So, if you want to trace cellsrv with this
+ *    script, set _cell_hugetlbtext_relocate=FALSE in cellinit.ora
+ *    and restart cellsrv.
+ *
+ *    This script is potentially dangerous, use at your own risk!
+ */
+
+#define GD_NAME_OFF 0x20
+
+BEGIN
+{
+    if ($# < 1) {
+        @OPT_SCRUB_STACKS = 0;
+    } else {
+        if (str($1) == "yes" || str($2) == "y") {
+            @OPT_SCRUB_STACKS = 1;
+        }
+    }
+
+    printf("\n%s: ", strftime("%Y-%m-%dT%H:%M:%S", nsecs));
+    printf("Tracing scrub req calls ... Hit ^C to stop.\n\n");
+}
+
+uprobe:/opt/oracle/cell/cellsrv/bin/cellsrv:"ScrubbingJob::submitIO(GridDisk*, DiskAddress&, unsigned long, int*)"
+{
+    /* 
+     * Note: the GridDisk pointer is passed in 
+     * arg1, because arg0 is used by the C++ this 
+     * pointer.
+     */
+    $gd_p = (uint64) arg1;
+    $gd_name = str(uptr($gd_p + GD_NAME_OFF));
+    @scrub_reqs[$gd_name] = count();
+    @scrub_regs_tot++;
+
+    if (@OPT_SCRUB_STACKS) {
+        @scrub_stacks[ustack()] = count();
+    }
+}
+
+interval:s:1
+{
+    printf("\n*** %s:\n", strftime("%Y-%m-%dT%H:%M:%S", nsecs));
+
+    printf("Total scrub reqs: %ld\n", @scrub_regs_tot);
+    clear(@scrub_regs_tot);
+
+    print(@scrub_reqs);
+    clear(@scrub_reqs);
+}
+
+END
+{
+    if (@OPT_SCRUB_STACKS) {
+        printf("Scrub call stacks:\n");
+        print(@scrub_stacks);
+        clear(@scrub_stacks);
+    }
+
+    clear(@OPT_SCRUB_STACKS);
+    clear(@scrub_reqs);
+    clear(@scrub_regs_tot);
+}
