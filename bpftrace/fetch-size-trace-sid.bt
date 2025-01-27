@@ -1,13 +1,13 @@
-#!/usr/bin/env -S bpftrace --no-warnings
+#!/usr/bin/env -S bpftrace --no-warnings 
 /*
  * Purpose:
- *   Trace fetch calls (qertbFetch and qertbFetchByRowID) 
+ *   Trace fetch calls of table and index access paths
  *   and show the fetch size, how many rows they fetched
  *   plus additional context information from v$session 
  *   (ksuse), like sid, username, sql hash, etc.
  *
  * Date:
- *   Jan-17 2025
+ *   Jan-27 2025
  *
  * Author:
  *   Christoph Lutz
@@ -17,11 +17,12 @@
  *
  *   Arguments:
  *     singleRowFetch: yes|no (default: yes)
- *                     Oracle piggy-backs single row fetches
- *                     in kpoal8 (v8 bundled exec). This op- 
- *                     tion will filter out these single row
- *                     fetches (note: it will filter out
- *                     index unique fetches as well).
+ *                     Filter out fetches that only fetch a
+ *                     single row. These can either be piggy-
+ *                     backed fetches from kpoal (v8 bundled
+ *                     exec) or index unique scan fetches.
+ *                     Filtering out these single row fetches
+ *                     may eliminate a lot of noise.
  * 
  * Tested on:
  *   Oracle 19.22 and 19.23
@@ -72,11 +73,13 @@
  *   ROWS:
  *   Number of rows fetched
  *
- *   FETCH_TYPE:
- *   Table (qertbFetch) or index (qertbFetchByRowID) 
- *   fetch. Note: index fetches are subdivided into 
- *   non-unique (qerixtFetch) and unique index 
- *   (qertbFetchByRowID) fetches.
+ *   ACCESS_PATH:
+ *   One of the following:
+ *      - TBL_SCAN     - Full table/segment scan (qertbFetch)
+ *      - TBL_INDX_RS  - Table access via index range scan (qerixtFetch)
+ *      - TBL_INDX_UQ  - Table access via index uq scan (qerixFetchUniqueIndex)
+ *      - INDX_RS_ONLY - Non-unique index only access (qerixtFetch)
+ *      - INDX_UQ_ONLY - Unique-index only access (qerixFetchUniqueIndex)
  *
  *   ELA_US:
  *   Fetch elapsed time in usec
@@ -107,10 +110,12 @@ BEGIN
     printf("\n%s: ", strftime("%Y-%m-%dT%H:%M:%S", nsecs));
     printf("Tracing fetch calls ... Hit ^C to stop.\n\n");
 
-    printf("%-19s %-15s %-7s %-15s %-5s %-10s %-10s %9s %11s %8s %4s %10s %10s\n",
+    printf("%-19s %-15s %-7s %-15s %-5s %-10s %-10s %9s %11s %8s %4s %12s %10s\n",
            "TIME", "INSTANCE", "PID", "COMM", "SID", "USERNAME", "SQL_HASH", 
-           "PLSQL_OBJ", "PLSQL_SUBID", "FETCH_SZ", "ROWS", "FETCH_TYPE", "ELA_US");
+           "PLSQL_OBJ", "PLSQL_SUBID", "FETCH_SZ", "ROWS", "ACCESS_PATH", "ELA_US");
 }
+
+/* *************** Table fetch paths *************** */
 
 uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetch
 / str(uptr(KSPSSIDST_ADDR)) == str($1) /
@@ -145,10 +150,16 @@ uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetch
         $plsql_sub  = *(uint32 *) uptr($saddr + KSUSEPCS_OFF);
         $user_p     = uptr($saddr + KSUUDLNA_OFF);
 
-        time("%Y-%m-%d %H:%M:%S ");
-        printf("%-15s %-7d %-15s %-5d %-10s %-10lu %9u %11u %8u %4u %10s %10lu\n",
-               str(uptr(KSPSSIDST_ADDR)), pid, comm, $sid, str($user_p), $sql_hash, 
-               $plsql_obj, $plsql_sub, @fetch_sz[pid], $rows, "TABLE", $ela_us);
+        /*
+         * Don't show 'null' user sessions
+         * (usually internal bg sessions).
+         */
+        if (*(uint8 *) $user_p) {
+            time("%Y-%m-%d %H:%M:%S ");
+            printf("%-15s %-7d %-15s %-5d %-10s %-10lu %9u %11u %8u %4u %12s %10lu\n",
+                   str(uptr(KSPSSIDST_ADDR)), pid, comm, $sid, str($user_p), $sql_hash, 
+                   $plsql_obj, $plsql_sub, @fetch_sz[pid], $rows, "TBL_SCAN", $ela_us);
+        }
     }
 
     delete(@start_ns[pid]);
@@ -158,7 +169,7 @@ uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetch
 uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetchByRowID
 / str(uptr(KSPSSIDST_ADDR)) == str($1) /
 {
-    @fetchByRowID[pid] = 1;
+    @tbFetchByRowID[pid] = 1;
     @start_ns[pid] = nsecs;
     @fetch_sz[pid] = (uint32) arg4;
 }
@@ -179,8 +190,8 @@ uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetchBy
      * the qerixFetchUniqueIndex return probe further
      * down below.
      */ 
-    $type = @fetchUniqueIndex[pid] ? "UQ_INDEX" : "INDEX";
-    $rows = @fetchUniqueRow[pid] ? 1 : (@fetch_sz[pid] - retval); 
+    $type = @tbFetchUniqueIndex[pid] ? "TBL_INDX_UQ" : "TBL_INDX_RS";
+    $rows = @tbFetchUniqueRow[pid] ? 1 : (@fetch_sz[pid] - retval); 
 
     /*
      * Don't consider fetch sizes >= 32000 as these values
@@ -203,28 +214,179 @@ uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetchBy
         $plsql_sub  = *(uint32 *) uptr($saddr + KSUSEPCS_OFF);
         $user_p     = uptr($saddr + KSUUDLNA_OFF);
 
-        time("%Y-%m-%d %H:%M:%S ");
-        printf("%-15s %-7d %-15s %-5d %-10s %-10lu %9u %11u %8u %4u %10s %10lu\n",
-               str(uptr(KSPSSIDST_ADDR)), pid, comm, $sid, str($user_p),
-               $sql_hash, $plsql_obj, $plsql_sub, @fetch_sz[pid], $rows,
-               $type, $ela_us);
+        /*
+         * Don't show 'null' user sessions
+         * (usually internal bg sessions).
+         */
+        if (*(uint8 *) $user_p) {
+            time("%Y-%m-%d %H:%M:%S ");
+            printf("%-15s %-7d %-15s %-5d %-10s %-10lu %9u %11u %8u %4u %12s %10lu\n",
+                   str(uptr(KSPSSIDST_ADDR)), pid, comm, $sid, str($user_p),
+                   $sql_hash, $plsql_obj, $plsql_sub, @fetch_sz[pid], $rows,
+                   $type, $ela_us);
+        }
     }
 
-    delete(@fetchByRowID[pid]);
-    delete(@fetchUniqueIndex[pid]);
-    delete(@fetchUniqueRow[pid]);
+    delete(@tbFetchByRowID[pid]);
+    delete(@tbFetchUniqueIndex[pid]);
+    delete(@tbFetchUniqueRow[pid]);
     delete(@start_ns[pid]);
     delete(@fetch_sz[pid]);
 }
 
+/* 
+ * Only fire this retprobe when a table is accessed via
+ * index (that is, when qertbFetchByRowID is calling
+ * into qerixFetchUniqueIndex). 
+ */
 uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qerixFetchUniqueIndex
-/ @fetchByRowID[pid] /
+/ @tbFetchByRowID[pid] /
 {
-    @fetchUniqueIndex[pid] = 1;
+    @tbFetchUniqueIndex[pid] = 1;
 
     if (retval == 0) {
-        @fetchUniqueRow[pid] = 1;
+        @tbFetchUniqueRow[pid] = 1;
     }
+}
+
+/* *************** Index only fetch paths *************** */
+
+/* 
+ * Index-only access paths call into qerixtFetch 
+ * and qerixFetchUniqueIndex from opifch2 directly. 
+ * However, both these these functions can also get
+ * called from various other places (recursive exe-
+ * cution or joins). Therefore, the probes below serve 
+ * as  filters to filter out recursive calls, so that 
+ * we (hopefully) only capture top-level calls. Any-
+ * how, this part here needs more work and thought,
+ * consider it experimental!
+ */
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:opiexe
+/ str(uptr(KSPSSIDST_ADDR)) == str($1) /
+{
+    @in_opiexe[pid] = 1;
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:opiexe
+/ @in_opiexe[pid] /
+{
+    delete(@in_opiexe[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:opifch2
+/ str(uptr(KSPSSIDST_ADDR)) == str($1) && !@in_opiexe[pid] /
+{
+    @in_opifch2[pid] = 1;
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:opifch2
+/ @in_opifch2[pid] /
+{
+    delete(@in_opifch2[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qerixFetchUniqueIndex
+/ @in_opifch2[pid] && !@tbFetchByRowID[pid] /
+{
+    @start_ns[pid] = nsecs;
+    @fetch_sz[pid] = (uint32) arg4;
+/*
+    printf("%ld %s DEBUG: ix unique only access!\n", pid, comm);
+    print(ustack());
+*/
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qerixFetchUniqueIndex
+/ @fetch_sz[pid] && !@tbFetchByRowID[pid] /
+{
+    $rows = (uint32) (@fetch_sz[pid] - retval);
+
+    /*
+     * Don't consider fetch sizes >= 32000 as these values
+     * seem to be used by internal and recursive queries
+     * (this needs further research). Also, don't include
+     * single row fetches, if the singleRowFetch option
+     * is set to 'no'.
+     */
+    if ((@fetch_sz[pid]  > 1 && @fetch_sz[pid] < 32000) ||
+        (@fetch_sz[pid] == 1 && @OPT_SINGLE_ROW_FETCH))
+    {
+        $ela_us     = (uint64) (nsecs - @start_ns[pid]) / 1e3;
+        $fsbase     = uptr(curtask->thread.fsbase);
+        $saddr_p    = uptr($fsbase - SADDR_TLS_OFF);
+        $saddr      = *(uint64 *) uptr($saddr_p);
+        $sid        = *(uint64 *)($saddr + KSUSENUM_OFF);
+        $oct        = *(uint8 *) uptr($saddr + KSUUDOCT_OFF);
+        $sql_hash   = *(uint32 *) uptr($saddr + KSUSESQH_OFF);
+        $plsql_obj  = *(uint32 *) uptr($saddr + KSUSEPCO_OFF);
+        $plsql_sub  = *(uint32 *) uptr($saddr + KSUSEPCS_OFF);
+        $user_p     = uptr($saddr + KSUUDLNA_OFF);
+
+        /*
+         * Don't show 'null' user sessions
+         * (usually internal bg sessions).
+         */
+        if (*(uint8 *) $user_p) {
+            time("%Y-%m-%d %H:%M:%S ");
+            printf("%-15s %-7d %-15s %-5d %-10s %-10lu %9u %11u %8u %4u %12s %10lu\n",
+                   str(uptr(KSPSSIDST_ADDR)), pid, comm, $sid, str($user_p), $sql_hash,
+                   $plsql_obj, $plsql_sub, @fetch_sz[pid], $rows, "INDX_UQ_ONLY", $ela_us);
+        }
+    }
+
+    delete(@start_ns[pid]);
+    delete(@fetch_sz[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qerixtFetch
+/ @in_opifch2[pid] && !@tbFetchByRowID[pid] /
+{
+    @start_ns[pid] = nsecs;
+    @fetch_sz[pid] = (uint32) arg4;
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qerixtFetch
+/ @fetch_sz[pid] && !@tbFetchByRowID[pid] /
+{
+    $rows = (uint32) (@fetch_sz[pid] - retval);
+
+    /*
+     * Don't consider fetch sizes >= 32000 as these values
+     * seem to be used by internal and recursive queries
+     * (this needs further research). Also, don't include
+     * single row fetches, if the singleRowFetch option
+     * is set to 'no'.
+     */
+    if ((@fetch_sz[pid]  > 1 && @fetch_sz[pid] < 32000) ||
+        (@fetch_sz[pid] == 1 && @OPT_SINGLE_ROW_FETCH))
+    {
+        $ela_us     = (uint64) (nsecs - @start_ns[pid]) / 1e3;
+        $fsbase     = uptr(curtask->thread.fsbase);
+        $saddr_p    = uptr($fsbase - SADDR_TLS_OFF);
+        $saddr      = *(uint64 *) uptr($saddr_p);
+        $sid        = *(uint64 *)($saddr + KSUSENUM_OFF);
+        $oct        = *(uint8 *) uptr($saddr + KSUUDOCT_OFF);
+        $sql_hash   = *(uint32 *) uptr($saddr + KSUSESQH_OFF);
+        $plsql_obj  = *(uint32 *) uptr($saddr + KSUSEPCO_OFF);
+        $plsql_sub  = *(uint32 *) uptr($saddr + KSUSEPCS_OFF);
+        $user_p     = uptr($saddr + KSUUDLNA_OFF);
+
+        /* 
+         * Don't show 'null' user sessions
+         * (usually internal bg sessions).
+         */
+        if (*(uint8 *) $user_p) {
+            time("%Y-%m-%d %H:%M:%S ");
+            printf("%-15s %-7d %-15s %-5d %-10s %-10lu %9u %11u %8u %4u %12s %10lu\n",
+                   str(uptr(KSPSSIDST_ADDR)), pid, comm, $sid, str($user_p), $sql_hash,
+                   $plsql_obj, $plsql_sub, @fetch_sz[pid], $rows, "INDX_RS_ONLY", $ela_us);
+        }
+    }
+
+    delete(@start_ns[pid]);
+    delete(@fetch_sz[pid]);
 }
 
 END
@@ -232,4 +394,6 @@ END
     clear(@OPT_SINGLE_ROW_FETCH);
     clear(@start_ns);
     clear(@fetch_sz);
+    clear(@tbFetchUniqueIndex);
+    clear(@tbFetchUniqueRow);
 }
