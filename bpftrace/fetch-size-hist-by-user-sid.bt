@@ -90,7 +90,7 @@ uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetchByRow
          * adjust histogram range and buckets:
          * lhist(value, min, max, step) 
          */
-        if ( *(uint8 *) $user_p) {
+        if (*(uint8 *) $user_p) {
             $user = str($user_p);
 
             /* 
