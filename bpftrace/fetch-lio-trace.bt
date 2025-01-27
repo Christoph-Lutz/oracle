@@ -1,0 +1,209 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Trace fetch and LIO calls for a given pid.
+ *   This script is for resarch purposes only.
+ *
+ * Date:
+ *   Jan-25 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ * 
+ * Credits:
+ *   LIO structs and function arguments (kcbgtcr, kcbgcur, kcbispnd) 
+ *   are copied from Alexander Anokhin's fantastic dtrace script 
+ *   dtracelio.d.
+ *
+ * Usage:
+ *   BPFTRACE_CACHE_USER_SYMBOLS=1 ./fetch-lio-trace.bt
+ * 
+ * Tested on:
+ *   Oracle 19.22 and 19.23
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ * 
+ *   This is experimental, Use at your own risk!
+ */
+
+/* full relative dba */
+struct kdbafr
+{
+    uint32_t tsn_kdbafr; /* a tablespace number */
+    uint32_t dba_kdbafr; /* a relative dba      */
+};
+
+/* relative dba + objd */
+struct ktid
+{
+    struct kdbafr dbr_ktid; /* a relative dba           */
+    int32_t  objd_ktid;     /* data object number       */
+    int32_t  objn_ktid;     /* dictionary object number */
+};
+
+/* full relative dba plus obj number */
+struct kcbds
+{
+    struct ktid kcbdstid;
+    /* rest unknown */
+};
+
+BEGIN
+{
+    if ($# < 1) {
+        printf("\nUsage: fetch-lio-trace.bt <pid>\n");
+        exit();
+    }
+
+    printf("\n%s: ", strftime("%Y-%m-%dT%H:%M:%S", nsecs));
+    printf("Tracing fetch and lio calls ... Hit ^C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetch
+/ pid == $1 /
+{
+    @in_qertbFetch[pid] = 1;
+    @qertbFetch_sz[pid] = (uint32) arg4;
+    printf("%s ", strftime("%H:%M:%S.%f", nsecs));
+    printf("%ld %s -> qertbFetch: fetch_sz=%u\n", pid, comm, @qertbFetch_sz[pid]);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetch
+/ @qertbFetch_sz[pid] /
+{
+    $rows = (uint32) (@qertbFetch_sz[pid] - retval);
+    printf("%s ", strftime("%H:%M:%S.%f", nsecs));
+    printf("%ld %s <- qertbFetch: fetch_sz=%u rows=%u\n", pid, comm, @qertbFetch_sz[pid], $rows);
+    delete(@qertbFetch_sz[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetchByRowID
+/ pid == $1 /
+{
+    @qertbFetchByRowID_sz[pid] = (uint32) arg4;
+    printf("%s ", strftime("%H:%M:%S.%f", nsecs));
+    printf("%ld %s -> qertbFetchByRowID: fetch_sz=%u\n", pid, comm, @qertbFetchByRowID_sz[pid]);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qertbFetchByRowID
+/ @qertbFetchByRowID_sz[pid] /
+{
+    $rows = (uint32) (@qertbFetchByRowID_sz[pid] - retval);
+    printf("%s ", strftime("%H:%M:%S.%f", nsecs));
+    printf("%ld %s <- qertbFetchByRowID: fetch_sz=%u rows=%u ret=%d\n", pid, comm, @qertbFetchByRowID_sz[pid], $rows, retval);
+    delete(@qertbFetchByRowID_sz[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qerixFetchUniqueIndex
+/ pid == $1 /
+{    
+    @qerixFetchUniqueIndex_sz[pid] = (uint32) arg4;
+    printf("%s ", strftime("%H:%M:%S.%f", nsecs));
+    printf("%ld %s -> qerixFetchUniqueIndex: fetch_sz=%u\n", pid, comm, @qerixFetchUniqueIndex_sz[pid]);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qerixFetchUniqueIndex
+/ @qerixFetchUniqueIndex_sz[pid] /
+{    
+    $rows = (uint32) (@qerixFetchUniqueIndex_sz[pid] - retval);
+    printf("%s ", strftime("%H:%M:%S.%f", nsecs));
+    printf("%ld %s <- qerixFetchUniqueIndex: fetch_sz=%u rows=%u ret=%d\n", pid, comm, @qerixFetchUniqueIndex_sz[pid], $rows, retval);
+    delete(@qerixFetchUniqueIndex_sz[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qerixtFetch
+/ pid == $1 /
+{    
+    @qerixtFetch_sz[pid] = (uint32) arg4;
+    printf("%s ", strftime("%H:%M:%S.%f", nsecs));
+    printf("%ld %s -> qerixtFetch: fetch_sz=%u\n", pid, comm, @qerixtFetch_sz[pid]);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:qerixtFetch
+/ @qerixtFetch_sz[pid] /
+{    
+    $rows = (uint32) (@qerixtFetch_sz[pid] - retval);
+    printf("%s ", strftime("%H:%M:%S.%f", nsecs));
+    printf("%ld %s <- qerixtFetch: fetch_sz=%u rows=%u ret=%d\n", pid, comm, @qerixtFetch_sz[pid], $rows, retval);
+    delete(@qerixtFetch_sz[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kcbgtcr
+/ pid == $1 /
+{
+    @in_kcbgtcr[pid] = 1;
+    $kcbds           = (struct kcbds *) uptr(arg0);
+    $tsn             = $kcbds->kcbdstid.dbr_ktid.tsn_kdbafr;
+    $dba             = $kcbds->kcbdstid.dbr_ktid.dba_kdbafr;
+    $objd            = $kcbds->kcbdstid.objd_ktid;
+    $objn            = $kcbds->kcbdstid.objn_ktid;
+    $dba_file        = (uint32) ($dba >> 22); /* for smallfile tablespaces */
+    $dba_block       = $dba & 0x3FFFFF;
+
+    printf("%s ", strftime("%H:%M:%S.%f", nsecs));
+    printf("%ld %s -> kcbgtcr: kcbds=%p, tsn=%u, dba=%p (sf: %u/%u, bf: %u), objd=%d, objn=%d\n",
+           pid, comm, $kcbds, $tsn, $dba, $dba_file, $dba_block, $dba, $objd, $objn);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kcbgtcr
+/ @in_kcbgtcr[pid] /
+{
+    printf("%s ", strftime("%H:%M:%S.%f", nsecs));
+    printf("%ld %s <- kcbgtcr: ret=0x%lx\n", pid, comm, retval);
+    delete(@in_kcbgtcr[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kcbgcur
+/ pid == $1 /
+{
+    @in_kcbgcur[pid] = 1;
+    $kcbds           = (struct kcbds *) uptr(arg0);
+    $tsn             = $kcbds->kcbdstid.dbr_ktid.tsn_kdbafr;
+    $dba             = $kcbds->kcbdstid.dbr_ktid.dba_kdbafr;
+    $objd            = $kcbds->kcbdstid.objd_ktid;
+    $objn            = $kcbds->kcbdstid.objn_ktid;
+    $dba_file        = (uint32) ($dba >> 22); /* for smallfile tablespaces */
+    $dba_block       = $dba & 0x3FFFFF;
+
+    printf("%s ", strftime("%H:%M:%S.%f", nsecs));
+    printf("%ld %s -> kcbgcur: kcbds=%p, tsn=%u, dba=%p (sf: %u/%u, bf: %u), objd=%d, objn=%d\n",
+           pid, comm, $kcbds, $tsn, $dba, $dba_file, $dba_block, $dba, $objd, $objn);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kcbgcur
+/ @in_kcbgcur[pid] /
+{
+    printf("%s ", strftime("%H:%M:%S.%f", nsecs));
+    printf("%ld %s <- kcbgcur: ret=0x%lx\n", pid, comm, retval);
+    delete(@in_kcbgcur[pid]);
+}
+
+/*
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kcbispnd
+/ pid == $1 / 
+{
+    @in_kcbispnd[pid] = 1;
+    printf("%s ", strftime("%H:%M:%S.%f", nsecs));
+    printf("%ld %s -> kcbispnd:\n", pid, comm);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kcbispnd
+/ @in_kcbispnd[pid] /
+{
+    printf("%s ", strftime("%H:%M:%S.%f", nsecs));
+    printf("%ld %s <- kcbispnd: ret=0x%x\n", pid, comm, retval);
+    delete(@in_kcbispnd[pid]);
+}
+*/
+
+END
+{
+    clear(@qertbFetch_sz);
+    clear(@qertbFetchByRowID_sz);
+    clear(@qerixFetchUniqueIndex_sz);
+    clear(@qerixtFetch_sz);
+    clear(@in_kcbgtcr);
+    clear(@in_kcbgcur);
+    // clear(@in_kcbispnd);
+}
