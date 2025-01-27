@@ -1,0 +1,87 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ *  Purpose:
+ *    Trace cellsrv aio scrub request. An aio scrub request is
+ *    an io_submit call with nr=1 and aio_nbytes=16384.
+ *
+ * Date:
+ *   Jan-26 2025
+ *
+ *  Author:
+ *    Christoph Lutz
+ * 
+ *  Usage: 
+ *    BPFTRACE_CACHE_USER_SYMBOLS=1 ./cellsrv-scrub-aio-reqs-disk.bt [aioStacks?]
+ *
+ *    Arguments:
+ *      aioStacks: yes or no (default: no)
+ *                 Collect aio call stacks.
+ *
+ *  Tested on:
+ *    Exadata system sw 24.1.7.0.0.241204
+ *    Kernel 5.4.17-2136.336.5.3.1.el8uek.x86_64
+ *
+ *  Notes: 
+ *    This script probes the libc io_submit wrapper function rather
+ *    than the sys_enter_io_submit tracepoint. Reason is that probing
+ *    the libc wrapper function can provide a full user space call stack 
+ *    if needed.
+ *
+ *    This script is potentially dangerous, use at your own risk!
+ */
+
+BEGIN
+{
+    if ($# < 1) {
+        @OPT_AIO_STACKS = 0;
+    } else {
+        if (str($1) == "yes" || str($2) == "y") {
+            @OPT_AIO_STACKS = 1;
+        }
+    }
+
+    printf("\n%s: ", strftime("%Y-%m-%dT%H:%M:%S", nsecs));
+    printf("Tracing scrub aio req calls ... Hit ^C to stop.\n\n");
+}
+
+uprobe:/lib64/libaio.so.1.0.1:io_submit
+/ comm == "cellsrv" /
+{
+    $nr = (int64) arg1;
+    $iocbp = *(struct iocb **) arg2;
+    $nbytes = $iocbp->aio_nbytes;
+
+    /* 
+     * Scrubbing issues 16K single
+     * block I/Os.
+     */
+    if ($nr == 1 && $nbytes == 16384) {
+        @aio_reqs++;
+        @aio_reqs_tot++;
+        if (@OPT_AIO_STACKS) {
+            @aio_stacks[ustack()] = count();
+        }
+    }
+}
+
+interval:s:1
+{
+    printf("\n*** %s:\n", strftime("%Y-%m-%dT%H:%M:%S", nsecs));
+    printf("aio reqs: %ld\n", @aio_reqs);
+    clear(@aio_reqs);
+}
+
+END
+{
+    printf("Aio reqs total: %ld\n", @aio_reqs_tot);
+
+    if (@OPT_AIO_STACKS) {
+        printf("Aio call stacks:\n");
+        print(@aio_stacks);
+        clear(@aio_stacks);
+    }
+
+    clear(@OPT_AIO_STACKS);
+    clear(@aio_reqs);
+    clear(@aio_reqs_tot);
+}
