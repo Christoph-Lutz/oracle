@@ -1,0 +1,51 @@
+#!/usr/bin/env -S bpftrace 
+/*
+ * Purpose:
+ *   Trace tcp connect calls by a given comm filter.
+ *
+ * Author:
+ *   Christoph Lutz 
+ * 
+ * Date:
+ *   Jan 29 2025
+ * 
+ * Usage:
+ *   tcp-connect-comm.bt <comm>
+ * 
+ * Note:
+ *   Use at your own risk!
+ */
+
+#include <linux/socket.h>
+#include <net/sock.h>
+
+BEGIN
+{
+    if ($# < 1) {
+        printf("\nUsage: tcp-connect-comm.bt <comm>\n");
+        exit();
+    }
+
+    time("\n%Y-%m-%dT%H:%M:%S: ");
+    printf("Tracing connect calls, hit ^C to stop ...\n\n");
+}
+
+tracepoint:syscalls:sys_enter_connect
+/ comm == str($1) /
+{
+    // $fd = args->fd;
+    $sa = (struct sockaddr_in *) args->uservaddr;
+    $family = $sa->sin_family;
+    $port = ($sa->sin_port >> 8) | (($sa->sin_port << 8) & 0x00FF00);
+    $proc_name = curtask->mm->arg_start;
+
+    /* Trace ipv4 connections only */
+    if ($family == AF_INET && $port > 0) {
+        time("%H:%M:%S ");
+        printf("%ld %s: bin=%s port=%d\n", pid, comm, str(uptr($proc_name)), $port);
+    }
+}
+
+END
+{
+}
