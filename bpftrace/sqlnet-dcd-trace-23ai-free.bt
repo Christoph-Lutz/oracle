@@ -1,0 +1,287 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Trace databbase sessions that get terminated by dead 
+ *   connection detection (DCD).
+ *
+ * Date:
+ *   Oct-05 2024
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *
+ * Tested on:
+ *   Oracle 23ai free (23.5.0.24.07), VirtualBox Image,
+ *   kernel 5.15.0-210.163.7, bpftrace 0.16
+ *
+ *   Important: Tracing with the UEK7 kernel version
+ *   5.15.0-3.60.5.1 is hopelessly broken. Either upgrade
+ *   to the more recent UEK7/u2 kernel version 5.15.0-210.163.7
+ *   or use an older one, like 4.18.0-553.16.1.
+ *
+ * Notes:
+ *   This script was only tested with the 'new' DCD mechanism
+ *   that is based on the os tcp keepalive mechanism. That is,
+ *   it is not known if the script also works with the older 
+ *   tns based keepalive mechanism that can be switched on with
+ *   USE_NS_PROBES_FOR_DCD=TRUE. 
+ * 
+ *   Moreover, the script has only been tested with dedicated
+ *   server connections and so, it is not known if it also
+ *   works with drcp or with shared servers.
+ *
+ *   The script hooks into the following DCD error paths:
+ *
+ *   1. Session is idle and blocks in a socket read when the
+ *      peer disconnects:
+ *        After the SIGALRM handler returns, the read is re-
+ *        started (ERESTARTSYS) and then returns with 
+ *        ETIMEDOUT, because the os tcp keepalive mechanism 
+ *        breaks the connection. The process will then dis-
+ *        connect (nttdisc) and terminate.
+ *
+ *   2. Session is active (i.e. executing a query) when the
+ *      peer disocnnects:
+ *        The SIGALRM handler checks the socket status with
+ *        poll(). If poll() returns with eflags set to POLLERR
+ *        and POLLHUP, it "peeks" the socket by calling
+ *        revcmsg() with the MSG_PEEK flag set. If the socket
+ *        is dead, the recvmsg() call returns with ETIMEDOUT
+ *        and the process will disconnect (nttdisc) and ter-
+ *        minate.
+ * 
+ *  This script doesnt trace / detect dead connections when they
+ *  have alredy started to block in a socket read before the script 
+ *  was started.
+ *
+ *  The script only supports ipv4 connections.
+ *
+ *  Adjust the ORACLE_HOME path for your environment.
+ *
+ *  You can simulate dead connections on a client machine  by blocking 
+ *  and dropping connections to the server with the following iptables
+ *  rule:
+ *    iptables -A OUTPUT -d <server_ip> -p tcp --dport <lsnr_port> -j DROP
+ *
+ *  To clean / remove the iptables rule:
+ *    iptables -D OUTPUT -d <server_ip> -p tcp --dport <lsnr_port> -j DROP
+ */
+
+/* 
+ * Define tcp and socket flags to workaround bpftrace header madness ... 
+ * This is not ideal, but it does the trick.
+ */
+#define SOL_TCP                 6       /* TCP level                         */
+#define TCP_KEEPIDLE            4       /* Start keeplives after this period */
+#define TCP_KEEPINTVL           5       /* Interval between keepalives       */
+#define TCP_KEEPCNT             6       /* Number of keepalives before death */
+#define MSG_PEEK                2       /* Peek at incoming messages         */
+#define ETIMEDOUT               110
+
+#define SIGALRM                 14
+#define AF_INET                 2
+#define KSPSSIDST_ADDR          0x6000b760
+
+BEGIN
+{
+    printf("Tracing dead connection detection (dcd) ... Hit ^C to stop.\n\n");
+
+    printf("%-8s %-15s %-7s %-15s %-15s %-5s %-15s %-5s %-5s %-15s %-4s %-5s %-3s %-6s\n",
+           "TIME", "INSTANCE", "PID", "COMM", "SRC_IP", "SPORT", "DST_IP", "DPORT", "SID", 
+           "USERNAME", "IDLE", "INTVL", "CNT", "STATUS"); 
+}
+
+uprobe:/opt/oracle/product/23ai/dbhomeFree/bin/oracle:sntttunekeepalive
+{
+    @tcp_ka[pid] = 1;
+}
+
+uretprobe:/opt/oracle/product/23ai/dbhomeFree/bin/oracle:sntttunekeepalive
+{
+    @tcp_ka[pid] = 0;
+}
+
+uprobe:libc:setsockopt
+/ @tcp_ka[pid] /
+{
+    if (arg1 == SOL_TCP) {
+        if (arg2 == TCP_KEEPIDLE) {
+            @tcp_ka_idle[pid] = *(uint32 *) arg3;
+        } else if (arg2 == TCP_KEEPINTVL) {
+            @tcp_ka_intvl[pid] = *(uint32 *) arg3;
+        } else if (arg2 == TCP_KEEPCNT) {
+            @tcp_ka_cnt[pid] = *(uint32 *) arg3;
+        }
+    }
+}
+
+uprobe:/opt/oracle/product/23ai/dbhomeFree/bin/oracle:nsbasic_brc
+{
+    @nsbasic_brc[pid] = 1;
+}
+
+uretprobe:/opt/oracle/product/23ai/dbhomeFree/bin/oracle:nsbasic_brc
+/ @nsbasic_brc[pid] /
+{
+    delete(@nsbasic_brc[pid]);
+}
+
+/* 
+ * snttread() is a vos wrapper function around read() and takes 
+ * the same args (on linux).
+ */
+uprobe:/opt/oracle/product/23ai/dbhomeFree/bin/oracle:snttread
+/ @nsbasic_brc[pid] /
+{
+    @snttread[pid] = 1;
+
+    /* 
+     * Note: lookup src and dst socket details here in, 
+     * the entry probe, because not all details will be 
+     * available anymore in the retprobe if the read re-
+     * turns with an error (ETIMEDOUT).
+     */
+    $fd = (uint32) arg0;
+    $sock = (struct socket *)((struct file *) *(curtask->files->fdt->fd + (uint64) $fd))->private_data;
+    $sk = $sock->sk;
+    $inet_family = $sk->__sk_common.skc_family;
+
+    if ($inet_family == AF_INET) {
+        @dst_addr[pid] = $sk->__sk_common.skc_daddr;
+        @dst_port[pid] = bswap($sk->__sk_common.skc_dport);
+        @src_addr[pid] = $sk->__sk_common.skc_rcv_saddr;
+        @src_port[pid] = $sk->__sk_common.skc_num;
+        @fd[pid] = $fd;
+    }
+
+    /* 
+     * As we already lookup socket details above, let's 
+     * also lookup oracle session details here.
+     */
+    $ksuudlna_off = (uint64) 0xc9;            /* username offset  */
+    $ksusenum_off = (uint64) 0xc08;           /* sid offset       */
+    $saddr_off = (uint64) 0xf350;             /* saddr tls offset */
+    $fsbase = uptr(curtask->thread.fsbase);
+    $saddr_p = uptr($fsbase - $saddr_off);
+    $saddr = *(uint64 *) uptr($saddr_p);
+    @sid[pid] = *(uint64 *)($saddr + $ksusenum_off);
+    @username[pid] = (uint64 *)($saddr + $ksuudlna_off);
+}
+
+tracepoint:syscalls:sys_enter_read
+/ @snttread[pid] /
+{
+    @read[pid] = 1;
+}
+
+tracepoint:syscalls:sys_exit_read
+/ @read[pid] /
+{
+    if (args->ret == -ETIMEDOUT) {
+        @read_err[pid] = 1;
+    }
+    @read[pid] = 0;
+}
+
+uretprobe:/opt/oracle/product/23ai/dbhomeFree/bin/oracle:snttread
+/ @snttread[pid] / 
+{
+    @snttread[pid] = 0;
+}
+
+uprobe:/opt/oracle/product/23ai/dbhomeFree/bin/oracle:sslsshandler
+/ arg0 == SIGALRM /
+{
+    @sigalrm[pid] = 1;
+}
+
+uretprobe:/opt/oracle/product/23ai/dbhomeFree/bin/oracle:sslsshandler
+/ @sigalrm[pid] /
+{
+    @sigalrm[pid] = 0;
+}
+
+tracepoint:syscalls:sys_enter_recvfrom
+/ @sigalrm[pid] && args->flags == MSG_PEEK /
+{
+    @msg_peek[pid] = 1;
+}
+
+tracepoint:syscalls:sys_exit_recvfrom
+/ @msg_peek[pid] /
+{
+    if (args->ret == -ETIMEDOUT) {
+        @recv_err[pid] = 1;
+    }
+    @msg_peek[pid] = 0;
+}
+
+/* nttdisc - network transport tcp disconnect? */
+uprobe:/opt/oracle/product/23ai/dbhomeFree/bin/oracle:nttdisc
+/ @read_err[pid] || @recv_err[pid] /
+{
+    $daddr = ntop(0);
+    $saddr = ntop(0);
+    $daddr = ntop(@dst_addr[pid]);
+    $dport = @dst_port[pid];
+    $saddr = ntop(@src_addr[pid]);
+    $lport = @src_port[pid];
+    $sid = @sid[pid];
+    $user = @username[pid];
+
+    if (@read_err[pid]) {
+        $status = "idle";
+    } else if(@recv_err[pid]) {
+        $status = "active";
+    }
+
+    time("%H:%M:%S ");
+    if (@tcp_ka_idle[pid] && @tcp_ka_intvl[pid] && @tcp_ka_cnt[pid]) {
+        printf("%-15s %-7lu %-15s %-15s %-5u %-15s %-5u %-5u %-15s %-4u %-5u %-3u %-6s\n", 
+               str(uptr(KSPSSIDST_ADDR)), pid, comm, $daddr, $dport, $saddr, $lport, 
+               $sid, str($user), @tcp_ka_idle[pid], @tcp_ka_intvl[pid], @tcp_ka_cnt[pid],
+               $status);
+    } else {
+        printf("%-15s %-7lu %-15s %-15s %-5u %-15s %-5u %-5u %-15s %-4s %-5s %-3s %-6s\n", 
+               str(uptr(KSPSSIDST_ADDR)), pid, comm, $daddr, $dport, $saddr, $lport,
+               $sid, str($user), "n/a", "n/a", "n/a", $status);
+    }
+
+    delete(@tcp_ka_idle[pid]);
+    delete(@tcp_ka_intvl[pid]);
+    delete(@tcp_ka_cnt[pid]);
+    delete(@fd[pid]);
+    delete(@dst_addr[pid]);
+    delete(@dst_port[pid]);
+    delete(@src_addr[pid]);
+    delete(@src_port[pid]);
+    delete(@sid[pid]);
+    delete(@username[pid]);
+    delete(@read[pid]);
+    delete(@sigalrm[pid]);
+    delete(@read_err[pid]);
+    delete(@recv_err[pid]);
+}
+
+END {
+    clear(@tcp_ka);
+    clear(@tcp_ka_idle);
+    clear(@tcp_ka_intvl);
+    clear(@tcp_ka_cnt);
+    clear(@msg_peek);
+    clear(@nsbasic_brc);
+    clear(@snttread);
+    clear(@fd);
+    clear(@dst_addr);
+    clear(@dst_port);
+    clear(@src_addr);
+    clear(@src_port);
+    clear(@sid);
+    clear(@username);
+    clear(@read);
+    clear(@sigalrm);
+    clear(@read_err);
+    clear(@recv_err);
+}
