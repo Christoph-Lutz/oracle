@@ -1,0 +1,176 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Trace drcp think timeouts and print additional context infor-
+ *   mation like session id and similar when a think timeout expires. 
+ *
+ * Date:
+ *   Feb-14 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./drcp-max-think-time-trace.bt <oracle_sid>
+ *
+ * Tested on:
+ *   Oracle 19.22 and 19.23
+ *
+ * Notes:
+ *   Adjust KSPSSIDST_ADDR and ksuse offsets for your
+ *   Oracle version.
+ *
+ *   Adjust the ORACLE_HOME path for your environment.
+ *
+ *   This script is potentially dangerous, use it at your own risk!
+ * 
+ * Background information:
+ *   The drcp max_think_time translates to the SO_RCVTIMEO on the
+ *   tns socket. If the timeout expires, the socket read returns
+ *   with EAGAIN and the drcp pooled server process then disconnects
+ *   the session by calling nttdisc (network tcp disconnect?). 
+ *   This script probes the relevant code paths and prints out 
+ *   context information when a connect, timeout or disconnect occ-
+ *   urs.
+ */
+
+/* syscall defines  */
+#define AF_INET      2 
+#define EAGAIN      11
+#define SO_RCVTIMEO 20 
+
+/* version dependent: may change in every RU!    */
+#define KSPSSIDST_ADDR 0x60009628  /* sid name   */
+#define SADDR_TLS_OFF  0xff78      /* tls offset */
+#define KSUUDLNA_OFF   0xc5        /* username   */
+#define KSUUDOCT_OFF   0x5d6       /* command    */
+#define KSUSENUM_OFF   0x878       /* sid        */
+#define KSUSESQH_OFF   0x984       /* sql hash   */
+#define KSUSEPCO_OFF   0x9b4       /* plsql obj  */
+#define KSUSEPCS_OFF   0x9b8       /* plsql sub  */
+
+BEGIN
+{
+    if ($# < 1) {
+        printf("\nUsage: drcp-think-time-trace-sid.bt <oracle_sid>\n");
+        exit();
+    }
+    printf("\nTracing drcp max think time ... Hit ^C to stop.\n\n");
+
+    printf("%-19s %-12s %-15s %7s %-15s %3s %-15s %5s %-15s %5s %5s %-10s %10s\n", "TIME", "EVENT", 
+           "INSTANCE", "PID", "COMM", "FD", "SRC_IP", "SPORT", "DST_IP", "DPORT", "SID", "USERNAME", "ELA_MS");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:kmp_srv_set_read_timeout
+/ str(uptr(KSPSSIDST_ADDR)) == str($1) /
+{
+    @in_kmp_timeout[pid] = 1;
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:nstoControlRTO
+/ @in_kmp_timeout[pid] /
+{
+    @in_nsto_rto[pid] = 1;
+}
+
+tracepoint:syscalls:sys_enter_setsockopt
+/ @in_nsto_rto[pid] /
+{
+    $fd     = (int32) args->fd;
+    $opt    = args->optname;
+    $sock   = (struct socket *)((struct file *) *(curtask->files->fdt->fd + (uint64) $fd))->private_data;
+    $sk     = $sock->sk;
+    $family = $sk->__sk_common.skc_family;
+
+    if ($opt == SO_RCVTIMEO && $family == AF_INET) {
+        $to          = *(int32 *) args->optval;
+        @to_beg[pid] = nsecs;
+        $ela_ms      = 0;
+        $dstip       = ntop($sk->__sk_common.skc_daddr);
+        $srcip       = ntop($sk->__sk_common.skc_rcv_saddr);
+        $lport       = $sk->__sk_common.skc_num;
+        $dport       = bswap($sk->__sk_common.skc_dport);
+
+        printf("%s ", strftime("%Y-%m-%d %H:%M:%S", nsecs));
+        printf("%-12s %-15s %7ld %-15s %3d %-15s %5u %-15s %5u %5s %-10s %10ld\n", 
+               "CONNECT", str(uptr(KSPSSIDST_ADDR)), pid, comm, $fd, $srcip, $dport, 
+               $dstip, $lport, "n/a", "n/a", $ela_ms);
+    }
+
+    delete(@in_kmp_timeout[pid]);
+    delete(@in_nsto_rto[pid]);
+}
+
+tracepoint:syscalls:sys_exit_setsockopt
+/ @in_nsto_rto[pid] /
+{
+    @to_start[pid] = nsecs;
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:snttread
+/ @to_beg[pid] /
+{
+    @snttread[pid] = 1;
+    @fd[pid] = (int32) arg0;
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:snttread
+/ @snttread[pid] /
+{
+    delete(@snttread[pid]);  
+    delete(@fd[pid]);
+}
+
+tracepoint:syscalls:sys_exit_read
+/ @snttread[pid] /
+{
+    if (args->ret == -EAGAIN) {
+        @eagain[pid] = 1;
+
+        $fsbase      = uptr(curtask->thread.fsbase);
+        $saddr_p     = uptr($fsbase - SADDR_TLS_OFF);
+        $saddr       = *(uint64 *) uptr($saddr_p);
+        $sid         = *(uint64 *)($saddr + KSUSENUM_OFF);
+        $user_p      = uptr($saddr + KSUUDLNA_OFF);
+
+        $fd          = @fd[pid];
+        $sock        = (struct socket *)((struct file *) *(curtask->files->fdt->fd + (uint64) $fd))->private_data;
+        $sk          = $sock->sk;
+        $dstip       = ntop($sk->__sk_common.skc_daddr);
+        $srcip       = ntop($sk->__sk_common.skc_rcv_saddr);
+        $lport       = $sk->__sk_common.skc_num;
+        $dport       = bswap($sk->__sk_common.skc_dport);
+        $ela_ms      = (nsecs - @to_beg[pid]) / 1e6;
+
+        printf("%s ", strftime("%Y-%m-%d %H:%M:%S", nsecs));
+        printf("%-12s %-15s %7ld %-15s %3d %-15s %5u %-15s %5u %5u %-10s %10ld\n", 
+               "READ_TIMEOUT", str(uptr(KSPSSIDST_ADDR)), pid, comm, $fd, $srcip, 
+               $dport, $dstip, $lport, $sid, str(uptr($user_p)), $ela_ms);
+    }
+
+    delete(@snttread[pid]);
+    delete(@fd[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:nttdisc
+/ @eagain[pid] /
+{
+    $ela_ms   = (nsecs - @to_beg[pid]) / 1e6;
+
+    printf("%s ", strftime("%Y-%m-%d %H:%M:%S", nsecs));
+    printf("%-12s %-15s %7ld %-15s %3s %-15s %5s %-15s %5s %5s %-10s %10ld\n", 
+           "DISCONNECT", str(uptr(KSPSSIDST_ADDR)), pid, comm, "n/a", "n/a", 
+           "n/a", "n/a", "n/a", "n/a", "n/a", $ela_ms);
+
+    delete(@eagain[pid]);
+}
+
+END
+{
+    clear(@in_kmp_timeout);
+    clear(@in_nsto_rto);
+    clear(@in_nsto_rto);
+    clear(@to_beg);
+    clear(@snttread);
+    clear(@fd);
+}
