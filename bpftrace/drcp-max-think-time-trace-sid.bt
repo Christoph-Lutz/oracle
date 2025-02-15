@@ -57,7 +57,7 @@ BEGIN
     }
     printf("\nTracing drcp max think time ... Hit ^C to stop.\n\n");
 
-    printf("%-19s %-12s %-15s %7s %-15s %3s %-15s %5s %-15s %5s %5s %-10s %10s\n", "TIME", "EVENT", 
+    printf("%-19s %-11s %10s %-15s %7s %-15s %3s %-15s %5s %-15s %5s %5s %-10s %10s\n", "TIME", "EVENT", "RCV_TIMEO",
            "INSTANCE", "PID", "COMM", "FD", "SRC_IP", "SPORT", "DST_IP", "DPORT", "SID", "USERNAME", "ELA_MS");
 }
 
@@ -92,8 +92,8 @@ tracepoint:syscalls:sys_enter_setsockopt
         $dport       = bswap($sk->__sk_common.skc_dport);
 
         printf("%s ", strftime("%Y-%m-%d %H:%M:%S", nsecs));
-        printf("%-12s %-15s %7ld %-15s %3d %-15s %5u %-15s %5u %5s %-10s %10ld\n", 
-               "CONNECT", str(uptr(KSPSSIDST_ADDR)), pid, comm, $fd, $srcip, $dport, 
+        printf("%-11s %10u %-15s %7ld %-15s %3d %-15s %5u %-15s %5u %5s %-10s %10ld\n", 
+               "CONNECT", $to, str(uptr(KSPSSIDST_ADDR)), pid, comm, $fd, $srcip, $dport, 
                $dstip, $lport, "n/a", "n/a", $ela_ms);
     }
 
@@ -143,8 +143,8 @@ tracepoint:syscalls:sys_exit_read
         $ela_ms      = (nsecs - @to_beg[pid]) / 1e6;
 
         printf("%s ", strftime("%Y-%m-%d %H:%M:%S", nsecs));
-        printf("%-12s %-15s %7ld %-15s %3d %-15s %5u %-15s %5u %5u %-10s %10ld\n", 
-               "READ_TIMEOUT", str(uptr(KSPSSIDST_ADDR)), pid, comm, $fd, $srcip, 
+        printf("%-11s %10s %-15s %7ld %-15s %3d %-15s %5u %-15s %5u %5u %-10s %10ld\n", 
+               "RCV_TIMEOUT", "n/a", str(uptr(KSPSSIDST_ADDR)), pid, comm, $fd, $srcip, 
                $dport, $dstip, $lport, $sid, str(uptr($user_p)), $ela_ms);
     }
 
@@ -158,8 +158,8 @@ uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:nttdisc
     $ela_ms   = (nsecs - @to_beg[pid]) / 1e6;
 
     printf("%s ", strftime("%Y-%m-%d %H:%M:%S", nsecs));
-    printf("%-12s %-15s %7ld %-15s %3s %-15s %5s %-15s %5s %5s %-10s %10ld\n", 
-           "DISCONNECT", str(uptr(KSPSSIDST_ADDR)), pid, comm, "n/a", "n/a", 
+    printf("%-11s %10s %-15s %7ld %-15s %3s %-15s %5s %-15s %5s %5s %-10s %10ld\n", 
+           "DISCONNECT", "n/a", str(uptr(KSPSSIDST_ADDR)), pid, comm, "n/a", "n/a", 
            "n/a", "n/a", "n/a", "n/a", "n/a", $ela_ms);
 
     delete(@eagain[pid]);
