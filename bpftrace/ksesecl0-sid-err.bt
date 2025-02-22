@@ -57,14 +57,16 @@ BEGIN
         @OPT_STACKS = 1;
     }
 
-    printf("%-19s %-15s %-7s %-15s %-5s %-15s %-10s %3s %9s %11s %8s\n",
-           "TIME", "INSTANCE", "PID", "COMM", "SID", "USERNAME", "SQL_HASH", 
-           "OCT", "PLSQL_OBJ", "PLSQL_SUBID", "ERR");
+    printf("%-19s %-15s %-7s %-15s %-5s %-15s %-10s %3s %9s %11s %8s %-16s %-16s\n",
+           "TIME", "INSTANCE", "PID", "COMM", "SID", "USERNAME", "SQL_HASH", "OCT",
+           "PLSQL_OBJ", "PLSQL_SUBID", "ERR", "FUNC", "LOCATION");
 }
 
 uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:ksesecl0
 / str(uptr(KSPSSIDST_ADDR)) == str($1) /
 {
+    $func       = (uint64 *) arg0;
+    $loc        = (uint64 *) arg1;
     $err        = (uint32) arg2;
     $fsbase     = uptr(curtask->thread.fsbase);
     $saddr_p    = uptr($fsbase - SADDR_TLS_OFF);
@@ -84,9 +86,9 @@ uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:ksesecl0
 
         if ($err == @OPT_ERR) {
             printf("%s ", strftime("%Y-%m-%d %H:%M:%S", nsecs));
-            printf("%-15s %-7d %-15s %-5d %-15s %-10lu %3d %9u %11u %8u\n",
+            printf("%-15s %-7d %-15s %-5d %-15s %-10lu %3d %9u %11u %8u %-16s %-16s\n",
                    str(uptr(KSPSSIDST_ADDR)), pid, comm, $sid, str($user_p), $sql_hash, 
-                   $oct, $plsql_obj, $plsql_sub, $err);
+                   $oct, $plsql_obj, $plsql_sub, $err, str(uptr($func)), str(uptr($loc)));
  
             if (@OPT_STACKS) {
                 print(ustack());
@@ -94,9 +96,9 @@ uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:ksesecl0
         } 
         else if (!@OPT_ERR) {
             printf("%s ", strftime("%Y-%m-%d %H:%M:%S", nsecs));
-            printf("%-15s %-7d %-15s %-5d %-15s %-10lu %3d %9u %11u %8u\n",
+            printf("%-15s %-7d %-15s %-5d %-15s %-10lu %3d %9u %11u %8u %-16s %-16s\n",
                    str(uptr(KSPSSIDST_ADDR)), pid, comm, $sid, str($user_p), $sql_hash, 
-                   $oct, $plsql_obj, $plsql_sub, $err);
+                   $oct, $plsql_obj, $plsql_sub, $err, str(uptr($func)), str(uptr($loc)));
 
             if (@OPT_STACKS) {
                 print(ustack());
