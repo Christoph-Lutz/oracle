@@ -6,7 +6,7 @@
  *
  *   Oracle uses ksesecl0 to raise internal errors like ORA-14403
  *   or ORA-1551 (and possibly other errors as well). Note that the
- *   script wad written with the intention to trace ORA-14403 and
+ *   script was written with the intention to trace ORA-14403 and
  *   ORA-1551 errors and therefore it may not work in situations
  *   when Oracle throws other errors in different kse functions.
  *
