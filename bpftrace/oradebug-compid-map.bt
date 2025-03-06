@@ -1,0 +1,86 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ * Purpose:
+ *   Probe the function dbgfcoName to map the components
+ *   shown by "oradebug doc component" to their internal
+ *   component ids.
+ *
+ * Date:
+ *   Mar-04 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./oradebug-compid-map.bt <oracle_sid>
+ *
+ * Credits:
+ *   Hatem Mahmoud, Oracle trace events hunting : dbgdChkEventIntV, 2018-10-12
+ *   https://mahmoudhatem.wordpress.com/2018/10/12/oracle-trace-events-hunting-dbgdchkeventintv/
+ *
+ *   Hatem Mahmoud, Oracle trace events hunting : Undocumented events/Filling the gaps, 2018-10-18
+ *   https://mahmoudhatem.wordpress.com/2018/10/18/oracle-trace-events-hunting-undocumented-events-filling-the-gaps/
+ *
+ * Tested on:
+ *   Oracle 19.23
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *  
+ *   Use at your own risk!
+ * 
+ *   The elements in the array dbgfilcsCompDefTab point
+ *   to the component descriptions (more research needed).
+ */
+
+/* version dependent: may change in every RU!    */
+#define KSPSSIDST_ADDR 0x60009628  /* sid name   */
+
+BEGIN
+{
+    if ($# != 1) {
+        printf("\nUsage: ./oradebug-compid-map.bt <oracle_sid>\n");
+        exit();
+    }
+    printf("\nReady. Run 'oradebug doc component' now ... Hit Ctrl + C to stop.\n");
+    printf("\n%-10s %-30s %-10s\n", "LIBRARY", "COMPONENT", "COMP_ID");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:dbgfcoHelp
+/ str(uptr(KSPSSIDST_ADDR)) == str($1) /
+{
+    @in_help[pid] = 1;
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:dbgfcoHelp
+/ @in_help[pid] /
+{
+    delete(@in_help[pid]);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:dbgfcsLibName
+/ @in_help[pid] /
+{
+    @lib[pid] = (uint64) retval;
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:dbgfcoName
+/ @in_help[pid] /
+{
+    @comp_id[pid] = (uint64) arg1;
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1923_1/bin/oracle:dbgfcoName
+/ @comp_id[pid] /
+{
+    $lib_p = (uint64) @lib[pid]; 
+    $str_p = (uint64) retval;
+    printf("%-10s %-30s %-p\n", str(uptr($lib_p)), str(uptr($str_p)), @comp_id[pid]);
+    delete(@comp_id[pid]);
+}
+
+END
+{
+    clear(@comp_id);
+    clear(@lib);
+}
