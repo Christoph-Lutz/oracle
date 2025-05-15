@@ -1,0 +1,110 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ * Purpose:
+ *   Trce calls to kcrfw_alfs_sl_save_redowrite_time and show how
+ *   lgwr maintains a moving average of the redo write time that is
+ *   used to decide if the Fast Log File Sync should be enabled or
+ *   disabled.
+ *
+ * Date:
+ *   May-15 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./kcrfw_alfs_sl_save_redowrite_time.bt <oracle_sid>
+ *
+ * Tested on:
+ *   Oracle 19.26 / Exadata 24.1.2
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ * 
+ *   Floating point numbers are not supported by BPF, therefore
+ *   the script doesn't calculate the moving avg of the redo
+ *   write time and rather only emits the formula so that you
+ *   can do the calculation in a calculator.
+ *  
+ *   Use at your own risk!
+ *
+ * Background information:
+ *   A log file sync mode switch (enable/disable Fast Sync) is eva-
+ *   luated in the following scenarios and code paths:
+ * 
+ *   1. On every 128th log write (hard-coded default in 
+ *      kcrfw_alfs_sl_update_mode, which gets called be-
+ *      fore lgwr issues a log write)
+ *
+ *   2. Log file switch (kcrfnl)
+ *
+ *   The moving average of the redo write time based on the following 
+ *   formula:
+ * 
+ *   diff = curr_write_time - write_avg;
+ *   write_avg += (diff * 2) / 129;
+ * 
+ *   The smoothing factor 2/129 (~0.0155) controls how fast it adapts 
+ *   and smooths out spikes and dips.
+ * 
+ *   The moving avg is calculated in kcrfw_alfs_sl_save_redowrite_time, 
+ *   which gets called from kcrfw_post after a log write (lgwr post-write 
+ *   processing).
+ *
+ */
+
+#define KSPSSIDST 0x60009628  /* oracle sid name                       */
+#define KSPASV3   0x6000ace8  /* kspasv3_ (redo write time moving avg) */
+
+BEGIN
+{
+    if ($# != 1) 
+    {
+        printf("\nUsage: ./kcrfw_alfs_sl_save_redowrite_time.bt <oracle_sid>\n");
+        exit();
+    }
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_alfs_sl_save_redowrite_time
+/ str(uptr(KSPSSIDST)) == str($1) /
+{
+    @trace[tid] = 1;
+    $kspasv3 = *(uint32 *) uptr(KSPASV3);
+    $write_avg = (int32) $kspasv3;
+    $fs = uptr(curtask->thread.fsbase);
+    $tls_off = *(uint64 *) ($fs - 0xec78);
+    $t1 = *(uint64 *) ($tls_off + 0x48);
+    $t2 = *(uint64 *) ($tls_off + 0x50);
+    $write_time = (int32) (($t2 - $t1) * 1000);
+    $diff = (int32) ($write_time - $write_avg);
+
+    printf("%ld %s -> kcrfw_alfs_sl_save_redowrite_time:\n", pid, comm);
+    printf("%ld %s    write_avg = %u\n", pid, comm, $write_avg);
+    printf("%ld %s    t1 = %lu\n", pid, comm, $t1);
+    printf("%ld %s    t2 = %lu\n", pid, comm, $t2);
+    printf("%ld %s    write_time = (t2 - t1) * 1000 = %d\n", pid, comm, $write_time);
+    printf("%ld %s    diff = write_time - write_avg = %d\n", pid, comm, $diff);
+    printf("%ld %s    calculation: new_avg = write_avg + (diff * 2)/129 = %d + (%d * 2)/129\n", 
+           pid, comm, $write_avg, $diff);
+
+    /* Uncomment to print stack trace */
+    // printf("%s\n", ustack());
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_alfs_sl_save_redowrite_time
+/ @trace[tid] /
+{
+    $new_avg = *(uint32 *) uptr(KSPASV3);
+
+    printf("%ld %s    effective: new_avg = %u\n", pid, comm, $new_avg);
+    printf("%ld %s <- kcrfw_alfs_sl_save_redowrite_time\n\n", pid, comm);
+
+    delete(@trace[tid]);
+}
+
+END
+{
+    clear(@trace);
+}
