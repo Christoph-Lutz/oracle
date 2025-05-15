@@ -10,6 +10,15 @@
 #     kspasv90_: 
 #     alfs sl write count (kcrfw_alfs_sl_update_mode uses a hard-coded 
 #     threshold of 128).
+# 
+#   To observe log file sync mode switches when using this script,
+#   enable event 10468 in the lgwr process as follows:
+#
+#     SQL> oradebug setorapname lgwr
+#
+#     SQL> oradebug event 10468 trace name context forever, level 32;
+#
+#     SQL> oradebug event 10468 trace name context off;
 #
 # Author:
 #   Christoph Lutz
@@ -18,7 +27,7 @@
 #   May-15 2025
 #
 # Usage:
-#   gdb -q -x enabled-fast-sync -p <lgwr_pid>
+#   gdb -q -x fast-sync-enabled.gdb -p <lgwr_pid>
 # 
 # Tested on:
 #   Oracle 19.26 / Exadata 24.1.2 (X8M-2)
