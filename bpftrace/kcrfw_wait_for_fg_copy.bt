@@ -1,0 +1,225 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ * Purpose:
+ *   Demonstrate the mechanics of the "LGWR wait for redo copy" 
+ *   wait event.
+ *
+ *   To simulate a "LGWR wait for redo copy" event, attach to
+ *   a FG process with gdb, set a breakpoint in kcrfw_copy_cv
+ *   (copy redo change vectors into log buffer) and then run 
+*    a transaction in the FG. Something like:
+ *
+ *     # gdb -q -p <fg_pid>
+ *     (gdb) break kcrfw_copy_cv
+ *     (gdb) continue
+ * 
+ *     SQL> update ...
+ *     SQL> commit;
+ *
+ *   When the breakpoint is hit, make sure to either exit gdb
+ *   or resume FG execution promptly. If lgwr remains blocked
+ *   for too long, the instance may crash!
+ *
+ *   You may also want to dump KCRFS and Pending I/O Context
+ *   (PIC) data while lgwr is stuck. You can trigger the dump 
+ *   using gdb as well (when the FG stops in kcrfw_copy_cv):
+ * 
+ *     (gdb) call (void) kcrfw_dump_interesting_data() 
+ *
+ * Date:
+ *   May-22 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./kcrfw_wait_for_fg_copy.bt <oracle_sid> [verbose?]
+ *
+ * Tested on:
+ *   Oracle 19.26 / Exadata 24.1.2 
+ *
+ * Notes:
+ *   The bpf verifier has issues with variables in loop exit 
+ *   conditions and therefore, the nr of copy latches 
+ *   (_log_simultaneous_copies) is hardcoded (set to 24) in 
+ *   the two while loops in the script.
+ *
+ *   Adjust the ORACLE_HOME path for your environment.
+ *  
+ *   Use at your own risk!
+ */
+
+/* version dependent: may change in every RU!                   */
+#define KSPSSIDST      0x60009628  /* sid name                  */
+#define COPY_LATCH_AUX 0x60021848  /* redo copy latch aux       */
+#define KCRFSG         0x600216D0  /* kcrfsg_ sga struct        */
+#define AUX_STRAND_OFF 0x4         /* aux strand offset         */
+#define PIC_META_OFF   0xd8        /* PIC metadata offset       */
+#define PIC_META_SZ    0x60        /* PIC medata size           */
+#define PIC_LOWBUF_OFF 0x40        /* PIC lowBuf_kcrfpicstd     */
+#define PIC_HIBUF_OFF  0x44        /* PIC hiBuf_kcrfpicstd      */
+#define LATCH_PROC_OFF 0xd0        /* latch process addr offset */
+#define PROC_PNAME_OFF 0xd28       /* process name              */
+
+BEGIN
+{
+    if( $# < 1 || $# > 2) 
+    {
+        printf("\nUsage: ./kcrfw_wait_for_fg_copy.bt <oracle_sid> [verbose?]\n");
+        exit();
+    }
+
+    if (str($2) == "yes" || str($3) == "y") {
+        @OPT_VERBOSE = 1;
+    }
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_wait_for_fg_copy
+/ str(uptr(KSPSSIDST)) == str($1) /
+{
+    @in_trace[pid] = 1;
+    $pic = (uint64) arg0;
+    $pic_meta = *(uint64 *) ($pic + PIC_META_OFF);
+    @pic_meta[pid] = $pic_meta;
+
+    printf("%ld %s -> kcrfw_wait_for_fg_copy: pic=0x%lx [pic_meta=0x%lx]\n", 
+           pid, comm, $pic, $pic_meta);
+
+    /* 
+     * Note:
+     * Hardcoding 24 (_log_simultaneous_copies)
+     * below to avoid bpf verifier issues!
+     */
+    $i = 0;
+    $aux_p = *(uint64 *) uptr(COPY_LATCH_AUX);
+    while ($i < 24) {
+        $aux_buffno = *(int32 *) uptr($aux_p + ($i * 8));
+        $aux_strand = *(int32 *) uptr($aux_p + AUX_STRAND_OFF + ($i * 8));
+
+        printf("%ld %s    aux: latch#%2d: strand = 0x%x (%d), buffno = 0x%x (%d)\n", 
+               pid, comm, $i, $aux_strand, $aux_strand, $aux_buffno, $aux_buffno);
+        $i++;
+    }
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_wait_for_fg_copy
+/ @in_trace[pid] /
+{
+    printf("%ld %s <- kcrfw_wait_for_fg_copy: ret=0x%lx\n\n", pid, comm, retval);
+    delete(@pic_meta[pid]);
+    delete(@in_trace[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kslgetl
+/ @in_trace[pid] /
+{
+    $laddr = (uint64) arg0;
+    $wait  = (uint8) arg1;
+    $why   = (uint32) arg2;
+    $where = (uint32) arg3;
+    $paddr = *(uint64 *) ($laddr + LATCH_PROC_OFF);
+    $pname = (uint64) ($paddr + PROC_PNAME_OFF);
+    $aux_p = *(uint64 *) uptr(COPY_LATCH_AUX);
+
+    printf("%ld %s -> kslgetl: laddr=0x%lx, wait=0x%x, why=0x%x, where=0x%x\n", 
+           pid, comm, $laddr, $wait, $why, $where);
+
+    printf("%ld %s    registered proc: %p (%s)\n", pid, comm, $paddr, str(uptr($pname)));
+
+    /* 
+     * Without the verbose flag, only print aux details for the 
+     * latch acquired by kslgetl.
+     *
+     * With the verbose flag, print aux details for all latches.
+     */
+    if (!@OPT_VERBOSE) {
+        $aux_buffno = *(int32 *) uptr($aux_p + ($why * 8));
+        $aux_strand = *(int32 *) uptr($aux_p + AUX_STRAND_OFF + ($why * 8));
+        $pic_lowbuf = *(uint32 *) uptr(@pic_meta[pid] + ($aux_strand * PIC_META_SZ) + PIC_LOWBUF_OFF);
+        $pic_hibuf = *(uint32 *) uptr(@pic_meta[pid] + ($aux_strand * PIC_META_SZ) + PIC_HIBUF_OFF);
+
+        printf("%ld %s    aux: latch#%2d: strand = 0x%lx (%d), buffno = 0x%lx (%d)\n", 
+               pid, comm, $why, $aux_strand, $aux_strand, $aux_buffno, $aux_buffno);
+
+        printf("%ld %s    pic: latch#%2d: lowbuf = 0x%lx (%u), hibuf = 0x%lx (%u)\n",
+               pid, comm, $why, $pic_lowbuf, $pic_lowbuf, $pic_hibuf, $pic_hibuf);
+
+    } else {
+        /* 
+         * Note:
+         * Hardcoding 24 (_log_simultaneous_copies)
+         * below to avoid bpf verifier issues!
+         */
+        $i = 0;
+        while ($i < 24) {
+            $aux_buffno = *(int32 *) uptr($aux_p + ($i * 8));
+            $aux_strand = *(int32 *) uptr($aux_p + AUX_STRAND_OFF + ($i * 8));
+
+            printf("%ld %s    aux: latch#%2d: strand = 0x%x (%d), buffno = 0x%x (%d)\n", 
+                   pid, comm, $i, $aux_strand, $aux_strand, $aux_buffno, $aux_buffno);
+
+            if ($aux_strand != -1 && $aux_buffno != -1) {
+                $pic_lowbuf = *(uint32 *) uptr(@pic_meta[pid] + ($aux_strand * PIC_META_SZ) + PIC_LOWBUF_OFF);
+                $pic_hibuf = *(uint32 *) uptr(@pic_meta[pid] + ($aux_strand * PIC_META_SZ) + PIC_HIBUF_OFF);
+
+                printf("%ld %s    pic: latch#%2d: lowbuf = 0x%lx (%u), hibuf = 0x%lx (%u)\n",
+                    pid, comm, $why, $pic_lowbuf, $pic_lowbuf, $pic_hibuf, $pic_hibuf);
+            }
+
+            $i++;
+        }
+    }
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kslgetl
+/ @in_trace[pid] /
+{
+    printf("%ld %s <- kslgetl: ret=%d\n", pid, comm, retval);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kslfre
+/ @in_trace[pid] /
+{
+    $laddr = (uint64) arg0;
+    printf("%ld %s -> kslfre: laddr=%p\n", pid, comm, $laddr);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kslwtbctx
+/ @in_trace[pid] /
+{
+    printf("%ld %s -> kslwtbctx\n", pid, comm);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kslwaitctx
+/ @in_trace[pid] /
+{
+    printf("%ld %s -> kslwaitctx\n", pid, comm);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kslwtectx
+/ @in_trace[pid] /
+{
+    printf("%ld %s -> kslwtectx:\n", pid, comm);
+}
+
+tracepoint:syscalls:sys_enter_semtimedop
+/ @in_trace[pid] /
+{
+    $timespec = (struct timespec *) args->timeout;
+    $ms = ($timespec->tv_nsec /1e6);
+    printf("%ld %s -> semtimedtop: timeout_ms=%lu\n", pid, comm, $ms);
+}
+
+tracepoint:syscalls:sys_exit_semtimedop
+/ @in_trace[pid] /
+{
+    printf("%ld %s <- semtimedtop: ret=%d\n", pid, comm, args->ret);
+}
+
+END
+{
+    clear(@OPT_VERBOSE);
+    clear(@in_trace);
+}
