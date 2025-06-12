@@ -6,7 +6,7 @@
 #   This is useful for analyzing which code paths
 #   increment a stats counter. 
 #
-#  Date:
+# Date:
 #   Jun-07 2025
 #
 # Author:
@@ -48,7 +48,7 @@
 #   script may change with each RU, so you may need
 #   adjust them based on your specific version.
 #
-#   This script may be dangerours, use at your own 
+#   This script may be dangerous, use at your own 
 #   risk!
 
 set pagination off
