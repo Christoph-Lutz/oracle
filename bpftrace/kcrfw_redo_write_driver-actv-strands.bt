@@ -1,0 +1,75 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ * Purpose:
+ *   Probe kcrfw_redo_write_driver to show how lgwr 
+ *   deactivates one public redo strand on every 10th 
+ *   log write when multiple public redo strands are 
+ *   active.
+ * 
+ *   Note that you can manually enable multiple public
+ *   redo strands by changing the sga variable 
+ *   kcrf_actv_strands_ using gdb (or use the gdb script
+ *   all-public-redo-strands-enable.gdb).
+ *
+ * Date:
+ *   Jun-12 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./kcrfw_redo_write_driver-actv-strands.bt <oracle_sid>
+ *
+ * Tested on:
+ *   Oracle 19.26
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *  
+ *   Use at your own risk!
+ */
+
+/* May change in every RU!                                        */
+#define KSPSSIDST_ADDR      0x60009628  /* sid name               */
+#define KCRF_MAX_STRANDS    0x60021e90  /* max nr of redo strands */
+#define KCRF_ACTV_STRANDS   0x60021ea0  /* active public strands  */
+#define KCRF_LGWR_WRITE_CNT 0x60021f0c  /* lgwr write count       */
+
+BEGIN
+{
+    if ($# != 1) {
+        printf("\nUsage: kcrfw_redo_write_driver-actv-strands.bt <oracle_sid>\n\n");
+        exit();
+    }
+    printf("\nTracing ... Hit Ctrl + C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_redo_write_driver
+/ str(uptr(KSPSSIDST_ADDR)) == str($1) /
+{
+    @in_driver[pid] = 1;
+    @actv_strands[pid] = *(uint32 *) uptr(KCRF_ACTV_STRANDS);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_redo_write_driver
+/ @in_driver[pid] /
+{
+    $actv_strands = *(uint32 *) uptr(KCRF_ACTV_STRANDS);
+    $redo_writes  = *(uint32 *) uptr(KCRF_LGWR_WRITE_CNT);
+
+    if (@actv_strands[pid] != $actv_strands) {
+        printf("%ld %s <- kcrfw_redo_write_driver\n", pid, comm);
+        printf("%ld %s    On entry: active strands=%u\n", pid, comm, @actv_strands[pid]);
+        printf("%ld %s    On exit : active strands=%u, redo writes=%u\n\n", pid, comm, 
+               $actv_strands, $redo_writes);
+    }
+    
+    delete(@in_driver[pid]);
+    delete(@actv_strands[pid]);
+}
+
+END
+{
+    clear(@in_driver);
+    clear(@actv_strands);
+}
