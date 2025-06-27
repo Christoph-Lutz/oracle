@@ -1,0 +1,95 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ * Purpose:
+ *   Proof of concept example to demonstrate how to 
+ *   access parameter values in bpftrace. 
+ *
+ *   Note that this is highly experimental and only 
+ *   works with an spfile and only with integer and 
+ *   string parameters! 
+ *
+ * Date:
+ *   Jun-26 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./ksp-show-values.bt <pid> <ksppi_indx> <ksppi_type> 
+ * 
+ *   Arguments:
+ *   pid       : os pid
+ *   ksppi_indx: parameter indx (x$ksppi.indx)
+ *   ksppi_type: parameter type (x$ksppi.ksppity)
+ * 
+ * Tested on:
+ *   Oracle 19.26 / Exadata 24.1.2
+ *
+ * Notes:
+ *   The script probes opiexe for demo purposes. 
+ * 
+ *   Adjust the ORACLE_HOME path for your environment.
+ *  
+ *   Use at your own risk!
+ */
+
+/* May change in every RU                                          */
+#define KSP_TYPE_STR          0x2         /* string parameter      */ 
+#define KSP_TYPE_INT          0x3         /* integer parameter     */
+#define KSP_TBL_BLK_SIZ_EXP2  0x60006994  /* ksptblblksizexp2_     */
+#define KSP_TBL_BLK_SIZ_MOD   0x60006998  /* ksptblblksizemod_     */
+#define KSP_HDL_TLS_OFF       0x10058     /* ksp handle tls offset */
+
+BEGIN
+{
+    if( $# < 3)
+    {
+        printf("\nUsage: BPFTRACE_CACHE_USER_SYMBOLS=1 ./ksp-show-value.bt <pid> <ksppi_indx> <ksppi_type>\n");
+        exit();
+    }
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:opiexe
+/ pid == $1 /
+{
+    /* 
+     * Extract the param value for ksppi_indx 
+     * from the ksp structures. This is exper-
+     * imental (hacky!) and needs more research!
+     */
+    $ksppi_indx = $2;
+    $fsbase = uptr(curtask->thread.fsbase);
+    $ksp_hdl_p = *(uint64 *)($fsbase - KSP_HDL_TLS_OFF);
+    $ksptblblksizexp2 = *(uint32 *) uptr(KSP_TBL_BLK_SIZ_EXP2);
+    $ksptblblksizemod = *(uint32 *) uptr(KSP_TBL_BLK_SIZ_MOD);
+    $table_idx = (uint64) $ksppi_indx >> ($ksptblblksizexp2 & 0x1f);
+    $entry_idx =(uint64) $ksptblblksizemod & $ksppi_indx;
+    $table_p = *(uint64 *) ($ksp_hdl_p + ($table_idx * 8));
+    $entry_p = *(uint64 *) ($table_p + ($entry_idx * 8));
+
+    /* Remove comments for debugging */
+    /*
+    printf("%ld %s DEBUG: ksp_hdl_p=%p\n", pid, comm, $ksp_hdl_p);
+    printf("%ld %s DEBUG: table_idx=%lu\n", pid, comm, $table_idx);
+    printf("%ld %s DEBUG: entry_idx=%lu\n", pid, comm, $entry_idx);
+    printf("%ld %s DEBUG: table_p=%p\n", pid, comm, $table_p);
+    printf("%ld %s DEBUG: entry_p=%p\n", pid, comm, $entry_p);
+    */
+
+    if ($3 == KSP_TYPE_INT) {
+       $val = *(uint64 *) $entry_p;
+       printf("%ld %s param# = %u, value = %lu\n", pid, comm, $ksppi_indx, $val);
+    }
+
+    if ($3 == KSP_TYPE_STR) {
+        $p = *(uint64 *) $entry_p;
+        $str_p = (uint64 *) ($p + 8);
+        printf("%ld %s param# = %u, value = %s\n", pid, comm, $ksppi_indx, str(uptr($str_p)));
+    }
+}
+
+END
+{
+}
