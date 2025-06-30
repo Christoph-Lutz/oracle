@@ -69,7 +69,7 @@ BEGIN
         exit();
     }
 
-    if (str($2) == "yes" || str($3) == "y") {
+    if (str($2) == "yes" || str($2) == "y") {
         @OPT_VERBOSE = 1;
     }
 
