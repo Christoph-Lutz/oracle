@@ -1,10 +1,12 @@
 #!/usr/bin/env -S bpftrace --no-warning
 /*
  * Purpose:
- *   Trce calls to kcrfw_alfs_sl_save_redowrite_time and show how
+ *   Trace calls to kcrfw_alfs_sl_save_redowrite_time to show how
  *   lgwr maintains a moving average of the redo write time that is
  *   used to decide if the Fast Log File Sync should be enabled or
- *   disabled.
+ *   disabled. The decision to enable or disable the Fast Sync
+ *   is taken in kcrfw_alfs_sl_update_mode (kcrfw adaptive log file
+ *   sync smart log update mode). 
  *
  * Date:
  *   May-15 2025
@@ -21,36 +23,43 @@
  * Notes:
  *   Adjust the ORACLE_HOME path for your environment.
  * 
- *   Floating point numbers are not supported by BPF, therefore
- *   the script doesn't calculate the moving avg of the redo
- *   write time and rather only emits the formula so that you
- *   can do the calculation in a calculator.
+ *   Floating point numbers are not supported by BPF, there-
+ *   fore the script doesn't calculate the moving avg of the 
+ *   redo write time and rather only emits the formula so that 
+ *   you can do the calculation in a calculator.
  *  
  *   Use at your own risk!
  *
  * Background information:
- *   A log file sync mode switch (enable/disable Fast Sync) is eva-
- *   luated in the following scenarios and code paths:
- * 
- *   1. On every 128th log write (hard-coded default in 
- *      kcrfw_alfs_sl_update_mode, which gets called be-
- *      fore lgwr issues a log write)
+ *   The moving avg is calculated in kcrfw_alfs_sl_save_
+ *   redowrite_time, which gets called from kcrfw_post af-
+ *   ter a log write (lgwr post-write processing).
  *
- *   2. Log file switch (kcrfnl)
+ *   Oracle tracks the Fast Sync status in sga variable
+ *   kcrf_fast_sync_ (0=disabled/1=enabled). A mode switch
+ *   to Fast Sync is evaluated in in kcrfw_alfs_sl_update_
+ *   mode when the avg redo write time to a smart log (dax
+ *   device) is less than the max threshold of 100 us; simi-
+ *   larly, Fast Sync is disabled, when the avg redo write
+ *   time to a smart log drops below the max threshold of
+ *   100 us. Note that the status update to variable kcrfw_
+ *   fast_sync_ is not performed in kcrfw_alfs_sl_update_mode
+ *   directly, but rather via kcrf_handle_storage_switch -> 
+ *   kcrf_switch_storage_params.
  *
- *   The moving average of the redo write time based on the following 
- *   formula:
+ *   The latter code path gets also invoked on a redo log 
+ *   switch (kcrfwl->kcrfnl->kcrf_handle_storage_witch->
+ *   kcrf_switch_storage_params; however, the log switch 
+ *   code path was not investigated further).
+ *
+ *   The moving average of the redo write time based on the 
+ *   following formula:
  * 
  *   diff = curr_write_time - write_avg;
  *   write_avg += (diff * 2) / 129;
  * 
- *   The smoothing factor 2/129 (~0.0155) controls how fast it adapts 
- *   and smooths out spikes and dips.
- * 
- *   The moving avg is calculated in kcrfw_alfs_sl_save_redowrite_time, 
- *   which gets called from kcrfw_post after a log write (lgwr post-write 
- *   processing).
- *
+ *   The smoothing factor 2/129 (~0.0155) controls how fast 
+ *   it adapts and smooths out spikes and dips.
  */
 
 #define KSPSSIDST 0x60009628  /* oracle sid name                       */
