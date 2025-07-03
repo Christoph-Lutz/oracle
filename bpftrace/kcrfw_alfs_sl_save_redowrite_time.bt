@@ -60,10 +60,16 @@
  * 
  *   The smoothing factor 2/129 (~0.0155) controls how fast 
  *   it adapts and smooths out spikes and dips.
+ *
+ *   kcrfw_alfs_savre_redowrite_time also increments the 
+ *   number of smart log writes (tracked in sga variable 
+ *   kspasv90_).
  */
 
+/* Addresses and offsets my change in every RU!                        */
 #define KSPSSIDST 0x60009628  /* oracle sid name                       */
 #define KSPASV3   0x6000ace8  /* kspasv3_ (redo write time moving avg) */
+#define KSPASV90  0x6000aec0  /* kspasv90_ smart log (sl) write count  */
 
 BEGIN
 {
@@ -80,8 +86,8 @@ uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_alfs_sl_s
 / str(uptr(KSPSSIDST)) == str($1) /
 {
     @trace[tid] = 1;
-    $kspasv3 = *(uint32 *) uptr(KSPASV3);
-    $write_avg = (int32) $kspasv3;
+    $write_avg = *(uint32 *) uptr(KSPASV3);
+    $write_cnt = *(uint32 *) uptr(KSPASV90);
     $fs = uptr(curtask->thread.fsbase);
     $tls_off = *(uint64 *) ($fs - 0xec78);
     $t1 = *(uint64 *) ($tls_off + 0x48);
@@ -91,6 +97,7 @@ uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_alfs_sl_s
 
     printf("%ld %s -> kcrfw_alfs_sl_save_redowrite_time:\n", pid, comm);
     printf("%ld %s    write_avg = %u\n", pid, comm, $write_avg);
+    printf("%ld %s    write_cnt = %u\n", pid, comm, $write_cnt);
     printf("%ld %s    t1 = %lu\n", pid, comm, $t1);
     printf("%ld %s    t2 = %lu\n", pid, comm, $t2);
     printf("%ld %s    write_time = (t2 - t1) * 1000 = %d\n", pid, comm, $write_time);
@@ -105,9 +112,11 @@ uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_alfs_sl_s
 uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_alfs_sl_save_redowrite_time
 / @trace[tid] /
 {
+    $new_write_cnt = *(uint32 *) uptr(KSPASV90);
     $new_avg = *(uint32 *) uptr(KSPASV3);
 
     printf("%ld %s    effective: new_avg = %u\n", pid, comm, $new_avg);
+    printf("%ld %s    new write_cnt = %u\n", pid, comm, $new_write_cnt);
     printf("%ld %s <- kcrfw_alfs_sl_save_redowrite_time\n\n", pid, comm);
 
     delete(@trace[tid]);
