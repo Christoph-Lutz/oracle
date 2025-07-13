@@ -235,7 +235,7 @@ def update_ma_api(
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Usage: ma_api.py <params.json>")
+        print("Usage: fast-sync-ma_api.py <params.json>")
         sys.exit(1)
 
     param_file = sys.argv[1]
