@@ -1,0 +1,170 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ * Purpose:
+ *   Trace ckpt to collect the input parameter values
+ *   for calculating the adaptive moving average of 
+ *   the sleep time used during log file sync waits 
+ *   when Fast Sync is active.
+ * 
+ *   The script outputs input parameters as a json,
+ *   configuration, which you can use with the fol-
+ *   lowing python script:
+ *   fast-sync-ma_api.py
+ *
+ * Date:
+ *   Jul-13 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./kcrfw_alfs_cron_job.bt-fast-sync-sleep-inputs.bt <ckpt_pid> [<verbose>?]
+ *
+ * Tested on:
+ *   Oracle 19.26 / Exadata 24.1.2
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *  
+ *   Use at your own risk!
+ */
+
+/* Addresses and offsets may change in every RU                                         */
+#define KCRF_FAST_SYNC                0x60021f1c  /* kcrf_fast_sync_                    */
+#define KCRF_ALFS_INFO                0x60021f30  /* kcrf_alfs_info_                    */
+#define KCRF_ALFS_INFO_RW_MIN         0x60021ffc  /* redo write time min                */
+#define KCRF_ALFS_INFO_RW_AVG         0x60021ff8  /* redo write time avg                */
+#define KCRF_ALFS_INFO_SLEEP_CNT      0x60021fd0  /* sleep count                        */
+#define KCRF_ALFS_INFO_SLEEP_CNT_PRV  0x60021fc8  /* previous sleep count               */
+#define KCRF_ALFS_INFO_USLEEP_CNT     0x60021fc0  /* usleep count                       */
+#define KCRF_ALFS_INFO_USLEEP_CNT_PRV 0x60021fb8  /* previous usleep count              */
+#define KCRF_ALFS_INFO_SLEEP_OH       0x60021fe8  /* sleep overhead                     */
+#define KCRF_ALFS_INFO_SLEEP_OH_PRV   0x60021fe0  /* previous sleep overhead            */
+#define KCRF_ALFS_INFO_MA_SLEEP_OH    0x60021ff4  /* ma per sleep overhead              */
+#define KCRF_ALFS_INFO_MA_API         0x60022000  /* ma api: fast sync sleep moving avg */
+
+#define ALFS_DELTA_SLEEP_CNT_THRESH   100         /* delta sleep count threshold        */
+#define ALFS_SLEEP_TARGET_PCT_DEFAULT 50          /* _fg_fast_sync_sleep_target_pct     */
+
+BEGIN
+{
+    if( $# < 1 || $# > 2) {
+        printf("\nUsage: ./kcrfw_alfs_cron_job.bt-fast-sync-sleep-inputs.bt <ckpt_pid> [<verbose>?]\n");
+        exit();
+    }
+
+    if (str($2) == "yes" || str($2) == "y" || str($2) == "verbose") {
+        @OPT_VERBOSE = 1;
+    }
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_alfs_cron_job
+/ pid == $1 /
+{
+    @in_trace[pid] = 1;
+    @alfs_info[pid] = *(uint32 *) uptr(KCRF_ALFS_INFO);
+    @fast_sync[pid] = *(uint32 *) uptr(KCRF_FAST_SYNC);
+
+    /* Fast Sync input parameters */
+    @prv_sleep_cnt[pid] = *(uint64 *) uptr(KCRF_ALFS_INFO_SLEEP_CNT_PRV);
+    @sleep_cnt[pid] = *(uint64 *) uptr(KCRF_ALFS_INFO_SLEEP_CNT);
+
+    @prv_usleep_cnt[pid] = *(uint64 *) uptr(KCRF_ALFS_INFO_USLEEP_CNT_PRV);
+    @usleep_cnt[pid] = *(uint64 *) uptr(KCRF_ALFS_INFO_USLEEP_CNT);
+
+    @prv_sleep_oh[pid] = *(uint64 *) uptr(KCRF_ALFS_INFO_SLEEP_OH_PRV);
+    @sleep_oh[pid] = *(uint64 *) uptr(KCRF_ALFS_INFO_SLEEP_OH);
+
+    @rw[pid] = *(uint32 *) uptr(KCRF_ALFS_INFO_RW_AVG);
+
+    /* Note: scale rw by 1000 */
+    @rw[pid] = @rw[pid] / 1000;
+
+    @rw_min[pid] = *(uint32 *) uptr(KCRF_ALFS_INFO_RW_MIN);
+
+    @ma_per_sleep_oh[pid] = *(uint32 *) uptr(KCRF_ALFS_INFO_MA_SLEEP_OH);
+    @ma_api[pid] = *(uint32 *) uptr(KCRF_ALFS_INFO_MA_API);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_alfs_cron_job
+/ @in_trace[pid] /
+{
+    $alfs_info_str = @alfs_info[pid] == 1 ? "enabled" : "disabled";
+    $fast_sync_str = @fast_sync[pid] == 1 ? "enabled" : "disabled";
+    $ma_api = *(uint32 *) uptr(KCRF_ALFS_INFO_MA_API);
+
+    printf("%ld %s %s\n", pid, comm, strftime("*** %Y-%d-%m %H:%MT%H:%M:%S.%f%z", nsecs));
+    printf("%ld %s -> kcrfw_alfs_cron_job\n", pid, comm);
+    printf("%ld %s    alfs is %s\n", pid, comm, $alfs_info_str);
+    printf("%ld %s    fast sync is %s\n", pid, comm, $fast_sync_str);
+
+    if (@alfs_info[pid] && @fast_sync[pid] && (@sleep_cnt[pid] > @prv_sleep_cnt[pid] + ALFS_DELTA_SLEEP_CNT_THRESH) ) { 
+        printf("%ld %s    Collecting fast sync adaptive sleep input values ...\n", pid, comm);
+        printf("{\n");
+        printf("    \"sleep_target_pct_prm\": %u,\n", ALFS_SLEEP_TARGET_PCT_DEFAULT);
+        printf("    \"prev_sleep_cnt\": %lu,\n", @prv_sleep_cnt[pid]);
+        printf("    \"sleep_cnt\": %lu,\n", @sleep_cnt[pid]);
+        printf("    \"prev_usleep_cnt\": %lu,\n", @prv_usleep_cnt[pid]);
+        printf("    \"usleep_cnt\": %lu,\n", @usleep_cnt[pid]);
+        printf("    \"prev_sleep_oh\": %lu,\n", @prv_sleep_oh[pid]);
+        printf("    \"sleep_oh\": %lu,\n", @sleep_oh[pid]);
+        printf("    \"min_redo_write\": %u,\n", @rw_min[pid]);
+        printf("    \"redo_write\": %u,\n", @rw[pid]);
+        printf("    \"ma_per_sleep_oh\": %u,\n", @ma_per_sleep_oh[pid]);
+        printf("    \"ma_api\": %u\n", @ma_api[pid]);
+        printf("}\n");
+
+       printf("%ld %s    Calculation done, new adaptive fast sync sleep time:\n", pid, comm); 
+       printf("%ld %s    ma_api = %u (%u scaled)\n", pid, comm, $ma_api, $ma_api/1000);
+    } else {
+        if (@OPT_VERBOSE) {
+            if (!@alfs_info[pid]) {
+                printf("%ld %s    alfs disabled, no action.\n", pid, comm);
+            }
+
+            if (@fast_sync[pid]) {
+                printf("%ld %s    fast sync disabled, no action.\n", pid, comm);
+            }
+
+            if (@sleep_cnt[pid] <= @prv_sleep_cnt[pid] + ALFS_DELTA_SLEEP_CNT_THRESH) {
+                printf("%ld %s     skip, reason: sleep_cnt <= prv_sleep_cnt + threshold (%d)\n", pid, comm, ALFS_DELTA_SLEEP_CNT_THRESH);
+            }
+        }
+    }
+
+    printf("%ld %s <- kcrfw_alfs_cron_job\n\n", pid, comm);
+
+    delete(@in_trace[pid]);
+    delete(@alfs_info[pid]);
+    delete(@fast_sync[pid]);
+    delete(@sleep_cnt[pid]);
+    delete(@prv_sleep_cnt[pid]);
+    delete(@usleep_cnt[pid]);
+    delete(@prv_usleep_cnt[pid]);
+    delete(@prv_sleep_oh[pid]);
+    delete(@sleep_oh[pid]);
+    delete(@rw[pid]);
+    delete(@rw_min[pid]);
+    delete(@ma_per_sleep_oh[pid]);
+    delete(@ma_api[pid]);
+}
+
+END
+{
+    clear(@in_trace);
+    clear(@alfs_info);
+    clear(@fast_sync);
+    clear(@sleep_cnt);
+    clear(@prv_sleep_cnt);
+    clear(@usleep_cnt);
+    clear(@prv_usleep_cnt);
+    clear(@prv_sleep_oh);
+    clear(@sleep_oh);
+    clear(@rw);
+    clear(@rw_min);
+    clear(@ma_per_sleep_oh);
+    clear(@ma_api);
+    clear(@OPT_VERBOSE);
+}
