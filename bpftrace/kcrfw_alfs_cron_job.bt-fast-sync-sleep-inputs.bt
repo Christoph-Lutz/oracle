@@ -99,6 +99,11 @@ uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_alfs_c
     printf("%ld %s -> kcrfw_alfs_cron_job\n", pid, comm);
     printf("%ld %s    alfs is %s\n", pid, comm, $alfs_info_str);
     printf("%ld %s    fast sync is %s\n", pid, comm, $fast_sync_str);
+ 
+    if (@OPT_VERBOSE) {
+        printf("%ld %s    sleep_cnt = %u\n", pid, comm, @sleep_cnt[pid]);
+        printf("%ld %s    prev_sleep_cnt = %u\n", pid, comm, @prv_sleep_cnt[pid]);
+    }
 
     if (@alfs_info[pid] && @fast_sync[pid] && (@sleep_cnt[pid] > @prv_sleep_cnt[pid] + ALFS_DELTA_SLEEP_CNT_THRESH) ) { 
         printf("%ld %s    Collecting fast sync adaptive sleep input values ...\n", pid, comm);
@@ -124,12 +129,12 @@ uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_alfs_c
                 printf("%ld %s    alfs disabled, no action.\n", pid, comm);
             }
 
-            if (@fast_sync[pid]) {
+            if (!@fast_sync[pid]) {
                 printf("%ld %s    fast sync disabled, no action.\n", pid, comm);
             }
 
             if (@sleep_cnt[pid] <= @prv_sleep_cnt[pid] + ALFS_DELTA_SLEEP_CNT_THRESH) {
-                printf("%ld %s     skip, reason: sleep_cnt <= prv_sleep_cnt + threshold (%d)\n", pid, comm, ALFS_DELTA_SLEEP_CNT_THRESH);
+                printf("%ld %s    skip, reason: sleep_cnt <= prv_sleep_cnt + threshold (%d)\n", pid, comm, ALFS_DELTA_SLEEP_CNT_THRESH);
             }
         }
     }
