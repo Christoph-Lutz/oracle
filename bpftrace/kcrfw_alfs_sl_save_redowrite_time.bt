@@ -117,7 +117,7 @@ uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_alfs_sl_s
            pid, comm, $write_avg, $diff);
 
     /* Uncomment to print stack trace */
-    printf("%s\n", ustack());
+    // printf("%s\n", ustack());
 }
 
 uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_alfs_sl_save_redowrite_time
