@@ -41,7 +41,7 @@
  *   mode when the avg redo write time to a smart log (dax
  *   device) is less than the max threshold of 100 us; simi-
  *   larly, Fast Sync is disabled, when the avg redo write
- *   time to a smart log drops below the max threshold of
+ *   time to a smart logd exceeds the max threshold of 
  *   100 us. Note that the status update to variable kcrfw_
  *   fast_sync_ is not performed in kcrfw_alfs_sl_update_mode
  *   directly, but rather via kcrf_handle_storage_switch -> 
@@ -52,8 +52,8 @@
  *   kcrf_switch_storage_params; however, the log switch 
  *   code path was not investigated further).
  *
- *   The moving average of the redo write time based on the 
- *   following formula:
+ *   The moving average of the redo write time is based on 
+ *   the following formula:
  * 
  *   diff = curr_write_time - write_avg;
  *   write_avg += (diff * 2) / 129;
@@ -61,15 +61,19 @@
  *   The smoothing factor 2/129 (~0.0155) controls how fast 
  *   it adapts and smooths out spikes and dips.
  *
- *   kcrfw_alfs_savre_redowrite_time also increments the 
+ *   kcrfw_alfs_save_redowrite_time also increments the 
  *   number of smart log writes (tracked in sga variable 
  *   kspasv90_).
  */
 
-/* Addresses and offsets my change in every RU!                        */
-#define KSPSSIDST 0x60009628  /* oracle sid name                       */
-#define KSPASV3   0x6000ace8  /* kspasv3_ (redo write time moving avg) */
-#define KSPASV90  0x6000aec0  /* kspasv90_ smart log (sl) write count  */
+/* Addresses and offsets my change in every RU!                                  */
+#define KSPSSIDST           0x60009628  /* oracle sid name                       */
+
+#define KCRF_FAST_SYNC      0x60021f1c  /* kcrf_fast_sync_                       */
+#define KCRFWSLV_LGWR_MODE  0x6002200c  /* lgwr mode (0=serial, 1=parallel)      */
+
+#define KSPASV3             0x6000ace8  /* kspasv3_ (redo write time moving avg) */
+#define KSPASV90            0x6000aec0  /* kspasv90_ smart log (sl) write count  */
 
 BEGIN
 {
@@ -86,6 +90,8 @@ uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_alfs_sl_s
 / str(uptr(KSPSSIDST)) == str($1) /
 {
     @trace[tid] = 1;
+    $fast_sync = *(uint32 *) uptr(KCRF_FAST_SYNC);
+    $lgwr_mode = *(uint32 *) uptr(KCRFWSLV_LGWR_MODE);
     $write_avg = *(uint32 *) uptr(KSPASV3);
     $write_cnt = *(uint32 *) uptr(KSPASV90);
     $fs = uptr(curtask->thread.fsbase);
@@ -95,18 +101,23 @@ uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_alfs_sl_s
     $write_time = (int32) (($t2 - $t1) * 1000);
     $diff = (int32) ($write_time - $write_avg);
 
+    $fast_sync_str = $fast_sync == 0 ? "disabled" : "enabled";
+    $lgwr_mode_str = $lgwr_mode == 0 ? "serial"   : "parallel";
+
     printf("%ld %s -> kcrfw_alfs_sl_save_redowrite_time:\n", pid, comm);
+    printf("%ld %s    fast sync is %s\n", pid, comm, $fast_sync_str);
+    printf("%ld %s    lgwr mode is %s\n", pid, comm, $lgwr_mode_str);
     printf("%ld %s    write_avg = %u\n", pid, comm, $write_avg);
     printf("%ld %s    write_cnt = %u\n", pid, comm, $write_cnt);
     printf("%ld %s    t1 = %lu\n", pid, comm, $t1);
     printf("%ld %s    t2 = %lu\n", pid, comm, $t2);
     printf("%ld %s    write_time = (t2 - t1) * 1000 = %d\n", pid, comm, $write_time);
     printf("%ld %s    diff = write_time - write_avg = %d\n", pid, comm, $diff);
-    printf("%ld %s    calculation: new_avg = write_avg + (diff * 2)/129 = %d + (%d * 2)/129\n", 
+    printf("%ld %s    new_avg = write_avg + (diff * 2)/129 = %d + (%d * 2)/129\n", 
            pid, comm, $write_avg, $diff);
 
     /* Uncomment to print stack trace */
-    // printf("%s\n", ustack());
+    printf("%s\n", ustack());
 }
 
 uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_alfs_sl_save_redowrite_time
@@ -115,7 +126,7 @@ uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_alfs_s
     $new_write_cnt = *(uint32 *) uptr(KSPASV90);
     $new_avg = *(uint32 *) uptr(KSPASV3);
 
-    printf("%ld %s    effective: new_avg = %u\n", pid, comm, $new_avg);
+    printf("%ld %s    new_avg = %u (%u usec)\n", pid, comm, $new_avg, ($new_avg/1000));
     printf("%ld %s    new write_cnt = %u\n", pid, comm, $new_write_cnt);
     printf("%ld %s <- kcrfw_alfs_sl_save_redowrite_time\n\n", pid, comm);
 
