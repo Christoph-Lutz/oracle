@@ -151,7 +151,7 @@ define enable_lg_workers
         else
             printf "  changing redorate to: (2 x switch threshold) + 1\n"
             set *(uint64_t *) $KCRFWSLV_REDORATE = (2 * *(uint64_t *) $KCRFWSLV_SWITCH_THRESH) + 1
-            printf "  changed redorate to: %lu\n", *(uint64_t *) $KCRFWSLV_REDORATE + 1
+            printf "  changed redorate to: %lu\n", *(uint64_t *) $KCRFWSLV_REDORATE
         end
     end 
     printf "\n"
@@ -190,7 +190,7 @@ define disable_lg_workers
 
         printf "  changing group0 write count to write count all: %lu\n", *(uint64_t *) $KCRFWSLV_ALL
         set *(uint64_t *) $KCRFWSLV_GROUP0 = *(uint64_t *) $KCRFWSLV_ALL
-        printf "  changed write count group to: %lu\n", *(uint64_t *) $KCRFWSLV_GROUP0
+        printf "  changed write count group0 to: %lu\n", *(uint64_t *) $KCRFWSLV_GROUP0
 
 
         printf "  changing redo write time to redo write time avg: %u\n", *(uint32_t *) $KCRFWSLV_RW_AVG
