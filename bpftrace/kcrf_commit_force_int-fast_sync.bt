@@ -1,0 +1,444 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ * Purpose:
+ *   Show how "log file sync" wait events behave and how
+ *   long a FG process sleeps when the Fast Log File Sync
+ *   is active (kcrf_fast_sync_ = 1).
+ * 
+ *   In verbose mode, the script also shows the Fast Sync
+ *   stats counters tracked in sga struct kcrf_alfs_info_,
+ *   as well as the Fast Sync counters from v$sesstat. 
+ *   Both type of statistics are calculated and updated 
+ *   in kcrf_upd_fast_sync_stats.
+ *
+ *   The Fast Sync statistic counters in kcrf_alfs_info_
+ *   are used by ckpt to calculate an adaptive moving 
+ *   average of the target sleep time for Fast Sync.
+ *
+ * Date:
+ *   Jul-12 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./kcrf_commit_force_int-fast_sync.bt <pid> [<verbose>?]
+ * 
+ *
+ * Tested on:
+ *   Oracle 19.26 / Exadata 19.26 (X8M-2)
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *
+ *   Use at your own risk!
+ * 
+ * Background information:
+ *   When a session completes a transaction (commit or roll-
+ *   back), it calls kcrf_comit_force_int, which starts a
+ *   log file sync (LFS) wait if the sync scn is not higher
+ *   than the on-disk scn (meaning lgwr hasn't yet written 
+ *   the scn the session is waiting for).
+ * 
+ *   When Fast Sync (FS) is active (kcrf_fast_sync = 1), 
+ *   LFS waits can occur in three different variations:
+ *
+ *   1) Sleep: 
+ *      The fg sleeps and finds the on-disk scn greater 
+ *      than the sync scn when it wakes up. The sleep 
+ *      time is an adaptive moving average, dynamically 
+ *      calculated and updated by ckpt every 3 sec at 
+ *      runtime (in kcrfw_alfs_cron_job).
+ *
+ *   2) Spin:
+ *      The fg sleeps, finds the on-disk scn lower than 
+ *      the sync scn when it wakes up, and starts to spin 
+ *      for 100 us (defined by _fg_fast_sync_sleep_usecs). 
+ *      After the spin, the fg finds that lgwr has pro-
+ *      gressed and the on-disk scn is now greater than 
+ *      the sync scn.
+ *
+ *   3) Backoff:
+ *      If the fg finds on-disk scn still lower than the 
+ *      sync scn after sleeping and spinning, it starts 
+ *      sleeping again using an exponential backoff scheme:
+ *      sleep for 10 us and double the sleep time on every 
+ *      iteration until it reaches 160 us. Once the sleep
+ *      time reaches 160 us, it no longer increases 
+ *      (=> 10, 20, 40, 80, 160, 160, 160, ...). 
+ *      The min and max sleep times of 10 and 160 us are 
+ *      hardcoded and cannot be configured (tested on 
+ *      19.26).
+ *
+ *   kcrf_upd_fast_sync stats maintains the following FS
+ *   related runtime statistic counters in the sga struct-
+ *    ure kcrf_alfs_info, 
+ *    
+ *     - sleep_cnt: 
+ *       Total number of FS sleeps (scheme 1, 2, or 3).
+ *
+ *     - usleep_cnt: 
+ *       Total number of "usleeps"; that is sleeps in 
+ *       schemes 2 or 3 (spin or exponential backoff). 
+ *       The ocunter is not updated for LFS waits that 
+ *       completed after the first sleep (scheme 1).
+ * 
+ *     - overhead: 
+ *       Running total of the sleep overhead, which 
+ *        is: FS ela - sleep time
+ * 
+ *   Moreover, kcrf_upd_fast_sync also updates various
+ *   statistic counters from v$sesstat, which reflect 
+ *   the different LFS wait schemes when FS is active:
+ * 
+ *   1) Sleep:
+ *        redo synch fast sync sleep count
+ *        redo synch fast sync sleep (usec)
+ * 
+ *   2) Spin:
+ *        redo synch fast sync spin count 
+ *        redo synch fast sync spin (usec)
+ * 
+ *   3) Backoff:
+ *        redo synch fast sync backoff count 
+ *        redo synch fast sync backoff (usec)
+ * 
+ *   The following counters are updated in all LFS 
+ *   wait schemes:
+ *      redo synch fast sync all sleep count
+ *      redo synch fast sync all sleep count
+ *      redo synch fast sync all sleep (nn us) => nn = 20 - 720
+ *
+ *   Interestingly, Oracle records the FS end time at 
+ *   two different locations and uses two separate time
+ *   intervals to calculate the FS duration. 
+ *
+ *   Here's how the timings are measured from a function
+ *   flow perspective:
+ *
+ *    -> kcrf_commit_force_int()
+ *
+ *       t_fs_beg = skgstmGetEpochTs()
+ *       wait: log file sync
+ *       t_fs_end = skgstmGetEpochTs()
+ *
+ *       -> kcrf_upd_fast_sync_stats()
+ *          t_fs_end_upd = skgstmGetEpochTs()
+ *       <- kcrf_upd_fast_sync_stats()
+ *
+ *    <- kcrf_commit_force_int()
+ *
+ *   This gives the following two timings:
+ *     fs_ela_1 = t_fs_end - t_fs_beg
+ *     fs_ela_2 = t_fs_end_upd - t_fs_beg
+ * 
+ *   These two timings are used in different statistics 
+ *   as follows:
+ *    
+ *     t_fs_ela_1:
+ *       overhead (kcrf_alfs_info_)
+ *       redo synch fast sync all sleep (usec) 
+ *       redo synch fast sync all sleep (nn us) 
+ * 
+ *     t_fs_ela_2:
+ *       redo synch fast sync sleep (usec)
+ *       redo synch fast sync spin (usec)
+ *       redo synch fast sync backoff (usec)
+ * 
+ *   This means, the times tracked by the sleep, spin, and
+ *   backoff counters (t_fs_ela_2) include additional over-
+ *   head. Also, these statistics are cumulative, such that:
+ * 
+ *    spin time: sleep time + spin time
+ *
+ *    backoff time: sleep time + spin time + backoff time
+ */
+
+/* Addresses and offsets may change in every RU!                                      */
+#define KSLEDT                   0x600069f0  /* event description table               */
+#define KSLED_SZ                 0x38        /* ksled size                            */
+
+#define KSUSE_TLS_OFF            0xff78      /* ksuse tls offset                      */
+#define KSUSE_STATS_OFF          0x7f8       /* ksuse stats array offset              */
+
+#define KSUSDT                   0x140a2c20  /* kernel service user statistics        */ 
+                                             /* description table?                    */
+#define KSUSDT_SZ                0x20        /* ksusdt entry size                     */
+
+#define KSPSSIDST                0x60009628   /* oracle sid name                      */
+
+#define KCRF_FAST_SYNC           0x60021f1c   /* kcrf_fast_sync_                      */
+
+#define ALFS_INFO_FS_SLEEP_CNT   0x60021fd0  /* fast sync sleep count                 */
+#define ALFS_INFO_FS_USLEEP_CNT  0x60021fc0  /* fast sync usleep count                */
+#define ALFS_INFO_FS_SLEEP_OH    0x60021fe8  /* fast sync sleep overhead              */
+
+#define FAST_SYNC_SLEEP          0x1         /* fast sync sleep                       */
+#define FAST_SYNC_SPIN           0x2         /* fast sync spin                        */
+#define FAST_SYNC_BACKOFF        0x3         /* fast sync backoff                     */
+
+#define STA_FS_ALL_SLEEP_US      372         /* redo synch fast sync all sleep (usec) */
+#define STA_FS_ALL_SLEEP_CNT     373         /* redo synch fast sync all sleep count  */
+#define STA_FS_SPIN_CNT          388         /* redo synch fast sync spin count       */
+#define STA_FS_SPIN_US           389         /* redo synch fast sync spin (usec)      */
+#define STA_FS_SLEEP_CNT         385         /* redo synch fast sync sleep count      */
+#define STA_FS_SLEEP_US          386         /* redo synch fast sync sleep (usec)     */
+#define STA_FS_BACKOFF_CNT       390         /* redo synch fast sync backoff count    */
+#define STA_FS_BACKOFF_US        391         /* redo synch fast sync backoff (usec)   */
+
+BEGIN
+{
+    if ($# < 1 || $# > 2) {
+        printf("\nUsage: ./kcrf_commit_force_int-fast_sync.bt <pid> [<verbose>?]\n");
+        exit();
+    }
+
+    if (str($2) == "yes" || str($2) == "y" || str($2) == "verbose") {
+        @OPT_VERBOSE = 1;
+    }
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrf_commit_force_int
+/ pid == $1 /
+{
+    @in_trace[pid] = 1;
+    @fast_sync[pid] = *(int32 *) uptr(KCRF_FAST_SYNC);
+    $fast_sync_str = @fast_sync[pid] == 1 ? "enabled" : "disabled";
+
+    printf("%ld %s -> kcrf_commit_force_int: 0x%lx 0x%lx 0x%lx\n", 
+           pid, comm, arg0, arg1, arg2);
+    printf("%ld %s    fast sync is %s\n", pid, comm, $fast_sync_str);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrf_commit_force_int
+/ @in_trace[pid] /
+{
+    printf("%ld %s <- kcrf_commit_force_int: 0x%lx\n\n", pid, comm, retval);
+
+    delete(@in_trace[pid]);
+    delete(@fast_sync[pid]);
+}
+
+tracepoint:syscalls:sys_enter_semop
+/ @in_trace[pid] && @fast_sync[pid] /
+{
+    $tsops = args->tsops;
+    $sem_num = $tsops->sem_num;
+    $sem_op = $tsops->sem_op;
+    $sem_flg = $tsops->sem_flg;
+
+    printf("%ld %s    -> semop: semid=%d sops=%p nsops=%u\n", 
+           pid, comm, args->semid, $tsops, args->nsops);
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s       sembuf={sem_num=%u, sem_op=%d, sem_flg=0x%x}\n", 
+               pid, comm, $sem_num, $sem_op, $sem_flg);
+    }
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kskthbwt
+/ @in_trace[pid] && @fast_sync[pid] /
+{
+    $ev_num = (uint64) arg1;
+    $ksledt = *(uint64 *) uptr(KSLEDT);
+    $ev_off = (uint64) ($ev_num * KSLED_SZ);
+    $kslednam_p = *(uint64 *) uptr($ksledt + $ev_off);
+
+    printf("%d %s    -> kskthbwt: %s\n", pid, comm, str($kslednam_p));
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kskthewt
+/ @in_trace[pid] && @fast_sync[pid] /
+{
+    printf("%d %s    -> kskthewt\n", pid, comm);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:sltrusleep
+/ @in_trace[pid] && @fast_sync[pid] /
+{
+    printf("%ld %s       -> sltrusleep: %lu, %lu, %lu\n", pid, comm, arg0, arg1, arg2);
+}
+
+uprobe:/lib64/libpthread-2.28.so:nanosleep
+/ @in_trace[pid] && @fast_sync[pid] /
+{
+    $dur = (struct timespec *) arg0;
+    $rem = (struct timespec *) arg1;
+
+    printf("%ld %s          -> nanosleep: duration=%p, rem=%p\n", pid, comm, arg0, arg1);
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s             *duration={tv_sec=%ld, tv_nsec=%ld}\n", pid, comm, $dur->tv_sec, $dur->tv_nsec);
+    }
+}
+
+uretprobe:/lib64/libpthread-2.28.so:nanosleep
+/ @in_trace[pid] && @fast_sync[pid] /
+{
+    printf("%ld %s          <- nanosleep: %d\n", pid, comm, retval);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrf_upd_fast_sync_stats
+/ @in_trace[pid] && @fast_sync[pid] /
+{
+    @in_upd_stats[pid] = 1;
+
+    /* Function parameters */
+    $fs_mode = (uint32) arg0;
+    @fs_beg[pid] = (uint64) arg1;
+    @fs_end[pid] = (uint64) arg2;
+    $unk = (uint64) arg3;
+    @sleep[pid] = (uint64) arg4;
+
+    /* kcrf_alfs_info_ variables */
+    @sleeps[pid] = *(uint64 *) uptr(ALFS_INFO_FS_SLEEP_CNT);
+    @usleeps[pid] = *(uint64 *) uptr(ALFS_INFO_FS_USLEEP_CNT);
+    @oh[pid] = *(uint64 *) uptr(ALFS_INFO_FS_SLEEP_OH);
+
+    if ($fs_mode == FAST_SYNC_SLEEP) {
+        $fs_mode_str = "sleep";
+    }
+    else if ($fs_mode == FAST_SYNC_SPIN) {
+        $fs_mode_str = "spin";
+    } 
+    else if ($fs_mode == FAST_SYNC_BACKOFF) {
+        $fs_mode_str = "backoff";
+    }
+
+    if (@OPT_VERBOSE) {
+        $fs= uptr(curtask->thread.fsbase);
+        $saddr = *(uint64 *) uptr($fs - KSUSE_TLS_OFF);
+        $stats = *(uint64 *) uptr($saddr + KSUSE_STATS_OFF);
+
+        /* Collect sesstat counter values */
+        @stats[pid, STA_FS_ALL_SLEEP_US]  = *(uint64 *) uptr($stats + STA_FS_ALL_SLEEP_US * 8);
+        @stats[pid, STA_FS_ALL_SLEEP_CNT] = *(uint64 *) uptr($stats + STA_FS_ALL_SLEEP_CNT * 8);
+        @stats[pid, STA_FS_SPIN_CNT]      = *(uint64 *) uptr($stats + STA_FS_SPIN_CNT* 8);
+        @stats[pid, STA_FS_SPIN_US]       = *(uint64 *) uptr($stats + STA_FS_SPIN_US* 8);
+        @stats[pid, STA_FS_SLEEP_CNT]     = *(uint64 *) uptr($stats + STA_FS_SLEEP_CNT* 8);
+        @stats[pid, STA_FS_SLEEP_US]      = *(uint64 *) uptr($stats + STA_FS_SLEEP_US* 8);
+        @stats[pid, STA_FS_BACKOFF_CNT]   = *(uint64 *) uptr($stats + STA_FS_BACKOFF_CNT* 8);
+        @stats[pid, STA_FS_BACKOFF_US]    = *(uint64 *) uptr($stats + STA_FS_BACKOFF_US* 8);
+    }
+
+    printf("%ld %s    -> kcrf_upd_fast_sync_stats: mode=%u, beg=%lu, end=%lu, unk=%lu, sleep=%lu\n", 
+            pid, comm, $fs_mode, @fs_beg[pid], @fs_end[pid], $unk, @sleep[pid]);
+    printf ("%ld %s       mode is %s (%u)\n", pid, comm, $fs_mode_str, $fs_mode);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrf_upd_fast_sync_stats
+/ @in_trace[pid] && @fast_sync[pid] /
+{
+    $fs_ela_1 = @fs_end[pid] - @fs_beg[pid];
+    $fs_ela_2 = @fs_end_upd[pid] - @fs_beg[pid];
+    $fs_oh = $fs_ela_1 - @sleep[pid]; 
+    $sleeps = *(uint64 *) uptr(ALFS_INFO_FS_SLEEP_CNT);
+    $usleeps = *(uint64 *) uptr(ALFS_INFO_FS_USLEEP_CNT);
+    $oh = *(uint64 *) uptr(ALFS_INFO_FS_SLEEP_OH);
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s       fast_sync_ela_1=%lu (usec)\n", pid, comm, $fs_ela_1);
+        printf("%ld %s       fast_sync_ela_2=%lu (usec)\n", pid, comm, $fs_ela_2);
+        printf("%ld %s       fast_sync_oh=%lu (usec)\n", pid, comm, $fs_oh);
+
+        printf("%ld %s       kcrf_alfs_info stats: \n", pid, comm);
+        printf("%ld %s         %-8s %16s %16s %16s\n", pid, comm, "stat", "old", "new", "diff");
+        printf("%ld %s         %-8s %16lu %16lu %16lu\n", pid, comm, "sleeps", @sleeps[pid], $sleeps, ($sleeps - @sleeps[pid]));
+        printf("%ld %s         %-8s %16lu %16lu %16lu\n", pid, comm, "usleeps", @usleeps[pid], $usleeps, ($usleeps - @usleeps[pid]));
+        printf("%ld %s         %-8s %16lu %16lu %16lu\n", pid, comm, "overhead", @oh[pid], $oh, ($oh - @oh[pid]));
+    }
+
+    delete(@in_upd_stats[pid]);
+    delete(@fs_beg[pid]);
+    delete(@fs_end[pid]);
+    delete(@fs_end_upd[pid]);
+    delete(@sleep[pid]);
+    delete(@sleeps[pid]);
+    delete(@usleeps[pid]);
+    delete(@oh[pid]);
+
+    if (@OPT_VERBOSE) {
+        $fs = uptr(curtask->thread.fsbase);
+        $saddr = *(uint64 *) uptr($fs - KSUSE_TLS_OFF);
+        $stats = *(uint64 *) uptr($saddr + KSUSE_STATS_OFF);
+        $ksusdt = (uint64) uptr(KSUSDT);
+
+        /* Print old and new sesstat counters */
+        printf("%ld %s       sesstat counters:\n", pid, comm);
+        printf("%ld %s         %-37s %16s %16s %16s\n", pid, comm, "name", "old", "new", "diff");
+
+        $idx = STA_FS_ALL_SLEEP_US;
+        $str = uptr(*(uint64 *)(KSUSDT + $idx * KSUSDT_SZ));
+        $new = *(uint64 *) uptr($stats + $idx * 8);
+        printf("%ld %s         %-37s %16lu %16lu %16lu\n", pid, comm, str($str), @stats[pid, $idx], $new, ($new - @stats[pid, $idx]));
+
+        $idx = STA_FS_ALL_SLEEP_CNT;
+        $str = uptr(*(uint64 *)(KSUSDT + $idx * KSUSDT_SZ));
+        $new = *(uint64 *) uptr($stats + $idx * 8);
+        printf("%ld %s         %-37s %16lu %16lu %16lu\n", pid, comm, str($str), @stats[pid, $idx], $new, ($new - @stats[pid, $idx]));
+
+        $idx = STA_FS_SPIN_CNT;
+        $str = uptr(*(uint64 *)(KSUSDT + $idx * KSUSDT_SZ));
+        $new = *(uint64 *) uptr($stats + $idx * 8);
+        printf("%ld %s         %-37s %16lu %16lu %16lu\n", pid, comm, str($str), @stats[pid, $idx], $new, ($new - @stats[pid, $idx]));
+
+        $idx = STA_FS_SPIN_US;
+        $str = uptr(*(uint64 *)(KSUSDT + $idx * KSUSDT_SZ));
+        $new = *(uint64 *) uptr($stats + $idx * 8);
+        printf("%ld %s         %-37s %16lu %16lu %16lu\n", pid, comm, str($str), @stats[pid, $idx], $new, ($new - @stats[pid, $idx]));
+
+        $idx = STA_FS_SLEEP_CNT;
+        $str = uptr(*(uint64 *)(KSUSDT + $idx * KSUSDT_SZ));
+        $new = *(uint64 *) uptr($stats + $idx * 8);
+        printf("%ld %s         %-37s %16lu %16lu %16lu\n", pid, comm, str($str), @stats[pid, $idx], $new, ($new - @stats[pid, $idx]));
+
+        $idx = STA_FS_SLEEP_US;
+        $str = uptr(*(uint64 *)(KSUSDT + $idx * KSUSDT_SZ));
+        $new = *(uint64 *) uptr($stats + $idx * 8);
+        printf("%ld %s         %-37s %16lu %16lu %16lu\n", pid, comm, str($str), @stats[pid, $idx], $new, ($new - @stats[pid, $idx]));
+
+        $idx = STA_FS_BACKOFF_CNT;
+        $str = uptr(*(uint64 *)(KSUSDT + $idx * KSUSDT_SZ));
+        $new = *(uint64 *) uptr($stats + $idx * 8);
+        printf("%ld %s         %-37s %16lu %16lu %16lu\n", pid, comm, str($str), @stats[pid, $idx], $new, ($new - @stats[pid, $idx]));
+
+        $idx = STA_FS_BACKOFF_US;
+        $str = uptr(*(uint64 *)(KSUSDT + $idx * KSUSDT_SZ));
+        $new = *(uint64 *) uptr($stats + $idx * 8);
+        printf("%ld %s         %-37s %16lu %16lu %16lu\n", pid, comm, str($str), @stats[pid, $idx], $new, ($new - @stats[pid, $idx]));
+
+        delete(@stats[pid, STA_FS_ALL_SLEEP_US]);
+        delete(@stats[pid, STA_FS_ALL_SLEEP_CNT]);
+        delete(@stats[pid, STA_FS_SPIN_CNT]);
+        delete(@stats[pid, STA_FS_SPIN_US]);
+        delete(@stats[pid, STA_FS_SLEEP_CNT]);
+        delete(@stats[pid, STA_FS_SLEEP_US]);
+        delete(@stats[pid, STA_FS_BACKOFF_CNT]);
+        delete(@stats[pid, STA_FS_BACKOFF_US]);
+    }
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:skgstmGetEpochTs
+/ @in_upd_stats[pid] /
+{
+    @fs_end_upd[pid] = (uint64) retval;
+}
+
+
+END
+{
+    clear(@in_trace);
+    clear(@in_upd_stats);
+    clear(@fast_sync);
+    clear(@fs_beg);
+    clear(@fs_end);
+    clear(@fs_end_upd);
+    clear(@sleep);
+    clear(@sleeps);
+    clear(@usleeps);
+    clear(@oh);
+    clear(@stats);
+    clear(@OPT_VERBOSE);
+}
