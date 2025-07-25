@@ -14,24 +14,27 @@
 #   Oracle 19.26 (OEL 8.10)
 # 
 # Usage:
-#   gdb  -x sleep-on-break.py               \
-#         -ex 'set $location = "location"'  \
-#         -ex 'set $sleep_sec = 1'          \
-#         -p <pid>
+#   gdb                               \
+#   -ex 'set $location = "location"'  \
+#   -ex 'set $sleep_sec = 1'          \
+#   -x sleep-on-break.py              \
+#   -p <pid>
 # 
 # Examples:
 #   Break at kcrf_commit_force_int+2 and sleep 1.5 sec:
 #
-#     gdb -x sleep-on-break.py                         \  
+#     gdb                                              \  
 #     -ex 'set $location = "*kcrf_commit_force_int+2"' \
 #     -ex 'set $sleep_sec = 1.5'                       \
+#     -x sleep-on-break.py                             \
 #     -p 1234
 #
 #   Break at *0x13842a30 and sleep 2.2 sec
 # 
-#     gdb -x sleep-on-break.py            \
+#     gdb                                 \
 #     -ex 'set $location = "*0x13842a30"' \
 #     -ex 'set $sleep_sec = 2.2'          \
+#     -x sleep-on-break.py                \
 #     -p 1234
 
 import gdb
