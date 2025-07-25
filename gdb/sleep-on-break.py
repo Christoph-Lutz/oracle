@@ -29,9 +29,9 @@
 #
 #   Break at *0x13842a30 and sleep 2.2 sec
 # 
-#     gdb -x sleep-on-break.py           \
-#     -ex 'set $location = "*0x13842a30" \
-#     -ex 'set $sleep_sec = 2.2'         \
+#     gdb -x sleep-on-break.py            \
+#     -ex 'set $location = "*0x13842a30"' \
+#     -ex 'set $sleep_sec = 2.2'          \
 #     -p 1234
 
 import gdb
