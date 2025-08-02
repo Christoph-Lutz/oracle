@@ -26,7 +26,7 @@
  * 
  *
  * Tested on:
- *   Oracle 19.26 / Exadata 19.26 (X8M-2)
+ *   Oracle 19.26 / Exadata 24.1.2 (X8M-2)
  *
  * Notes:
  *   Adjust the ORACLE_HOME path for your environment.
