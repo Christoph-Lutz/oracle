@@ -1,0 +1,136 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ * Purpose:
+ *   Trace calls to kcrfw_stats_syncoverhead_record to show
+ *   how fg processes search the write info array to calculate
+ *   the redo synch time overhead. 
+ *
+ *   The redo synch time overhead is one of the metrics the
+ *   Adaptive Log File Sync (ALFS) mechanism uses to decide 
+ *   whether to perform a mode switch from post/wait to pol-
+ *   ling.
+ *
+ * Date:
+ *   Aug-02 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./kcrfw_stats_syncoverhead_record.bt <pid>
+ *
+ * Tested on:
+ *   Oracle 19.26 / Exadata 24.1.2
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *  
+ *   Use at your own risk!
+ *
+ * Background information:
+ *  Elements in the write info array contain two fields:
+ *    - lwn scn (log write number / logical write number?) 
+ *    - redo write end timestamp
+ *
+ *  Lgwr and lg worker processes use the write info array to 
+ *  track the timestamps of redo write completions in lwn scn
+ *  order (kcrfw_post). 
+ * 
+ *  The redo write end timestamps are used by fg processs to 
+ *  calculate the redo synch  overhead when a transaction
+ *  completes (via kcrf_commit_force_int -> kcrfw_stats_
+ *  syncoverhead_record):
+ * 
+ *    redo synch overhead = lfs end ts - redo write end ts 
+ * 
+ *  Lgwr and lg workers insert new entries into the write info
+ *  array in "forward" order, whereas fg processes scan the
+ *  write info array in "reverse" order.
+ * 
+ *  Concurrent updates to the write info array are protected
+ *  and serialized by the "log write info" latch.
+ */
+
+/* Addresses and offsets may change in every RU!                                  */
+#define KSPSSIDST_ADDR              0x60009628  /* sid name                       */
+#define KCRF_WRITE_INFO             0x60022318  /* kcrf_write_info_               */
+#define KCRF_WRITE_INFO_ARR_SZ_OFF  0x4         /* write info array size offset   */
+#define KCRF_WRITE_INFO_ARR_OFF     0x8         /* write info array offset        */
+#define KCRF_WRITE_INFO_REC_SZ      0x10        /* write info array record size   */
+#define KCRF_WRITE_INFO_TS_OFF      0x8         /* write info timestamp offset    */
+
+#define SKIP_NO_WRITE_TS            0x1         /* redo write timestamp not found */
+#define SKIP_LFS_END_TS             0x2         /* lfs ts before redo write ts    */
+
+BEGIN
+{
+    if ($# != 1) {
+        printf("\nUsage: ./kcrfw_stats_syncoverhead_record.bt <pid>\n\n");
+        exit();
+    }
+
+    @STR_SKIP[SKIP_NO_WRITE_TS] = "redo write ts not found";
+    @STR_SKIP[SKIP_LFS_END_TS] = "log file sync ts before redo write ts";
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_stats_syncoverhead_record
+/ pid == $1 /
+{
+    @in_trace[pid] = 1;
+    @lfs_end_ts[pid] = (uint64) arg1;
+
+    printf("%ld %s -> kcrfw_stats_syncoverhead_record: sync_scn_p=%p, lfs_end_ts=%lu\n", pid, comm, arg0, arg1);
+    printf("%ld %s    *sync_scn_p = %p\n", pid, comm, *(uint64 *) arg0);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_stats_syncoverhead_record
+/ @in_trace[pid] /
+{
+    $overhead = @lfs_end_ts[pid] - @redo_write_ts[pid];
+
+    $skip = 0;
+    if (!@redo_write_ts[pid]) {
+        $skip = SKIP_NO_WRITE_TS;
+    } 
+    else if (@lfs_end_ts[pid] < @redo_write_ts[pid]) { 
+        $skip = SKIP_LFS_END_TS;
+    }
+
+    if (!$skip) {
+        printf("%ld %s    lfs_end_ts = %lu\n", pid, comm, @lfs_end_ts[pid]);
+        printf("%ld %s    redo_write_ts = %lu\n", pid, comm, @redo_write_ts[pid]);
+        printf("%ld %s    overhead = lfs_end_ts - redo_write_ts = %lu\n", pid, comm, $overhead);
+    } else {
+        printf("%ld %s    skipping, reason: %s\n", pid, comm, @STR_SKIP[$skip]);
+    }
+
+    printf("%ld %s <- kcrfw_stats_syncoverhead_record: %d\n",  pid, comm, retval);
+
+    delete(@in_trace[pid]);
+    delete(@lfs_end_ts[pid]);
+    delete(@redo_write_ts[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_stats_writeinfo_find
+/ @in_trace[pid] /
+{
+    printf("%ld %s    -> kcrfw_stats_writeinfo_find: sync_scn_p=%p, lfs_end_ts=%lu\n", pid, comm, arg0, arg1);
+    printf("%ld %s       *sync_scn_p = %p\n", pid, comm, *(uint64 *) arg0);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_stats_writeinfo_find
+/ @in_trace[pid] /
+{
+    @redo_write_ts[pid] = (uint64) retval;
+    printf("%ld %s    <- kcrfw_stats_writeinfo_find: %lu\n", pid, comm, retval);
+}
+
+END
+{
+    clear(@in_trace);
+    clear(@lfs_end_ts);
+    clear(@redo_write_ts);
+    clear(@STR_SKIP);
+}
