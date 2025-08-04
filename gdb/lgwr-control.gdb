@@ -7,7 +7,11 @@
 #
 #   The script provides a bunch of gdb commands that modify
 #   various sga variables, causing Oracle to enable or disable
-#   lgwr features as needed.
+#   these lgwr features as needed.
+#
+#   Note: to enable or disable the Adaptive Log File Sync (ALFS)
+#   mechanism, refer to scripts alfs-enable-polling.gdb and
+#   alfs-disable-polling.gdb.
 #
 # Author:
 #   Christoph Lutz
@@ -22,17 +26,23 @@
 #   Oracle 19.26 / Exadata 24.1.2 (X8M-2)
 #
 # Notes:
-#   This is dangerous and higly experimental, use at your own 
-#   risk!
+#   The script does not retrieve parameter values from SGA
+#   structures at runtime. Instead, it relies on predefined
+#   defaults, which must be manually adjusted if necessary.
+#
+#   This script is dangerous and higly experimental, use at 
+#   your own risk!
 
 set pagination off
 set confirm off
+
+# Addresses can (and will) change between RUs!
+set $ALFS_INFO_POLLING                = 0x60021f38
 
 set $FAST_SYNC_SL_WRITE_COUNT_THRESH  = 128
 set $FAST_SYNC_SL_WRITE_US_LO         = 10 
 set $FAST_SYNC_SL_WRITE_US_HI         = 101 
 
-# Addresses can (and will) change between RUs!
 set $KCRFWSLV_ALL                     = 0x600222c0
 set $KCRFWSLV_ALL_PRV                 = 0x60022298
 set $KCRFWSLV_GROUP0                  = 0x600222b8
@@ -43,20 +53,39 @@ set $KCRFWSLV_ARBITER                 = 0x600222ac
 set $KCRFWSLV_MAX_LOG_WRITE_PAR       = 0x60022274
 set $KCRFWSLV_SWITCH_THRESH           = 0x600222d8
 set $KCRFWSLV_REDORATE                = 0x600222d0
+set $KCRFWSLV_STANDBY_MODE            = 0x60022010
 set $KCRFWSLV_SAMPLING_COUNT_PRM      = 128
 
+define show_lgwr_mode
+    printf "\n"
+    printf "----- Show LGWR mode -----\n"
+    printf "  lgwr mode is: %s\n", *(uint32_t *) $KCRFWSLV_LGWR_MODE > 0 ? "parallel" : "serial"
+    printf "  lgwr slave pool stdby mode is: %s\n", *(uint32_t *) $KCRFWSLV_STANDBY_MODE > 0 ? "enabled" : "disabled"
+    printf "  fast sync is: %s\n", (uint32_t) kcrf_fast_sync_ > 0 ? "enabled" : "disabled"
+    printf "  alfs polling is: %s\n", *(uint32_t *) $ALFS_INFO_POLLING > 0 ? "enabled" : "disabled"
+    printf "  max log write parallelism is: %u\n", *(uint32_t *) $KCRFWSLV_MAX_LOG_WRITE_PAR
+    printf "\n"
+end
+
 define set_max_log_write_parallelism
+    printf "\n"
+    printf "----- Changing max_log_write_parallelism -----\n"
     if ! $argc 
         printf "  target parallelism not supplied, no action!\n"
     else
-        printf "  max log write parallelism is: %u\n", *(uint32_t *) $KCRFWSLV_MAX_LOG_WRITE_PAR   
-        printf "  changing max log write parallelism to: %u\n", $arg0
-        set *(uint32_t *) $KCRFWSLV_MAX_LOG_WRITE_PAR = $arg0
-        printf "  changed max log write parallelism to: %u\n", *(uint32_t *) $KCRFWSLV_MAX_LOG_WRITE_PAR
+        if *(uint32_t *) $KCRFWSLV_MAX_LOG_WRITE_PAR != $argc
+            printf "  max log write parallelism is: %u\n", *(uint32_t *) $KCRFWSLV_MAX_LOG_WRITE_PAR   
+            printf "  changing max log write parallelism to: %u\n", $arg0
+            set *(uint32_t *) $KCRFWSLV_MAX_LOG_WRITE_PAR = $arg0
+            printf "  changed max log write parallelism to: %u\n", *(uint32_t *) $KCRFWSLV_MAX_LOG_WRITE_PAR
+        else
+            printf "  max log write parallelism already set to: %u\n", $arg0
+        end
     end
+    printf "\n"
 end
 
-define set_fs_sl_write_time
+define _set_fs_sl_write_time
     printf "  fast sync sl write time threshold is: %u us\n", (uint32_t) kspasv4_
 
     if (uint32_t) kspasv90_ < $FAST_SYNC_SL_WRITE_COUNT_THRESH
@@ -71,13 +100,7 @@ define set_fs_sl_write_time
     set *(uint32_t) &kspasv3_ = ($arg0 * 1000)
 
     printf "  changed fast sync sl write time to: %u us\n", ((uint32_t) kspasv3_ / 1000)
-
-    if *(uint32_t *) $KCRFWSLV_LGWR_MODE > 0
-        printf "  lgwr mode is parallel\n"
-    else
-        printf "  lgwr mode is serial\n"
-    end
-
+    printf "  lgwr mode is: %s\n", (uint32_t *) $KCRFWSLV_LGWR_MODE > 0 ? "parallel" : "serial"
     printf "  max log write parallelism is: %u\n", *(uint32_t *) $KCRFWSLV_MAX_LOG_WRITE_PAR 
 end
 
@@ -107,7 +130,7 @@ define enable_fast_sync
     printf "\n"
     printf "----- Enabling Fast Sync -----\n"
     printf "  using default low fast sync sl write time: %u us\n", $FAST_SYNC_SL_WRITE_US_LO
-    set_fs_sl_write_time $FAST_SYNC_SL_WRITE_US_LO
+    _set_fs_sl_write_time $FAST_SYNC_SL_WRITE_US_LO
     printf "\n"
 end
 
@@ -115,7 +138,7 @@ define disable_fast_sync
     printf "\n"
     printf "----- Disabling Fast Sync -----\n"
     printf "  using default high fast sync sl write time: %u us\n", $FAST_SYNC_SL_WRITE_US_HI
-    set_fs_sl_write_time $FAST_SYNC_SL_WRITE_US_HI
+    _set_fs_sl_write_time $FAST_SYNC_SL_WRITE_US_HI
     printf "\n"
 end
 
@@ -199,15 +222,15 @@ define disable_lg_workers
     end
     printf "\n"
 end
+
+document show_lgwr_mode
+Show current lgwr mode and configuration
+Usage: show_lgwr_mode
+end
     
 document set_max_log_write_parallelism
 Set the max_log_write_parallelism in kcrf_slave_info_ to a given value. 
 Usage: set_max_log_write_parallelism <new_parallelism>
-end
-
-document set_fs_sl_write_time
-Set the fast sync write_time to a given value (in us)
-Usage: set_fs_sl_write_time <write_time_us>
 end
 
 document enable_redo_strands
