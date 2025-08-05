@@ -1,0 +1,213 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ * Purpose:
+ *   Illustrate how the Oracle psp0 process measures the
+ *   scheduling deleay in kso_sched_delay_measure.
+ *
+ * Date:
+ *   Aug-05 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./kso_sched_delay_measure.bt <oracle_sid>
+ *
+ * Tested on:
+ *   Oracle 19.26 / Exadata 24.1.2
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *
+ *   Use at your own risk!
+ *
+ *  Background information:
+ *    By default, psp0 samples the scheduling delay every sec 
+ *    (_sched_delay_sample_interval_ms) by calling select()
+ *    with a 1 ms timeout (_sched_delay_measurement_sleep_us)
+ *    up to four times in a loop (_sched_delay_max_samples). 
+ *
+ *    The measurement loop is constrained by a collection time
+ *    threshold of 200 ms (_sched_delay_sample_collection_thresh_ms).
+ *    This means, the measurement loop may end before _sched_delay_
+ *    max_samples have been collected if scheduling delay is
+ *    high.
+ * 
+ *    The slowest of the select() calls during the measurement
+ *    interval is the sched_delay that gets logged to the under-
+ *    lying  sga structure of $kso_sched_delay_history. 
+ * 
+ *    Note that the slowest measured value gets adjusted as 
+ *    follows before getting stored: 
+ *
+ *      sched_delay = select_ela - 
+ *                    (_sched_delay_os_tick_granularity_us + 
+ *                     _sched_delay_measurement_sleep_us)
+ *
+ *    If the slowest measured value is lower than the OS tick
+ *    granularity plus the measurement sleep (in microseconds),
+ *    it is adjusted to 0. With default values of 16000 and 1000 
+ *    for these parameters, this implies that a delay of 0 has a 
+ *    deviation of +/- 17000 us (17 ms).
+ *
+ *    If the slowest measured value is lower than the os tick 
+ *    granularity + measurement sleep us, it is adjusted to 0.
+ *    With the default values of 16000 and 1000 for these para-
+ *    meters, this implies that a delay 0 zero has deviation 
+ *    of +/- 17000 us (17 ms).
+ *
+ *    The maximum number of entries in the sched_hist table 
+ *    is defined as follows (hardcoded in kso_sched_delay_sga_init):
+ * 
+ *     (60000 / _sched_delay_sample_interval_ms) * 15 + 3
+ *
+ *    The max possible sched_delay window is 300 sec (5 min, 
+ *    hardcoded in kso_sched_delay_avg_ms.
+ * 
+ * Credits & References:
+ *   Tanel Poder, Oracle Performance Troubleshooting Without 
+ *   OS Access, Part 1: Identifying CPU Scheduling Latency, 2020-02-10
+ *   (https://tanelpoder.com/posts/oracle-performance-troubleshooting-without-os-access-part-1/)
+ */
+
+/* Addresses and offsets can and will change between RUs!                                       */
+#define KSPSSIDST                   0x60009628  /* oracle sid name                              */
+
+#define KSO_SCHED_HIST_TAB          0x6000bd20  /* sched hist table (x$ksu_sched_delay_history) */
+#define KSO_SCHED_HIST_POS          0x6000bd28  /* current position in sched hist table         */
+#define KSO_SCHED_HIST_LEN          0x6000bd18  /* number of entries in the sched hist table    */
+
+#define KSO_SCHED_HIST_ELEM_SZ      0x20        /* size of sched hist element                   */
+#define KSO_SCHED_HIST_DELAY_OFF    0x10        /* sched delay offset in an element             */
+
+#define KSO_SCHED_TICK_GRAN_PRM     16000       /* _sched_delay_os_tick_granularity_us          */
+#define KSO_SCHED_MEAS_SLEEP_US_PRM 1000        /* _sched_delay_measurement_sleep_us            */
+
+BEGIN
+{
+    if ($# != 1) {
+        printf("\nUsage: ./kso_sched_delay_measure.bt <oracle_sid>\n");
+        exit();
+    }
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kso_sched_delay_measure
+/ str(uptr(KSPSSIDST)) == str($1) /
+{
+    @in_trace[pid] = 1;
+    @sched_hist_tab[pid] = *(uint64 *) uptr(KSO_SCHED_HIST_TAB);
+    @sched_hist_pos[pid] = *(uint32 *) uptr(KSO_SCHED_HIST_POS);
+    @adj[pid] = (KSO_SCHED_TICK_GRAN_PRM + KSO_SCHED_MEAS_SLEEP_US_PRM);
+    $len = *(uint32 *) uptr(KSO_SCHED_HIST_LEN);
+
+    printf("%s %ld %s -> kso_sched_delay_measure\n", strftime("%H:%M:%S.%f", nsecs), pid, comm);
+    printf("%s %ld %s    sched hist table = %p\n", strftime("%H:%M:%S.%f", nsecs), pid, comm, @sched_hist_tab[pid]);
+    printf("%s %ld %s    sched hist entries = %u\n", strftime("%H:%M:%S.%f", nsecs), pid, comm, $len);
+    printf("%s %ld %s    adj = %u\n", strftime("%H:%M:%S.%f", nsecs), pid, comm, @adj[pid]);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kso_sched_delay_measure
+/ @in_trace[pid] /
+{
+    $pos_new = *(uint32 *) uptr(KSO_SCHED_HIST_POS);
+    $sched_tab_off = (uint64) (@sched_hist_tab[pid] + ($pos_new * KSO_SCHED_HIST_ELEM_SZ));
+    $sched_delay = *(uint32 *) uptr($sched_tab_off + KSO_SCHED_HIST_DELAY_OFF);
+
+    printf("%s %ld %s    sched hist pos: old = %u, new = %u\n", strftime("%H:%M:%S.%f", nsecs), 
+           pid, comm, @sched_hist_pos[pid], $pos_new);
+
+    printf("%s %ld %s    max_delay = %u\n", strftime("%H:%M:%S.%f", nsecs), pid, comm, @max_delay[pid]);
+    printf("%s %ld %s    sched_delay = %u\n", strftime("%H:%M:%S.%f", nsecs), pid, comm, $sched_delay);
+    printf("%s %ld %s <- kso_sched_delay_measure\n\n", strftime("%H:%M:%S.%f", nsecs), pid, comm);
+
+    delete(@in_trace[pid]);
+    delete(@sched_hist_tab[pid]);
+    delete(@sched_hist_pos[pid]);
+    delete(@adj[pid]);
+    delete(@sltrgftime64[pid]);
+    delete(@t1[pid]);
+    delete(@max_delay[pid]); 
+    delete(@naps[pid]);
+}
+
+/* 
+ * sltrgftime64 is a wrapper around clock_gettime() 
+ * using CLOCK_MONOTONIC and returning the result
+ * in usec.
+ */
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:sltrgftime64
+/ @in_trace[pid] /
+{
+    @sltrgftime64[pid]++;
+
+    if (@sltrgftime64[pid] > 1 && !@after_nap[pid]) {
+        @t1[pid] = (uint64) retval;
+        printf("%s %ld %s    <- sltrgftime64: %lu\n", strftime("%H:%M:%S.%f", nsecs), pid, comm, retval);
+    } 
+
+    if (@sltrgftime64[pid] > 1 && @after_nap[pid]) {
+        $sleep_us = (uint64) retval - @t1[pid];       
+
+        printf("%s %ld %s    <- sltrgftime64: %lu\n", strftime("%H:%M:%S.%f", nsecs), pid, comm, retval);
+        printf("%s %ld %s       [%u] sleep_us = %lu\n", strftime("%H:%M:%S.%f", nsecs), pid, comm, @naps[pid], $sleep_us);
+
+        if ($sleep_us < @adj[pid]) {
+            $sleep_adj = 0;
+            printf("%s %ld %s       [%u] sleep_adj = %u, because sleep_us < adj (tick granularity + measurement sleep)\n", 
+                   strftime("%H:%M:%S.%f", nsecs), pid, comm, @naps[pid], $sleep_adj);
+        } else {
+            $sleep_adj = $sleep_us - @adj[pid];
+            printf("%s %ld %s       [%u] sleep_adj = %u\n", strftime("%H:%M:%S.%f", nsecs), pid, comm, @naps[pid], $sleep_adj);
+        }
+
+        @max_delay[pid] = $sleep_adj > @max_delay[pid] ? $sleep_adj : @max_delay[pid];
+
+        delete(@after_nap[pid]);
+    } 
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:skgpnap
+/ @in_trace[pid] /
+{
+    @naps[pid]++;
+    @after_nap[pid] = 1;
+    printf("%s %ld %s    -> skgpnap: 0x%lx, 0x%lx, measurement_sleep_us=%lu\n", 
+           strftime("%H:%M:%S.%f", nsecs), pid, comm, arg0, arg1, arg2);
+}
+
+tracepoint:syscalls:sys_enter_select
+/ @in_trace[pid] /
+{
+    @select_ns[pid] = nsecs;
+    $tvp = (struct timeval *) args->tvp;
+
+    printf("%s %ld %s       -> select: 0x%x, %p, %p, %p tvp=%p\n", 
+           strftime("%H:%M:%S.%f", nsecs), pid, comm, args->n, args->inp, args->outp, args->exp, args->tvp);
+
+    printf("%s %ld %s          tvp->tv_sec = %lu, tvp->tv_usec = %lu\n",  
+           strftime("%H:%M:%S.%f", nsecs), pid, comm, $tvp->tv_sec, $tvp->tv_usec);
+}
+
+tracepoint:syscalls:sys_exit_select
+/ @select_ns[pid] /
+{
+    printf("%s %ld %s          select_ns = %u\n", strftime("%H:%M:%S.%f", nsecs), pid, comm, nsecs - @select_ns[pid]);
+    printf("%s %ld %s       <- select: %d\n", strftime("%H:%M:%S.%f", nsecs), pid, comm, args->ret);
+
+    delete(@select_ns[pid]);
+}
+
+END
+{
+    clear(@in_trace);
+    clear(@sched_hist_tab);
+    clear(@sched_hist_pos);
+    clear(@adj);
+    clear(@sltrgftime64);
+    clear(@t1);
+    clear(@naps);
+    clear(@after_nap);
+    clear(@select_ns);
+}
