@@ -44,17 +44,11 @@
  *                    (_sched_delay_os_tick_granularity_us + 
  *                     _sched_delay_measurement_sleep_us)
  *
- *    If the slowest measured value is lower than the OS tick
+ *    If the slowest measured value is lower than the os tick
  *    granularity plus the measurement sleep (in microseconds),
  *    it is adjusted to 0. With default values of 16000 and 1000 
  *    for these parameters, this implies that a delay of 0 has a 
  *    deviation of +/- 17000 us (17 ms).
- *
- *    If the slowest measured value is lower than the os tick 
- *    granularity + measurement sleep us, it is adjusted to 0.
- *    With the default values of 16000 and 1000 for these para-
- *    meters, this implies that a delay 0 zero has deviation 
- *    of +/- 17000 us (17 ms).
  *
  *    The maximum number of entries in the sched_hist table 
  *    is defined as follows (hardcoded in kso_sched_delay_sga_init):
@@ -62,7 +56,7 @@
  *     (60000 / _sched_delay_sample_interval_ms) * 15 + 3
  *
  *    The max possible sched_delay window is 300 sec (5 min, 
- *    hardcoded in kso_sched_delay_avg_ms.
+ *    hardcoded in kso_sched_delay_avg_ms).
  * 
  * Credits & References:
  *   Tanel Poder, Oracle Performance Troubleshooting Without 
