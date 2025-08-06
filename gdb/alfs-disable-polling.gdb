@@ -77,7 +77,7 @@ set $POST_WAIT_THRESH_PARAM             = 50
 
 printf "\n"
 printf "----- Disabling ALFS Polling -----\n"
-printf "  lgwr mode is: %s\n", (uint32_t *) $KCRFWSLV_LGWR_MODE > 0 ? "parallel" : "serial"
+printf "  lgwr mode is: %s\n", *(uint32_t *) $KCRFWSLV_LGWR_MODE > 0 ? "parallel" : "serial"
 printf "  sched delay is: %u\n", *(uint32_t *) $ALFS_INFO_SCHED_DELAY  
 printf "  sched delay (switch) is: %u\n", *(uint32_t *) $ALFS_INFO_SCHED_DELAY_SWITCH 
 printf "  redo synch writes delta is: %u\n", *(uint32_t *) $ALFS_INFO_SYNC_WRITES_DELTA

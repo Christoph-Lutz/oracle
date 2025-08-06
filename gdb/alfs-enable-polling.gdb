@@ -62,7 +62,7 @@ set $ALFS_INFO_LONG_SYNCS_DELTA_DEF  = 8
 
 printf "\n"
 printf "----- Enabling ALFS Polling -----\n"
-printf "  lgwr mode is: %s\n", (uint32_t *) $KCRFWSLV_LGWR_MODE > 0 ? "parallel" : "serial"
+printf "  lgwr mode is: %s\n", *(uint32_t *) $KCRFWSLV_LGWR_MODE > 0 ? "parallel" : "serial"
 printf "  redo synch writes delta is: %u\n", *(uint32_t *) $ALFS_INFO_SYNC_WRITES_DELTA
 printf "  redo synch long waits delta is: %u\n", *(uint32_t *) $ALFS_INFO_LONG_SYNCS_DELTA
 
