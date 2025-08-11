@@ -37,18 +37,19 @@
  *    interval is the sched_delay that gets logged to the under-
  *    lying  sga structure of $kso_sched_delay_history. 
  * 
- *    Note that the slowest measured value gets adjusted as 
- *    follows before getting stored: 
+ *    Note that every measured value gets adjusted as follows:
  *
  *      sched_delay = select_ela - 
  *                    (_sched_delay_os_tick_granularity_us + 
  *                     _sched_delay_measurement_sleep_us)
  *
- *    If the slowest measured value is lower than the os tick
- *    granularity plus the measurement sleep (in microseconds),
- *    it is adjusted to 0. With default values of 16000 and 1000 
- *    for these parameters, this implies that a delay of 0 has a 
- *    deviation of +/- 17000 us (17 ms).
+ *    So, if the measured value is lower than the os tick granu-
+ *    larity plus the measurement sleep (in microseconds), it 
+ *    is adjusted to 0. With default values of 16000 and 1000 
+ *    for these parameters, sched_delay can differ from the 
+ *    actual delay by up to 17000 us (17 ms), because delays 
+ *    smaller than 17000 us are set to 0 and larger delays are 
+ *    offset by 17000 us.
  *
  *    The maximum number of entries in the sched_hist table 
  *    is defined as follows (hardcoded in kso_sched_delay_sga_init):
