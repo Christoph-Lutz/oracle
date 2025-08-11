@@ -92,6 +92,7 @@ uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kso_sched_delay
 / str(uptr(KSPSSIDST)) == str($1) /
 {
     @in_trace[pid] = 1;
+    @measure_start[pid] = nsecs;
     @sched_hist_tab[pid] = *(uint64 *) uptr(KSO_SCHED_HIST_TAB);
     @sched_hist_pos[pid] = *(uint32 *) uptr(KSO_SCHED_HIST_POS);
     @adj[pid] = (KSO_SCHED_TICK_GRAN_PRM + KSO_SCHED_MEAS_SLEEP_US_PRM);
@@ -115,9 +116,12 @@ uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kso_sched_de
 
     printf("%s %ld %s    max_delay = %u\n", strftime("%H:%M:%S.%f", nsecs), pid, comm, @max_delay[pid]);
     printf("%s %ld %s    sched_delay = %u\n", strftime("%H:%M:%S.%f", nsecs), pid, comm, $sched_delay);
+    printf("%s %ld %s    measurement_duration = %ld (us)\n", 
+                         strftime("%H:%M:%S.%f", nsecs), pid, comm, (nsecs - @measure_start[pid])/1000);
     printf("%s %ld %s <- kso_sched_delay_measure\n\n", strftime("%H:%M:%S.%f", nsecs), pid, comm);
 
     delete(@in_trace[pid]);
+    delete(@measure_start[pid]);
     delete(@sched_hist_tab[pid]);
     delete(@sched_hist_pos[pid]);
     delete(@adj[pid]);
@@ -142,7 +146,7 @@ uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:sltrgftime64
         printf("%s %ld %s    <- sltrgftime64: %lu\n", strftime("%H:%M:%S.%f", nsecs), pid, comm, retval);
     } 
 
-    if (@sltrgftime64[pid] > 1 && @after_nap[pid]) {
+    if (@sltrgftime64[pid] >= 1 && @after_nap[pid]) {
         $sleep_us = (uint64) retval - @t1[pid];       
 
         printf("%s %ld %s    <- sltrgftime64: %lu\n", strftime("%H:%M:%S.%f", nsecs), pid, comm, retval);
@@ -197,6 +201,7 @@ tracepoint:syscalls:sys_exit_select
 END
 {
     clear(@in_trace);
+    clear(@measure_start);
     clear(@sched_hist_tab);
     clear(@sched_hist_pos);
     clear(@adj);
