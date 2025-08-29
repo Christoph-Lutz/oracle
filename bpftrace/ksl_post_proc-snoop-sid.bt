@@ -1,0 +1,224 @@
+#!/usr/bin/env -S bpftrace --no-warning 
+/*
+ * Purpose:
+ *   Probe ksl_post_proc to snoop on the posting activity of
+ *   all processes in an Oracle instance.
+ *
+ * Date:
+ *   Aug-28 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./ksl_post_proc-snoop-sid.bt <oracle_sid> [<src_filter>?] [<tgt_filter>?]
+ *
+ *  Parameters:
+ *    oracle_sid: oracle sid
+ *    src_filter: filter src processes (bg = background, fg = foreground)
+ *    tgt_fitler: filter tgt processes (bg = background, fg = foreground)
+ *
+ *  Example:
+ *    Snoop post activity from bg to fg processes:
+ *    ./ksl_post_proc-snoop-sid.bt MY_INSTANCE bg fg
+ *
+ * Tested on:
+ *   Oracle 19.26 / Exadata 25.1.7 (X8M-2)
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *  
+ *   Use at your own risk!
+ * 
+ * Background information:
+ *   ksl_post_proc posts processes using semop calls (via
+ *   skgpwpost -> semop).
+ * 
+ *   The poster and postee details are highly experimental. 
+ *   Oracle exposes them in system and process state dumps 
+ *   (in ksl_dmp_post_info). The poster and postee location
+ *   strings can be mapped as follows:
+ *
+ *       location_str *(kslpost +(location * 0x10))
+ *
+ *   Note that Oracle sanitizes the location strings in
+ *   kgsd_sanitize_unique_string using str calls.
+ */
+
+/* Addresses and offsets can and will change between RUs!           */
+#define KSPSSIDST         0x60009628  /* oracle sid name            */
+
+#define KSUPRFLG_OFF         0x60     /* flag offset in ksupr       */
+#define KSUPR_SADDR_OFF      0x70     /* saddr offset in ksupr      */
+#define KSUPRPNAME_OFF       0xd28    /* pname offset in ksupr      */
+#define KSUPRPID_OFF         0xb98    /* spid offset in ksupr       */ 
+
+#define KSUSENUM_OFF         0x878    /* sid offset in ksuse        */
+#define KSUUDNAM_OFF         0x44     /* user name offset in ksuse  */
+
+#define SADDR_TLS_OFF        0xff78   /* saddr tls offset           */
+#define PADDR_TLS_OFF        0xff90   /* paddr tls offset           */
+
+#define SEM_OFF              0x640    /* sem offset                 */
+#define SEMID_OFF            0x4      /* semid offset               */
+#define SEMNUM_OFF           0x8      /* semnum offset              */
+
+#define LAST_POSTER_OFF      0x490    /* last process to post me    */
+#define LAST_POSTER_LOC_OFF  0x478    /* last post received         */
+#define LAST_POSTEE_OFF      0x498    /* last process posted by me  */
+#define LAST_POSTEE_LOC_OFF  0x47c    /* last post sent             */
+
+BEGIN
+{
+    if ($# < 1 || $# > 3) {
+        printf("\nUsage: ./ksl_post_proc-snoop-sid.bt <oracle_sid> <src_filter> <tgt_filter>\n\n");
+        exit();
+    }
+
+    if (str($2) == "bg") {
+        @OPT_SRC_BG = 1;
+    } 
+    else if (str($2) == "fg") {
+        @OPT_SRC_FG = 1;
+    }
+
+    if (str($3) == "bg") {
+        @OPT_TGT_BG = 1;
+    }
+    else if (str($3) == "fg") {
+        @OPT_TGT_FG = 1;
+    }
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n\n");
+
+    printf("%-15s %6s %-10s %-4s %-14s %-7s %7s %7s %7s %-16s %-16s %-4s %6s %-10s %-4s %-14s %-7s %7s %7s %7s %-16s %-16s\n",
+           "TIME", "SID", "USER", "TYPE", "PADDR", "PNAME", "OSPID", "SEMID", "SEMNUM", "LAST_POSTER", "LAST_POSTEE", "",
+           "SID", "USER", "TYPE", "PADDR", "PNAME", "OSPID", "SEMID", "SEMNUM", "LAST_POSTER", "LAST_POSTEE");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:ksl_post_proc
+/ str(uptr(KSPSSIDST)) == str($1) /
+{
+    $fsbase = uptr(curtask->thread.fsbase);
+
+    /* source ksupr */
+    @src_paddr[pid] = *(uint64 *) uptr($fsbase - PADDR_TLS_OFF);
+    @src_flag[pid]  = *(uint8  *) uptr(@src_paddr[pid] + KSUPRFLG_OFF);
+    @src_type[pid]  =  @src_flag[pid] & 0x2 ? "BG" : "FG";
+    @src_pname[pid] =  str(uptr(@src_paddr[pid] + KSUPRPNAME_OFF));
+    @src_semid[pid] = *(uint32 *) uptr(@src_paddr[pid] + SEM_OFF + SEMID_OFF);
+    @src_semno[pid] = *(uint16 *) uptr(@src_paddr[pid] + SEM_OFF + SEMNUM_OFF);
+
+    /* source ksuse */
+    @src_saddr[pid] = *(uint64 *) uptr($fsbase - SADDR_TLS_OFF);
+    @src_sid[pid]   = *(uint32 *) uptr(@src_saddr[pid] + KSUSENUM_OFF);
+    @src_user[pid]  =  str(uptr(@src_saddr[pid] + KSUUDNAM_OFF));
+
+    /* target ksupr */
+    @tgt_paddr[pid] =  (uint64) arg0;
+    @tgt_flag[pid]  = *(uint8  *) uptr(@tgt_paddr[pid] + KSUPRFLG_OFF);
+    @tgt_type[pid]  =  @tgt_flag[pid] & 0x2 ? "BG" : "FG";
+    @tgt_spid[pid]  =  str(uptr(@tgt_paddr[pid] + KSUPRPID_OFF));
+    @tgt_pname[pid] =  str(uptr(@tgt_paddr[pid] + KSUPRPNAME_OFF)); 
+    @tgt_semid[pid] = *(uint32 *) uptr(@tgt_paddr[pid] + SEM_OFF + SEMID_OFF);
+    @tgt_semno[pid] = *(uint16 *) uptr(@tgt_paddr[pid] + SEM_OFF + SEMNUM_OFF);
+
+    /* target ksuse */
+    @tgt_saddr[pid] = *(uint64 *) uptr(@tgt_paddr[pid] + KSUPR_SADDR_OFF);
+    @tgt_sid[pid]   = *(uint32 *) uptr(@tgt_saddr[pid] + KSUSENUM_OFF);
+    @tgt_user[pid]  =  str(uptr(@tgt_saddr[pid] + KSUUDNAM_OFF));
+
+    /* poster and postee details */
+    @src_last_poster[pid]     = *(uint64 *) uptr(@src_paddr[pid] + LAST_POSTER_OFF);
+    @src_last_poster_loc[pid] = *(uint32 *) uptr(@src_paddr[pid] + LAST_POSTER_LOC_OFF);
+    @src_last_postee[pid]     = *(uint64 *) uptr(@src_paddr[pid] + LAST_POSTEE_OFF);
+    @src_last_postee_loc[pid] = *(uint32 *) uptr(@src_paddr[pid] + LAST_POSTEE_LOC_OFF);
+
+    @tgt_last_poster[pid]     = *(uint64 *) uptr(@tgt_paddr[pid] + LAST_POSTER_OFF);
+    @tgt_last_poster_loc[pid] = *(uint32 *) uptr(@tgt_paddr[pid] + LAST_POSTER_LOC_OFF);
+    @tgt_last_postee[pid]     = *(uint64 *) uptr(@tgt_paddr[pid] + LAST_POSTEE_OFF);
+    @tgt_last_postee_loc[pid] = *(uint32 *) uptr(@tgt_paddr[pid] + LAST_POSTEE_LOC_OFF);
+
+    if ( ((@OPT_SRC_BG && @src_type[pid] == "BG") && (@OPT_TGT_BG && @tgt_type[pid] == "BG")) ||
+         ((@OPT_SRC_BG && @src_type[pid] == "BG") && (@OPT_TGT_FG && @tgt_type[pid] == "FG")) || 
+         ((@OPT_SRC_FG && @src_type[pid] == "FG") && (@OPT_TGT_FG && @tgt_type[pid] == "FG")) ||
+         ((@OPT_SRC_FG && @src_type[pid] == "FG") && (@OPT_TGT_BG && @tgt_type[pid] == "BG")) ||
+         (!@OPT_SRC_BG && !@OPT_SRC_FG && !@OPT_TGT_BG && !@OPT_TGT_FG)
+        ) {
+
+        printf("%s ", strftime("%H:%M:%S.%f", nsecs));
+
+        printf("%6u %-10s %-4s 0x%-12lx ", @src_sid[pid], @src_user[pid], @src_type[pid], @src_paddr[pid]);
+        printf("%-7s %7u %7u %7u 0x%-9lx%1s%-4u 0x%-9lx%1s%-4u ", @src_pname[pid], pid, @src_semid[pid], @src_semno[pid], 
+               @src_last_poster[pid], "/", @src_last_poster_loc[pid], @tgt_last_postee[pid], "/", @tgt_last_postee_loc[pid]);
+
+        printf("%4s ", " -> ");
+
+        printf("%6u %-10s %-4s 0x%-12lx ", @tgt_sid[pid], @tgt_user[pid], @tgt_type[pid], @tgt_paddr[pid]);
+        printf("%-7s %7s %7u %7u 0x%-9lx%1s%-4u 0x%-9lx%1s%-4u\n", @tgt_pname[pid], @tgt_spid[pid], @tgt_semid[pid], @tgt_semno[pid], 
+               @tgt_last_poster[pid], "/", @tgt_last_poster_loc[pid], @tgt_last_postee[pid], "/", @tgt_last_postee_loc[pid]);
+   }
+
+    delete(@src_paddr[pid]);
+    delete(@src_flag[pid]);
+    delete(@src_type[pid]);
+    delete(@src_pname[pid]);
+    delete(@src_semid[pid]);
+    delete(@src_semno[pid]);
+    delete(@src_saddr[pid]);
+    delete(@src_sid[pid]);
+    delete(@src_user[pid]);
+    delete(@tgt_paddr[pid]);
+    delete(@tgt_flag[pid]);
+    delete(@tgt_type[pid]);
+    delete(@tgt_spid[pid]);
+    delete(@tgt_pname[pid]);
+    delete(@tgt_semid[pid]);
+    delete(@tgt_semno[pid]);
+    delete(@tgt_saddr[pid]);
+    delete(@tgt_sid[pid]);
+    delete(@tgt_user[pid]);
+    delete(@src_last_poster[pid]);
+    delete(@src_last_poster_loc[pid]);
+    delete(@src_last_postee[pid]);
+    delete(@src_last_postee_loc[pid]);
+    delete(@tgt_last_poster[pid]);
+    delete(@tgt_last_poster_loc[pid]);
+    delete(@tgt_last_postee[pid]);
+    delete(@tgt_last_postee_loc[pid]); 
+}
+
+END
+{
+    clear(@src_paddr);
+    clear(@src_flag);
+    clear(@src_type);
+    clear(@src_pname);
+    clear(@src_semid);
+    clear(@src_semno);
+    clear(@src_saddr);
+    clear(@src_sid);
+    clear(@src_user);
+    clear(@tgt_paddr);
+    clear(@tgt_flag);
+    clear(@tgt_type);
+    clear(@tgt_spid);
+    clear(@tgt_pname);
+    clear(@tgt_semid);
+    clear(@tgt_semno);
+    clear(@tgt_saddr);
+    clear(@tgt_sid);
+    clear(@tgt_user);
+    clear(@src_last_poster);
+    clear(@src_last_poster_loc);
+    clear(@src_last_postee);
+    clear(@src_last_postee_loc);
+    clear(@tgt_last_poster);
+    clear(@tgt_last_poster_loc);
+    clear(@tgt_last_postee);
+    clear(@tgt_last_postee_loc); 
+    clear(@OPT_SRC_BG);
+    clear(@OPT_SRC_FG);
+    clear(@OPT_TGT_BG);
+    clear(@OPT_TGT_FG);
+}
