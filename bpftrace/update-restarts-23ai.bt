@@ -1,0 +1,359 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ * Purpose:
+ *   Trace system-wide update restarts in real-time and print additional 
+ *   context information like session id, sql hash, etc. when a restart 
+ *   is detected.
+ *
+ * Date:
+ *   Aug-30 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ * 
+ * Usage:
+ *   BPFTRACE_CACHE_USER_SYMBOLS=1 ./update-restarts-23ai.sql
+ *
+ * Tested on:
+ *   Oracle 23.6 / Exadata 25.1.7 (X8M-2)
+ * 
+ * Notes:
+ *   Adjust KSPSSIDST_ADDR and ksuse offsets for your
+ *   Oracle version.
+ * 
+ *   Adjust the ORACLE_HOME path for your environment. 
+ * 
+ *   This script is potentially dangerous, use at your own risk!
+ *  
+ * Background information:
+ *   Oracle may restart update statements for write consistency 
+ *   reasons. Such restarts are hard to track and observe. So,
+ *   idea of this script is to probe the function calls involved
+ *   in the update restart code path.
+ * 
+ *   Oracle uses a "three-pass algorithm" to execute update
+ *   statements that consists of the following three phases:
+ *
+ *     UNLOCKED phase: 
+ *     First attempt to update columns; if this does not succeed
+ *     due to write consistency conflicts, enter the LOCK phase.
+ *                    
+ *     LOCK phase:
+ *     Attempt to lock all the rows that are to be updated. If
+ *     this succeeds, enter the ALL LOCKED phase.
+ *
+ *     ALL LOCKED phase:
+ *     Final attempt to update all rows This will succeed if
+ *     Oracle manages to lock all the needed rows in the prior
+ *     LOCK phase. However, note that this may not be possible
+ *     with non-deterministic rowsets (e.g. when using rownum,
+ *     non-deterministic functions or querying v$ views).
+ *
+ *     Note that the implementation performs a CR and a CU get 
+ *     in every phase and then, before attempting to update or 
+ *     lock a row (in function updaul), checks if the CR column 
+ *     values differ from the CU values.
+ *
+ *     If CR and CU values don't match, the following happens:
+ *
+ *     UNLOCKED phase: 
+ *     Trigger a restart and enter a 1st LOCK pass.
+ *
+ *     LOCK phase: 
+ *     Start another LOCK pass, fail with ORA-600 [13013]
+ *     after 5000 lock-retry attempts.
+ * 
+ *     ALL LOCKED phase: 
+ *     Fail with ORA-600 [13030] ("no stable result set").
+ * 
+ *   From a function flow perspective, the anatomy of the "three-
+ *   pass algorithm" is like so (simplified):
+ * 
+ *   -> updexe
+ *      -> updThreePhaseExe 
+ *
+ *         -> updaul           # Start phase UNLOCKED and call
+ *            -> updrow        # updrow for every row.
+ *            <- updrow       
+ *               ...
+ *         <- updaul
+ *
+ *         -> updaul
+ *            -> updrow       # Start phase LOCKED and attempt to
+ *            <- updrow       # lock every row. Re-try 5000 times
+ *               ...          # maximum if unsuccesful.
+ *         <- updaul          
+ * 
+ *         -> updaul          # Start phase ALL LOCKED and 
+ *            -> updrow       # attempt to update all rows locked
+ *            <- updrow       # in the prior LOCK phase (may still
+ *               ...          # in scenarios with non-deterministic
+ *         <- updaul          # result sets.
+ *
+ *      <- updThreePhaseExe
+ *   <- updexe
+ *
+ * Output columns:
+ *   The script prints the following output columns:
+ *
+ *   TIME: 
+ *   Current date/time when a restarted update statement 
+ *   completed or failed.
+ *
+ *   RESTART_TIME:
+ *   Time when an update statement got restarted (techni-
+ *   cally that is the time when an update enters the LOCK 
+ *   phase and when updaul is called the second time).
+ * 
+ *   INSTANCE:
+ *   Oracle sid / instance name.
+ *
+ *   PID:
+ *   Oracle os pid.
+ *
+ *   COMM:
+ *   Oracle process command name.
+ *
+ *   SID:
+ *   Oracle session id.
+ * 
+ *   USERNAME:
+ *   Oracle db user name.
+ *
+ *   SQL_HASH:
+ *   Sql hash value (v$sql.hash_value).
+ *   Note: We're using the hash_value, because the sql_id
+ *   is not stored anywhere, but dynamically computed from 
+ *   the hash_value at runtime (a hash to sql_id conversion
+ *   function would be straight-forwrad to write in native
+ *   bpf, but it is quite cumbersome with bpftrace; therefore, 
+ *   we keep it very simplke and just log the hash_value).
+ *
+ *   OCT:
+ *   Oracle command type (v$session.command).
+ *
+ *   PLSQL_OBJ:
+ *   Plsql object id (v$session.plsql_cobject_id); this
+ *   maps to dba_objects.object_id.
+ * 
+ *   PLSQL_SUBID:
+ *   Plsql subprogram id (v$session.plsql_subprogram_id); 
+ *   this maps to dba_procedures.subprogram_id.
+ * 
+ *   DEP:
+ *   Dependency level (dep=n in sql trace) at which the
+ *   restarted update got executed.
+ * 
+ *   ATTEMPTS:
+ *   This counts the number of calls to updaul ('update -
+ *   attempt update or lock all rows').
+ *
+ *   L-RETRIES:
+ *   This counts the number of lock-retries (attempts to
+ *   lock all rows in the LOCK phase). This is calculated
+ *   as: 'calls to updaul' - 2 (that is, we simply don't 
+ *   count the first and last updaul passe that represent
+ *   the LOCK and ALL LOCKED phase).
+ * 
+ *   STATUS:
+ *   Status of the restarted update statement; this is 
+ *   either SUCCESS (restart ok) or ORA-600 (restart failed).
+ * 
+ *   ERR1:
+ *   In case of ORA-600, the first error argument.
+ *
+ *   ERR2:
+ *   In case of ORA-600, the second error argument.
+ * 
+ *   CR:
+ *   The number of consistent reads performed by a restarted
+ *   update statement (technically this counts the number of
+ *   calls to kcbgtcr in updThreePhaseExe).
+ *
+ *   CU:
+ *   The number of current gets performed by a restarted
+ *   update statement (technically this counts the number of
+ *   calls to kcbgcur in updThreePhaseExe).
+ * 
+ *   ELA:
+ *   Elapsed time of a restarted update statement (in ms).
+ */
+
+/* version dependent: may change in every RU!    */
+#define KSPSSIDST_ADDR 0x6000b9e0  /* sid name   */
+#define SADDR_TLS_OFF  0xf350      /* tls offset */
+#define KSUUDLNA_OFF   0xc9        /* username   */
+#define KSUUDOCT_OFF   0x5e0       /* command    */
+#define KSUSENUM_OFF   0xc08       /* sid        */
+#define KSUSESQH_OFF   0xd14       /* sql hash   */
+#define KSUSEPCO_OFF   0xd4c       /* plsql obj  */
+#define KSUSEPCS_OFF   0xd50       /* plsql sub  */
+
+BEGIN
+{
+    printf("Tracing dml restarts... Hit ^C to stop.\n\n");
+
+    printf("%-19s %-19s %-15s %-7s %-15s %-5s %-10s %-10s %3s %9s %11s %4s %8s %9s %-8s %-6s %-6s %9s %9s %10s\n",
+           "TIME", "RESTART_TIME", "INSTANCE", "PID", "COMM", "SID", "USERNAME", "SQL_HASH", "OCT", "PLSQL_OBJ", 
+           "PLSQL_SUBID", "DEP", "ATTEMPTS", "L-RETRIES", "STATUS", "ERR1", "ERR2", "CR", "CU", "ELA_MS");
+}
+
+uprobe:/u01/app/oracle/product/23.0.0.0/dbhome_236_1/bin/oracle:opiexe
+{
+    @dep[pid]++;
+}
+
+uretprobe:/u01/app/oracle/product/23.0.0.0/dbhome_236_1/bin/oracle:opiexe
+/ @dep[pid] /
+{
+    @dep[pid]--;
+}
+
+uprobe:/u01/app/oracle/product/23.0.0.0/dbhome_236_1/bin/oracle:updThreePhaseExe
+/ @dep[pid] /
+{
+    @in_3pass[pid] = 1;
+    @start_ns[pid] = nsecs;
+}
+
+uretprobe:/u01/app/oracle/product/23.0.0.0/dbhome_236_1/bin/oracle:updThreePhaseExe
+/ @in_3pass[pid] /
+{
+    if (@attempts[pid] > 1) {
+        $ela_ms     = (uint64) (nsecs - @start_ns[pid]) / 1e6;
+        $fsbase     = uptr(curtask->thread.fsbase);
+        $saddr_p    = uptr($fsbase - SADDR_TLS_OFF);
+        $saddr      = *(uint64 *) uptr($saddr_p);
+        $sid        = *(uint64 *)($saddr + KSUSENUM_OFF);
+        $oct        = *(uint8 *) uptr($saddr + KSUUDOCT_OFF);
+        $sql_hash   = *(uint32 *) uptr($saddr + KSUSESQH_OFF);
+        $plsql_obj  = *(uint32 *) uptr($saddr + KSUSEPCO_OFF);
+        $plsql_sub  = *(uint32 *) uptr($saddr + KSUSEPCS_OFF);
+        $user_p     = uptr($saddr + KSUUDLNA_OFF);
+
+         time("%Y-%m-%d %H:%M:%S ");
+         printf("%s ", strftime("%Y-%m-%d %H:%M:%S", @restart_tm[pid]));
+         printf("%-15s %-7d %-15s %-5d %-10s %-10lu %3d %9u %11u %4d %8d %9d %-8s %-6s %-6s %9u %9u %10d\n",
+                str(uptr(KSPSSIDST_ADDR)), pid, comm, $sid, str($user_p), $sql_hash, $oct, $plsql_obj, 
+                $plsql_sub, (@dep[pid]-1), @attempts[pid], (@attempts[pid] - 2), "SUCCESS", "n/a", 
+                "n/a", @cr_gets[pid], @cu_gets[pid], $ela_ms);
+    }
+
+    delete(@attempts[pid]);
+    delete(@in_3pass[pid]);
+    delete(@start_ns[pid]);
+    delete(@cr_gets[pid]);
+    delete(@cu_gets[pid]);
+}
+
+uprobe:/u01/app/oracle/product/23.0.0.0/dbhome_236_1/bin/oracle:kcbgtcr
+/ @in_3pass[pid] /
+{
+    @cr_gets[pid]++;
+}
+
+uprobe:/u01/app/oracle/product/23.0.0.0/dbhome_236_1/bin/oracle:kcbgcur
+/ @in_3pass[pid] /
+{
+    @cu_gets[pid]++;
+}
+
+uprobe:/u01/app/oracle/product/23.0.0.0/dbhome_236_1/bin/oracle:updaul
+/ @in_3pass[pid] /
+{
+    @attempts[pid]++;
+}
+
+/* 
+ * Only fire this probe once to check if the first pass
+ * in the UNLOCKED phase was successful or not. If not,
+ * we will store the current time and refer to it as
+ * the "restart time".
+ */
+uretprobe:/u01/app/oracle/product/23.0.0.0/dbhome_236_1/bin/oracle:updaul
+/ @in_3pass[pid] && @attempts[pid] == 1 /
+{
+    if (retval == 0) {
+        @restart_tm[pid] = nsecs;
+    }
+}
+
+/*
+ * Handle ORA-30926 (and similar?) errors.
+ */
+uprobe:/u01/app/oracle/product/23.0.0.0/dbhome_236_1/bin/oracle:kseseclv
+/ @in_3pass[pid] && @attempts[pid] > 1 /
+{
+    $err1       = (uint64) arg2;
+    $ela_ms     = (uint64) (nsecs - @start_ns[pid]) / 1e6;
+    $fsbase     = uptr(curtask->thread.fsbase);
+    $saddr_p    = uptr($fsbase - SADDR_TLS_OFF);
+    $saddr      = *(uint64 *) uptr($saddr_p);
+    $sid        = *(uint64 *)($saddr + KSUSENUM_OFF);
+    $oct        = *(uint8 *) uptr($saddr + KSUUDOCT_OFF);
+    $sql_hash   = *(uint32 *) uptr($saddr + KSUSESQH_OFF);
+    $plsql_obj  = *(uint32 *) uptr($saddr + KSUSEPCO_OFF);
+    $plsql_sub  = *(uint32 *) uptr($saddr + KSUSEPCS_OFF);
+    $user_p     = uptr($saddr + KSUUDLNA_OFF);
+
+    time("%Y-%m-%d %H:%M:%S ");
+    printf("%s ", strftime("%Y-%m-%d %H:%M:%S", @restart_tm[pid]));
+    printf("%-15s %-7d %-15s %-5d %-10s %-10lu %3d %9u %11u %4d %8d %9d %-8s %-6u %-6s %9u %9u %10d\n",
+           str(uptr(KSPSSIDST_ADDR)), pid, comm, $sid, str($user_p), $sql_hash, $oct, $plsql_obj, 
+           $plsql_sub, (@dep[pid]-1), @attempts[pid], (@attempts[pid] - 2), "ERROR", $err1, 
+           "n/a", @cr_gets[pid], @cu_gets[pid], $ela_ms);
+
+    delete(@dep[pid]);
+    delete(@in_3pass[pid]);
+    delete(@start_ns[pid]);
+    delete(@attempts[pid]);
+    delete(@restart_tm[pid]);
+    delete(@cr_gets[pid]);
+    delete(@cu_gets[pid]);
+}
+
+/*
+ * Handle ORA-600 errors
+ */
+uprobe:/u01/app/oracle/product/23.0.0.0/dbhome_236_1/bin/oracle:ksesic*
+/ @in_3pass[pid] && @attempts[pid] > 1 /
+{
+    $err1       = (uint64) arg0;
+    $err2       = (uint64) arg5;
+    $ela_ms     = (uint64) (nsecs - @start_ns[pid]) / 1e6;
+    $fsbase     = uptr(curtask->thread.fsbase);
+    $saddr_p    = uptr($fsbase - SADDR_TLS_OFF);
+    $saddr      = *(uint64 *) uptr($saddr_p);
+    $sid        = *(uint64 *)($saddr + KSUSENUM_OFF);
+    $oct        = *(uint8 *) uptr($saddr + KSUUDOCT_OFF);
+    $sql_hash   = *(uint32 *) uptr($saddr + KSUSESQH_OFF);
+    $plsql_obj  = *(uint32 *) uptr($saddr + KSUSEPCO_OFF);
+    $plsql_sub  = *(uint32 *) uptr($saddr + KSUSEPCS_OFF);
+    $user_p     = uptr($saddr + KSUUDLNA_OFF);
+
+    time("%Y-%m-%d %H:%M:%S ");
+    printf("%s ", strftime("%Y-%m-%d %H:%M:%S", @restart_tm[pid]));
+    printf("%-15s %-7d %-15s %-5d %-10s %-10lu %3d %9u %11u %4d %8d %9d %-8s %-6d %-6d %9u %9u %10d\n",
+           str(uptr(KSPSSIDST_ADDR)), pid, comm, $sid, str($user_p), $sql_hash, $oct, $plsql_obj, 
+           $plsql_sub, (@dep[pid]-1), @attempts[pid], (@attempts[pid] - 2), "ORA-600", $err1, 
+           $err2, @cr_gets[pid], @cu_gets[pid], $ela_ms);
+
+    delete(@dep[pid]);
+    delete(@in_3pass[pid]);
+    delete(@start_ns[pid]);
+    delete(@attempts[pid]);
+    delete(@restart_tm[pid]);
+    delete(@cr_gets[pid]);
+    delete(@cu_gets[pid]);
+}
+
+END
+{
+    clear(@dep);
+    clear(@in_3pass);
+    clear(@start_ns);
+    clear(@attempts);
+    clear(@restart_tm);
+    clear(@cr_gets);
+    clear(@cu_gets);
+}
