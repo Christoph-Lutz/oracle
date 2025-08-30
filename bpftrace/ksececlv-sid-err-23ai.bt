@@ -1,0 +1,119 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ * Purpose:
+ *   Trace calls to error handling function kseseclv and provide
+ *   additional v$session (ksuse) context enrichment. 
+ *
+ *   In Oracle 23ai, kseseclv raises internal errors like ORA-14403
+ *   or ORA-1551 (and possibly other errors as well). Note that the 
+ *   script was written with the intention to trace ORA-14403 and
+ *   ORA-1551 errors and therefore it may not work in situations
+ *   where Oracle throws other errors in different kse functions.
+ * 
+ *   The function kseseclv does not exist in Oracle 19c. Oracle 19c
+ *   usess ksesecl0 instead (which still exists in 23ai, but doesn't
+ *   seem to be used by in the dml code paths - more research needed
+ *   though).
+ *
+ * Date:
+ *   Aug-30 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   BPFTRACE_CACHE_USER_SYMBOLS=1 ./kseseclv-sid-err-23ai.bt <oracle_sid> <err> [stacks?]
+ *
+ *   Example:
+ *   Trace ORA-14403 errors for MYSID and collect stack traces:
+ *
+ *   BPFTRACE_CACHE_USER_SYMBOLS=1 ./kseseclv-sid-err.bt MYSID 14403 yes
+ *
+ * Tested on:
+ *   Oracle 23.6
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *
+ *   This is experimental, use at your own risk!
+ */
+
+/* version dependent: may change in every RU!    */
+#define KSPSSIDST_ADDR 0x6000b9e0  /* sid name   */
+#define SADDR_TLS_OFF  0xf350      /* tls offset */
+#define KSUUDLNA_OFF   0xc9        /* username   */
+#define KSUUDOCT_OFF   0x5e0       /* command    */
+#define KSUSENUM_OFF   0xc08       /* sid        */
+#define KSUSESQH_OFF   0xd14       /* sql hash   */
+#define KSUSEPCO_OFF   0xd4c       /* plsql obj  */
+#define KSUSEPCS_OFF   0xd50       /* plsql sub  */
+
+BEGIN
+{
+    if($# < 1) {
+        printf("\n\nUsage: BPFTRACE_CACHE_USER_SYMBOLS=1 ./kseseclv-sid-err-23ai.bt <oracle_sid> <err> [stacks?]\n");
+        exit();
+    }
+    if ($2) {
+        @OPT_ERR = (uint32) $2;
+    }
+   
+    if (str($3) == "yes" || str($3) == "y") {
+        @OPT_STACKS = 1;
+    }
+
+    printf("%-19s %-15s %-7s %-15s %-5s %-15s %-10s %3s %9s %11s %8s %-16s %-16s\n",
+           "TIME", "INSTANCE", "PID", "COMM", "SID", "USERNAME", "SQL_HASH", "OCT",
+           "PLSQL_OBJ", "PLSQL_SUBID", "ERR", "FUNC", "LOCATION");
+}
+
+uprobe:/u01/app/oracle/product/23.0.0.0/dbhome_236_1/bin/oracle:kseseclv
+/ str(uptr(KSPSSIDST_ADDR)) == str($1) /
+{
+    $err        = (uint64) arg0;
+    $func       = (uint64 *) arg1;
+    $loc        = (uint64 *) arg2;
+    $fsbase     = uptr(curtask->thread.fsbase);
+    $saddr_p    = uptr($fsbase - SADDR_TLS_OFF);
+    $saddr      = *(uint64 *) uptr($saddr_p);
+    $sid        = *(uint64 *)($saddr + KSUSENUM_OFF);
+    $oct        = *(uint8 *) uptr($saddr + KSUUDOCT_OFF);
+    $sql_hash   = *(uint32 *) uptr($saddr + KSUSESQH_OFF);
+    $plsql_obj  = *(uint32 *) uptr($saddr + KSUSEPCO_OFF);
+    $plsql_sub  = *(uint32 *) uptr($saddr + KSUSEPCS_OFF);
+    $user_p     = uptr($saddr + KSUUDLNA_OFF);
+
+    /* 
+     * Clumsy way to filter out null 
+     * users that are used internally.
+     */
+    if (*(uint8 *) $user_p) {
+
+        if ($err == @OPT_ERR) {
+            printf("%s ", strftime("%Y-%m-%d %H:%M:%S", nsecs));
+            printf("%-15s %-7d %-15s %-5d %-15s %-10lu %3d %9u %11u %8u %-16s %-16s\n",
+                   str(uptr(KSPSSIDST_ADDR)), pid, comm, $sid, str($user_p), $sql_hash, 
+                   $oct, $plsql_obj, $plsql_sub, $err, str(uptr($func)), str(uptr($loc)));
+ 
+            if (@OPT_STACKS) {
+                print(ustack());
+            }
+        } 
+        else if (!@OPT_ERR) {
+            printf("%s ", strftime("%Y-%m-%d %H:%M:%S", nsecs));
+            printf("%-15s %-7d %-15s %-5d %-15s %-10lu %3d %9u %11u %8u %-16s %-16s\n",
+                   str(uptr(KSPSSIDST_ADDR)), pid, comm, $sid, str($user_p), $sql_hash, 
+                   $oct, $plsql_obj, $plsql_sub, $err, str(uptr($func)), str(uptr($loc)));
+
+            if (@OPT_STACKS) {
+                print(ustack());
+            }
+        }
+    }
+}
+
+END
+{
+    clear(@OPT_ERR);
+    clear(@OPT_STACKS);
+}
