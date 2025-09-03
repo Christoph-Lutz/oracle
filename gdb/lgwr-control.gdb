@@ -56,14 +56,50 @@ set $KCRFWSLV_REDORATE                = 0x600222d0
 set $KCRFWSLV_STANDBY_MODE            = 0x60022010
 set $KCRFWSLV_SAMPLING_COUNT_PRM      = 128
 
+set $OLRW_TRACE_FLG                   = 0x10
+
 define show_lgwr_mode
+    set $adaptive_mode = (uint8_t) kcrf_slave_info_
+
+    if $adaptive_mode == 0
+        set $adaptive_mode_str = "disabled"
+    end
+   
+    if $adaptive_mode == 2
+        set $adaptive_mode_str = "heuristic"
+    end 
+
+    if $adaptive_mode == 3
+        set $adaptive_mode_str = "evaluative"
+    end
+
     printf "\n"
     printf "----- Show LGWR mode -----\n"
     printf "  lgwr mode is: %s\n", *(uint32_t *) $KCRFWSLV_LGWR_MODE > 0 ? "parallel" : "serial"
+    printf "  lgwr adaptive mode is: %s\n", $adaptive_mode_str
     printf "  lgwr slave pool stdby mode is: %s\n", *(uint32_t *) $KCRFWSLV_STANDBY_MODE > 0 ? "enabled" : "disabled"
     printf "  fast sync is: %s\n", (uint32_t) kcrf_fast_sync_ > 0 ? "enabled" : "disabled"
     printf "  alfs polling is: %s\n", *(uint32_t *) $ALFS_INFO_POLLING > 0 ? "enabled" : "disabled"
     printf "  max log write parallelism is: %u\n", *(uint32_t *) $KCRFWSLV_MAX_LOG_WRITE_PAR
+    printf "  nr of active redo strands is: %u\n", (uint32_t) kcrf_actv_strands_
+    printf "\n"
+end
+
+define set_alfs_polling
+    printf "\n"
+    printf "----- Changing ALFS polling -----\n"
+    if ! $argc || ($arg0 != 0 && $arg0 != 1)
+        printf "  no or invalid value supplied, no action!\n"
+    else 
+        if *(uint32_t *) $ALFS_INFO_POLLING != $arg0
+            printf "  alfs polling is: %u\n", *(uint32_t *) $ALFS_INFO_POLLING
+            printf "  changing alfs polling to: %u\n", $arg0
+            set *(uint32_t *) $ALFS_INFO_POLLING = $arg0
+            printf "  changed alfs polling to: %u\n", *(uint32_t *) $ALFS_INFO_POLLING
+        else
+            printf "  alfs polling already set to: %u\n", $arg0
+        end
+    end
     printf "\n"
 end
 
@@ -73,7 +109,7 @@ define set_max_log_write_parallelism
     if ! $argc 
         printf "  target parallelism not supplied, no action!\n"
     else
-        if *(uint32_t *) $KCRFWSLV_MAX_LOG_WRITE_PAR != $argc
+        if *(uint32_t *) $KCRFWSLV_MAX_LOG_WRITE_PAR != $arg0
             printf "  max log write parallelism is: %u\n", *(uint32_t *) $KCRFWSLV_MAX_LOG_WRITE_PAR   
             printf "  changing max log write parallelism to: %u\n", $arg0
             set *(uint32_t *) $KCRFWSLV_MAX_LOG_WRITE_PAR = $arg0
@@ -83,6 +119,37 @@ define set_max_log_write_parallelism
         end
     end
     printf "\n"
+end
+
+define set_redo_strands
+    printf "\n"
+    printf "----- Changing kcrf_actv_strands -----\n"
+    if  $arg0 > (int32_t) kcrf_max_strands_ || $arg0 < 1
+        printf "  no or invalid value supplied, no action!\n"
+    else
+        if $argc && (uint32_t) kcrf_actv_strands_ != $arg0
+            printf "  max number of redo strands is: %u\n", (uint32_t) kcrf_max_strands_
+            printf "  number of active redo strands is: %u\n", (uint32_t) kcrf_actv_strands_
+            printf "  changing number of redo strands to: %u \n", $arg0
+            # set *(uint32_t*) &kcrf_actv_strands_ = (uint32_t) kcrf_max_strands_
+            set *(uint32_t*) &kcrf_actv_strands_ = (uint32_t) $arg0
+            printf "  changed number of active redo strands to: %u\n", (uint32_t) kcrf_actv_strands_
+        else
+            if (uint32_t) kcrf_max_strands_ == $arg0
+                printf "  kcrf_max_strands_ already set to: %u\n", $arg0
+            end
+        end
+    end
+    printf "\n"
+end
+
+define enable_all_redo_strands
+    set $strands = (uint32_t) kcrf_max_strands_
+    set_redo_strands $strands
+end
+
+define disable_all_redo_strands 
+    set_redo_strands 1
 end
 
 define _set_fs_sl_write_time
@@ -102,28 +169,6 @@ define _set_fs_sl_write_time
     printf "  changed fast sync sl write time to: %u us\n", ((uint32_t) kspasv3_ / 1000)
     printf "  lgwr mode is: %s\n", (uint32_t *) $KCRFWSLV_LGWR_MODE > 0 ? "parallel" : "serial"
     printf "  max log write parallelism is: %u\n", *(uint32_t *) $KCRFWSLV_MAX_LOG_WRITE_PAR 
-end
-
-define enable_redo_strands
-    printf "\n"
-    printf "----- Enabling All Redo Strands -----\n"
-    printf "  max number of redo strands is: %u\n", (uint32_t) kcrf_max_strands_
-    printf "  number of active redo strands is: %u\n", (uint32_t) kcrf_actv_strands_
-    printf "  enabling all redo strands ...\n"
-    set *(uint32_t*) &kcrf_actv_strands_ = (uint32_t) kcrf_max_strands_
-    printf "  number of active redo strands is: %u\n", (uint32_t) kcrf_actv_strands_
-    printf "\n"
-end
-
-define disable_redo_strands
-    printf "\n"
-    printf "----- Disabling All Redo Strands -----\n"
-    printf "  max number of redo strands is: %u\n", (uint32_t) kcrf_max_strands_
-    printf "  number of active redo strands is: %u\n", (uint32_t) kcrf_actv_strands_
-    printf "  disabling all redo strands ...\n"
-    set *(uint32_t*) &kcrf_actv_strands_ = 1
-    printf "  number of active redo strands is: %u\n", (uint32_t) kcrf_actv_strands_
-    printf "\n"
 end
 
 define enable_fast_sync
@@ -195,7 +240,7 @@ define disable_lg_workers
 
         # When switching from parallal to serial, the
         # all_prv counter is not reset. Therefore, the
-        # write count detla can become negative, which
+        # write count delta can become negative, which
         # is why we need to cast this to int64.
         if ((int64_t) (*(uint64_t *) $KCRFWSLV_ALL - *(uint64_t *) $KCRFWSLV_ALL_PRV)) < 128
             printf "  changing write count to: %lu\n", (*(uint64_t *) $KCRFWSLV_ALL_PRV + 128)
@@ -223,9 +268,86 @@ define disable_lg_workers
     printf "\n"
 end
 
+define enable_olrw_trace 
+    # Note: in Oracle 19c, klassvp8_ has a pointer to 
+    # the olrw_info struct.
+    set $olrw_info_p = (uint64_t *) klassvp8_ 
+
+    printf "\n"
+    printf "----- Enabling OLRW trace -----\n"
+    printf "  olrw_info_p is: %p\n", $olrw_info_p
+    printf "  olrw_flags are: %d%d%d%d%d%d%d%d\n",   \
+           (*(uint8_t *) $olrw_info_p) & 0x80 ? 1 : 0, \
+           (*(uint8_t *) $olrw_info_p) & 0x40 ? 1 : 0, \
+           (*(uint8_t *) $olrw_info_p) & 0x20 ? 1 : 0, \
+           (*(uint8_t *) $olrw_info_p) & 0x10 ? 1 : 0, \
+           (*(uint8_t *) $olrw_info_p) & 0x08 ? 1 : 0, \
+           (*(uint8_t *) $olrw_info_p) & 0x04 ? 1 : 0, \
+           (*(uint8_t *) $olrw_info_p) & 0x02 ? 1 : 0, \
+           (*(uint8_t *) $olrw_info_p) & 0x01 ? 1 : 0
+
+    if (*(uint8_t *) $olrw_info_p) & $OLRW_TRACE_FLG 
+        printf "  olrw trace already enabled, no action!\n"
+    else
+        printf "  changing olrw flags ...\n"
+        set *(uint8_t *) $olrw_info_p = *(uint8_t *) $olrw_info_p | 0x10
+        printf "  olrw_flags are: %d%d%d%d%d%d%d%d\n",   \
+               (*(uint8_t *) $olrw_info_p) & 0x80 ? 1 : 0, \
+               (*(uint8_t *) $olrw_info_p) & 0x40 ? 1 : 0, \
+               (*(uint8_t *) $olrw_info_p) & 0x20 ? 1 : 0, \
+               (*(uint8_t *) $olrw_info_p) & 0x10 ? 1 : 0, \
+               (*(uint8_t *) $olrw_info_p) & 0x08 ? 1 : 0, \
+               (*(uint8_t *) $olrw_info_p) & 0x04 ? 1 : 0, \
+               (*(uint8_t *) $olrw_info_p) & 0x02 ? 1 : 0, \
+               (*(uint8_t *) $olrw_info_p) & 0x01 ? 1 : 0
+    end
+    printf "\n"
+end
+
+define disable_olrw_trace 
+    # Note: in Oracle 19c, klassvp8_ has a pointer to 
+    # the olrw_info struct.
+    set $olrw_info_p = (uint64_t *) klassvp8_ 
+
+    printf "\n"
+    printf "----- Disabling OLRW trace -----\n"
+    printf "  olrw_info_p is: %p\n", $olrw_info_p
+    printf "  olrw_flags are: %d%d%d%d%d%d%d%d\n",   \
+           (*(uint8_t *) $olrw_info_p) & 0x80 ? 1 : 0, \
+           (*(uint8_t *) $olrw_info_p) & 0x40 ? 1 : 0, \
+           (*(uint8_t *) $olrw_info_p) & 0x20 ? 1 : 0, \
+           (*(uint8_t *) $olrw_info_p) & 0x10 ? 1 : 0, \
+           (*(uint8_t *) $olrw_info_p) & 0x08 ? 1 : 0, \
+           (*(uint8_t *) $olrw_info_p) & 0x04 ? 1 : 0, \
+           (*(uint8_t *) $olrw_info_p) & 0x02 ? 1 : 0, \
+           (*(uint8_t *) $olrw_info_p) & 0x01 ? 1 : 0
+   
+    if ! ((*(uint8_t *) $olrw_info_p) & $OLRW_TRACE_FLG)
+        printf "  olrw trace already disabled, no action!\n"
+    else
+        printf "  changing olrw flags ...\n"
+        set *(uint8_t *) $olrw_info_p = *(uint8_t *) $olrw_info_p & (~$OLRW_TRACE_FLG)
+        printf "  olrw_flags are: %d%d%d%d%d%d%d%d\n",   \
+               (*(uint8_t *) $olrw_info_p) & 0x80 ? 1 : 0, \
+               (*(uint8_t *) $olrw_info_p) & 0x40 ? 1 : 0, \
+               (*(uint8_t *) $olrw_info_p) & 0x20 ? 1 : 0, \
+               (*(uint8_t *) $olrw_info_p) & 0x10 ? 1 : 0, \
+               (*(uint8_t *) $olrw_info_p) & 0x08 ? 1 : 0, \
+               (*(uint8_t *) $olrw_info_p) & 0x04 ? 1 : 0, \
+               (*(uint8_t *) $olrw_info_p) & 0x02 ? 1 : 0, \
+               (*(uint8_t *) $olrw_info_p) & 0x01 ? 1 : 0
+    end
+    printf "\n"
+end
+
 document show_lgwr_mode
 Show current lgwr mode and configuration
 Usage: show_lgwr_mode
+end
+
+document set_alfs_polling
+Enable or disable ALFS polling (0=disable, 1=enable)
+Usage: set_alfs_polling <value>
 end
     
 document set_max_log_write_parallelism
@@ -233,14 +355,19 @@ Set the max_log_write_parallelism in kcrf_slave_info_ to a given value.
 Usage: set_max_log_write_parallelism <new_parallelism>
 end
 
-document enable_redo_strands
-Enable all public redo strands (set kcrf_actv_strands_ = kcrf_max_strands).
-Usage: enable_redo_strands
+document set_redo_strands
+Change the number of public redo strands.
+Usage: set_redo_strand <nr_of_strands>
 end
 
-document disable_redo_strands
-Disable all public redo strands, except one (set kcrf_actv_strands = 1).
-Usage: disable_redo_strands
+document enable_all_redo_strands
+Enable all public redo strands.
+Usage: enable_all_redo_strands
+end
+
+document disable_all_redo_strands
+Disable all public redo strands.
+Usage: disable_all_redo_strands
 end
 
 document enable_fast_sync 
@@ -261,4 +388,14 @@ end
 document disable_lg_workers
 Disable lg worker processes (adaptive scalable lgwr)
 Usage: disable_lg_workers
+end
+
+document enable_olrw_trace
+Enable olrw trace
+Usage: enable_olrw_trace
+end
+
+document disable_olrw_trace
+Disable olrw trace
+Usage: disable_olrw_trace
 end
