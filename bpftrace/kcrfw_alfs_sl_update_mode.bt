@@ -1,0 +1,297 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ * Purpose:
+ *   The script's default output shows something similar 
+ *   to what lgwr logs to trace with lgwr debug event 10468 
+ *   enabled at level 32.
+ *
+ *     SQL> oradebug setorpname lgwr 
+ *     SQL> oradebug event 10468 trace name context forever, level 32
+ *     SQL> oradebug event 10468 trace name context off
+ *
+ * Date:
+ *   Jul-03 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./kcrfw_alfs_sl_update_mode.bt <lgwr_pid> [<verbose>?]
+ *
+ * Tested on:
+ *   Oracle 19.26 / Exadata 24.1.2
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *  
+ *   Use at your own risk!
+ */
+
+/* Addresses and offsets may change in every RU!                             */ 
+#define KSPSSIDST_ADDR       0x60009628  /* sid name                         */
+
+#define KCRF_FAST_SYNC       0x60021f1c  /* fast sync                        */
+#define KCRFW_LOG_GROUP      0x600218cc  /* redo log group                   */
+#define KCRFWSLV_LGWR_MODE   0x6002200c  /* lgwr mode (0=serial, 1=parallel) */
+#define KCRFWSLV_TST_SINGLE  0x60022300  /* test single                      */
+
+#define SMART_LOG_FLAGS      0x60021968  /* smart log flags                  */
+#define SMART_LOG_FLAG_DAX   0x02        /* dax mode                         */
+#define SMART_LOG_FLAG_DSK   0x08        /* disk mode                        */
+#define SMART_LOG_FLAG_EXA   0x10        /* exadata?                         */
+
+#define KSPASV3              0x6000ace8  /* kspasv3_ sl avg write time ns    */
+#define KSPASV4              0x6000acec  /* kspasv4_ sl write threshold us   */
+
+#define KSPASV5              0x6000acf0  /* kspasv5_: bit flags:             */
+                                         /*   0x01: dax enabled?             */
+                                         /*   0x02: syn dg enabled?          */
+                                         /*   0x04: dax algwr serial test?   */
+                                         /*   0x08: parallel lgwr enabled?   */
+                                         /*   0x10: serial lgwr enabled?     */
+
+#define KSPASV90             0x6000aec0  /* kspasv90_: sl write count        */
+
+#define SKIP_FLAG_EXADATA    0x01        /* exadata flag                     */
+#define SKIP_TST_SINGLE      0x02        /* test single                      */
+#define SKIP_KSPASV5         0x03        /* kspasv5_ flag                    */
+#define SKIP_SL_WRI_COUNT    0x04        /* smart log write count            */
+#define SKIP_SL_WRI_TIME_DAX 0x05        /* smart log write time dax         */
+#define SKIP_SL_WRI_TIME_DSK 0x06        /* smart log write time disk        */
+
+#define FAST_SYNC_DISABLED   0x00        /* fast sync is disabled            */
+#define FAST_SYNC_ENABLED    0x01        /* fast sync is enabled             */
+
+#define LGWR_MODE_SERIAL     0x00        /* lgwr mode serial                 */
+#define LGWR_MODE_PARALLEL1  0x01        /* lgwr mode parallel (1)           */
+#define LGWR_MODE_PARALLEL2  0x02        /* lgwr mode parallel (2)           */
+
+BEGIN
+{
+    if ($# < 1 || $# >2) {
+        printf("\nUsage: kcrfw_alfs_sl_update_mode.bt <lgwr_pid> [<verbose>?]\n\n");
+        exit();
+    }
+
+    if (str($2) == "yes" || str($2) == "y" || str($2) == "verbose") {
+        @OPT_VERBOSE = 1;
+    }
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n");
+
+    @STR_SKIP[SKIP_FLAG_EXADATA] = "not on exadata";
+    @STR_SKIP[SKIP_TST_SINGLE] = "test single";
+    @STR_SKIP[SKIP_KSPASV5] = "kspasv5_ flag";
+    @STR_SKIP[SKIP_SL_WRI_COUNT] = "sl_write_cnt < 128";
+    @STR_SKIP[SKIP_SL_WRI_TIME_DAX] = "sl_write_time_avg_us <= sl_write_threshold_us"; 
+    @STR_SKIP[SKIP_SL_WRI_TIME_DSK] = "sl_write_time_avg_us >= sl_write_threshold_us"; 
+
+    @STR_FAST_SYNC[FAST_SYNC_ENABLED] = "enabled";
+    @STR_FAST_SYNC[FAST_SYNC_DISABLED] = "disabled";
+
+    @STR_LGWR_MODE[LGWR_MODE_SERIAL] = "serial";
+    @STR_LGWR_MODE[LGWR_MODE_PARALLEL1] = "parallel";
+    @STR_LGWR_MODE[LGWR_MODE_PARALLEL2] = "parallel";
+
+    @STR_SMART_LOG_DSK[SMART_LOG_FLAG_DAX] = "dax";
+    @STR_SMART_LOG_DSK[SMART_LOG_FLAG_DSK] = "dax";
+}
+
+/* 
+ * kcrfw_alfs_sl_update_mode:
+ * kcrfw Adaptive Log File Sync Smart Log Update Mode
+ */
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_alfs_sl_update_mode
+/ pid == $1 /
+{
+    /*
+     * The sl_update_mode function uses and modifies
+     * several variables. To simplify processing, we
+     * collect all their values in the entry probe
+     * and defer the more complex action logic to the
+     * return probe.
+     */
+    @in_trace[pid] = 1;
+    @lgwr_mode[pid] = *(uint32 *) uptr(KCRFWSLV_LGWR_MODE);
+    @fast_sync[pid] = *(uint32 *) uptr(KCRF_FAST_SYNC);
+    @test_single[pid] = *(uint32 *) uptr(KCRFWSLV_TST_SINGLE);
+    @kspasv5[pid] = *(uint32 *) uptr(KSPASV5);
+    @sl_flags[pid] = *(uint32 *) uptr(SMART_LOG_FLAGS);
+    @sl_write_time_avg_us[pid] = (*(uint32 *) uptr(KSPASV3)) / 1000;
+    @sl_write_threshold_us[pid] = *(uint32 *) uptr(KSPASV4);
+    @sl_write_cnt[pid] = *(uint32 *) uptr(KSPASV90);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_alfs_sl_update_mode
+/ @in_trace[pid] /
+{
+    /* 
+     * Retrieve variable values on function return.
+     */
+    $lgwr_mode = *(uint32 *) uptr(KCRFWSLV_LGWR_MODE);
+    $fast_sync = *(uint32 *) uptr(KCRF_FAST_SYNC);
+    $sl_write_cnt = *(uint32 *) uptr(KSPASV90);
+    $sl_flags = *(uint32 *) uptr(SMART_LOG_FLAGS);
+    $log_group = *(uint32 *) uptr(KCRFW_LOG_GROUP);
+
+    if (@sl_flags[pid] & SMART_LOG_FLAG_DSK) {
+        $sl_disk_mode_str1 = "disk";
+    } else if (@sl_flags[pid] & SMART_LOG_FLAG_DAX) {
+        $sl_disk_mode_str1 = "dax";
+    }
+
+    if ($sl_flags & SMART_LOG_FLAG_DSK) {
+        $sl_disk_mode_str2 = "disk";
+    } else if ($sl_flags & SMART_LOG_FLAG_DAX) {
+        $sl_disk_mode_str2 = "dax";
+    }
+
+    /*
+     * Precondition checks 
+     */
+    $skip = 0;
+    if (!(@sl_flags[pid] & SMART_LOG_FLAG_EXA))  {
+        $skip = SKIP_FLAG_EXADATA;
+    }
+
+    if (@test_single[pid] == 2) {
+        $skip = SKIP_TST_SINGLE;
+    }
+ 
+    if (@kspasv5[pid] & 0x4) {
+        $skip = SKIP_KSPASV5;
+    }
+
+    if (@sl_write_cnt[pid] < 128) {
+        $skip = SKIP_SL_WRI_COUNT;
+    }
+
+    if ((@sl_flags[pid] & SMART_LOG_FLAG_DAX) && 
+        (@sl_write_time_avg_us[pid] <= @sl_write_threshold_us[pid])
+       ) {
+        $skip = SKIP_SL_WRI_TIME_DAX; 
+    }
+
+    if ((@sl_flags[pid] & SMART_LOG_FLAG_DSK) && 
+        (@sl_write_time_avg_us[pid] >= @sl_write_threshold_us[pid])
+       ) {
+        $skip = SKIP_SL_WRI_TIME_DSK;
+    }
+
+    if ($skip && @OPT_VERBOSE) {
+        printf("%ld %s -> kcrfw_alfs_sl_update_mode\n", pid, comm);
+        printf("%ld %s    smart log mode is %s\n", pid, comm, $sl_disk_mode_str1);
+        printf("%ld %s    fast sync is %s\n", pid, comm, @STR_FAST_SYNC[@fast_sync[pid]]);
+        printf("%ld %s    lgwr mode is %s\n", pid, comm, @STR_LGWR_MODE[@lgwr_mode[pid]]);
+        printf("%ld %s    test_single=%u\n", pid, comm, @test_single[pid]);
+        printf("%ld %s    kspasv5=0x%x\n", pid, comm, @kspasv5[pid]);
+        printf("%ld %s    sl_flags=%p\n", pid, comm, @sl_flags[pid]);
+        printf("%ld %s    sl_write_time_avg=%u (usec)\n", pid, comm, @sl_write_time_avg_us[pid]);
+        printf("%ld %s    sl_write_threshold=%u (usec)\n", pid, comm, @sl_write_threshold_us[pid]);
+        printf("%ld %s    sl_write_cnt=%u\n", pid, comm, @sl_write_cnt[pid]);
+        printf("%ld %s    No action. Reason: %s\n", pid, comm, @STR_SKIP[$skip]); 
+        printf("%ld %s <- kcrfw_alfs_sl_update_mode: %d\n\n", pid, comm, retval);
+    }
+
+    /* 
+     * Smart log mode is disk:
+     * enable dax mode when the avg smart
+     * log write time is below the threshold.
+     */
+    if (!$skip && (@sl_flags[pid] & SMART_LOG_FLAG_DSK)) {
+         
+        if(@sl_write_time_avg_us[pid] < @sl_write_threshold_us[pid] && ($fast_sync != @fast_sync[pid])) {
+            printf("%ld %s %s\n", pid, comm, strftime("*** %Y-%d-%mT%H:%M:%S.%f%z", nsecs));
+            printf("%ld %s -> kcrfw_alfs_sl_update_mode\n", pid, comm);
+
+            printf("%ld %s    smart log mode is %s\n", pid, comm, $sl_disk_mode_str1);
+            printf("%ld %s    fast sync is %s\n", pid, comm, @STR_FAST_SYNC[@fast_sync[pid]]);
+            printf("%ld %s    lgwr mode is %s\n", pid, comm, @STR_LGWR_MODE[@lgwr_mode[pid]]);
+
+            printf("%ld %s    switching from disk to DAX, group=%d, avg=%d, thresh=%d\n", 
+                   pid, comm, $log_group, @sl_write_time_avg_us[pid], @sl_write_threshold_us[pid]);  
+            printf("%ld %s    resetting sl_write_cnt to %u\n", pid, comm, $sl_write_cnt);
+            printf("%ld %s    setting sl_flags to 0x%x\n", pid, comm, $sl_flags);
+
+            printf("%ld %s    lgwr mode is %s\n", pid, comm, @STR_LGWR_MODE[$lgwr_mode]);
+            printf("%ld %s    fast sync is %s\n", pid, comm, @STR_FAST_SYNC[$fast_sync]);
+            printf("%ld %s    smart log mode is %s\n", pid, comm, $sl_disk_mode_str2);
+
+            printf("%ld %s <- kcrfw_alfs_sl_update_mode: %d\n\n", pid, comm, retval);
+        }
+    }
+
+    /*
+     * Smart log mode is dax:
+     * enable disk mode when the avg smart
+     * log write is above the threshold.
+     */
+    if (!$skip && (@sl_flags[pid] & SMART_LOG_FLAG_DAX)) {
+         
+        if(@sl_write_time_avg_us[pid] > @sl_write_threshold_us[pid] && ($fast_sync != @fast_sync[pid])) {
+            printf("%ld %s %s\n", pid, comm, strftime("*** %Y-%d-%m %H:%MT%H:%M:%S.%f%z", nsecs));
+            printf("%ld %s -> kcrfw_alfs_sl_update_mode\n", pid, comm);
+
+            printf("%ld %s    smart log mode is %s\n", pid, comm, $sl_disk_mode_str1);
+            printf("%ld %s    fast sync is %s\n", pid, comm, @STR_FAST_SYNC[@fast_sync[pid]]);
+            printf("%ld %s    lgwr mode is %s\n", pid, comm, @STR_LGWR_MODE[@lgwr_mode[pid]]);
+
+            printf("%ld %s    switching from DAX to disk, group=%d, avg=%d, thresh=%d\n", 
+                   pid, comm, $log_group, @sl_write_time_avg_us[pid], @sl_write_threshold_us[pid]);  
+            printf("%ld %s    resetting sl_write_cnt to %u\n", pid, comm, $sl_write_cnt);
+            printf("%ld %s    setting sl_flags to 0x%x\n", pid, comm, $sl_flags);
+
+            printf("%ld %s    smart log mode is %s\n", pid, comm, $sl_disk_mode_str2);
+            printf("%ld %s    fast sync is %s\n", pid, comm, @STR_FAST_SYNC[$fast_sync]);
+            printf("%ld %s    lgwr mode is %s\n", pid, comm, @STR_LGWR_MODE[$lgwr_mode]);
+
+            /* 
+             * kcrfw_slave_adaptive_init is only
+             * called when there is a switch from
+             * DAX to disk.
+             */
+            if (@kcrfw_asv_init[pid]) {
+                printf("%ld %s    initializing adaptive slaves: kcrfw_slave_adaptive_init()\n", pid, comm);
+            }
+
+            printf("%ld %s <- kcrfw_alfs_sl_update_mode: %d\n\n", pid, comm, retval);
+        }
+    }
+
+    delete(@in_trace[pid]);
+    delete(@lgwr_mode[pid]);
+    delete(@fast_sync[pid]);
+    delete(@test_single[pid]);
+    delete(@kspasv5[pid]);
+    delete(@sl_flags[pid]);
+    delete(@sl_write_time_avg_us[pid]);
+    delete(@sl_write_threshold_us[pid]);
+    delete(@sl_write_cnt[pid]);
+    delete(@kcrfw_asv_init[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_slave_adaptive_init
+/ @in_trace[pid] /
+{
+    @kcrfw_asv_init[pid] = 1;
+}
+
+END
+{
+    clear(@in_trace);
+    clear(@fast_sync);
+    clear(@lgwr_mode);
+    clear(@test_single);
+    clear(@kspasv5);
+    clear(@sl_flags);
+    clear(@sl_write_time_avg_us);
+    clear(@sl_write_threshold_us);
+    clear(@sl_write_cnt);
+    clear(@kcrfw_asv_init);
+
+    clear(@OPT_VERBOSE);
+    clear(@STR_SKIP);
+    clear(@STR_FAST_SYNC);
+    clear(@STR_LGWR_MODE);
+    clear(@STR_SMART_LOG_DSK);
+}
