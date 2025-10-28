@@ -1,0 +1,325 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ * Purpose:
+ *   Illustrate how, in post/wait mode, the "redo synch long waits" 
+ *   threshold is dynamically computed at runtime based on various
+ *   metrics.
+ *
+ * Date:
+ *   Aug-02 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./kcrf_commit_force_int-alfs-lfs-long.bt <fg_pid>
+ *
+ * Tested on:
+ *   Oracle 19.26 / Exadata 24.1.2
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *
+ *   Use at your own risk!
+ * 
+ * Background information:
+ *   In simple terms, a "redo synch long wait" is a "log file
+ *   sync" wait that exceeds the expected wait duration thresh-
+ *   old, which is computed (in kcrf_commit_force_int) based
+ *   on the following metrics:
+ *
+ *     delay = max(rw_avg, bcast_avg)
+ *     write_time = sync_time - overhead
+ *     usleep = (delay * 2) - (sched_delay * poll_aggressiveness/100)
+ *     sleep_interval =  max(adaptive_usleep, min_usleep)
+ *     sleep_cycles = ceil(write_time / sleep_interval)
+ *     expected_time = sleep_cycles * (sleep_interval + sched_delay)
+ *     expected_time_thresh = expected_time * use_poll_threshold/100
+ *
+ *     Metric description:
+ *       rw_avg:
+ *       Redo write time moving average
+ *
+ *       bcast_avg:
+ *       broadcast on commit ack delay (average)
+ *
+ *       delay: 
+ *       Higher of redo write avg or bcast ack avg
+ * 
+ *       write_time: 
+ *       Redo write time without overhead
+ *
+ *       poll_aggressiveness:
+ *       Value of parameter _adaptive_log_file_sync_poll_aggressiveness
+ * 
+ *       adaptive_usleep:
+ *       Dynamically calculated alfs target sleep time
+ *
+ *       min_usleep:
+ *       Minimum usleep value (the adaptive usleep value
+ *       cannot go below this)
+ *
+ *       sleep_interval:
+ *       Higher of adaptive or minimum usleep value
+ * 
+ *       sleep_cycles:
+ *       The number of full sleep intervals (rounded up) that 
+ *       can occur during a redo write
+ *
+ *       use_poll_thresh:
+ *       Value of parameter _adaptive_log_file_sync_use_polling_threshold
+ *       
+ *       expected_time:
+ *       Total expected wait time, including both, the write duration and 
+ *       the delays caused by waking up to check if it's complete.
+ *
+ *       expected_time_thresh:
+ *       Max ratio of redo synch time to expected wait time; if exceeded
+ *       a "redo synch long wait" is logged
+ */
+
+/* Addresses and offsets can and will change between RUs!                                     */
+#define KSPSSIDST                0x60009628  /* oracle sid name                               */
+
+#define KSLEDT                   0x600069f0  /* event description table                       */
+#define KSLED_SZ                 0x38        /* ksled size                                    */
+#define KSL_WAIT_CTX_EV_OFF      0x78        /* wait event offset                             */
+
+#define KSUSE_TLS_OFF            0xff78      /* ksuse tls offset                              */
+#define KSUSE_STATS_OFF          0x7f8       /* ksuse stats array offset                      */
+#define STA_REDO_SYNCH_LONG      394         /* redo synch long waits                         */
+
+#define KCRF_FAST_SYNC           0x60021f1c  /* kcrf_fast_sync_                               */
+#define ALFS_INFO_POLLING        0x60021f38  /* polling (0=no, 1=yes)                         */
+#define ALFS_INFO_USLEEP_MIN     0x60021f40  /* min usleep                                    */
+#define ALFS_INFO_RW_AVG         0x60021f88  /* redo write moving avg                         */
+#define ALFS_INFO_BCAST_ACK_AVG  0x60021f8c  /* broadcast ack avg (rac)                       */
+#define ALFS_INFO_SCHED_DELAY    0x60021f78  /* scheduling delay (ms)                         */
+
+#define KCRFWSLV_LGWR_MODE       0x6002200c  /* lgwr mode (0=serial, 1=parallel)              */
+
+#define KSP_USE_POLL_THRESH_VAL  200         /* _adaptive_log_file_sync_use_polling_threshold */
+#define KSP_POLL_AGGRESSIVE_VAL  0           /* _adaptive_log_file_sync_poll_aggressiveness   */
+
+#define TLS_TIME_OFF             0x4d3d0     /* tls time offset                               */
+
+BEGIN
+{
+    if ($# != 1) {
+        printf("\nUsage: ./kcrf_commit_force_int-alfs-lfs-long.bt <fg_pid>\n");
+        exit();
+    }
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n\n");
+}
+
+/* Note:
+ * Only trace kcrf_commit_force_int calls
+ * with arg1 set to 1, as only these calls
+ * will start "log file sync" waits.
+ */
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrf_commit_force_int
+/ pid == $1 && arg1 == 1 /
+{
+    $fsbase = (uint64) uptr(curtask->thread.fsbase);
+    $saddr = *(uint64 *) uptr($fsbase - KSUSE_TLS_OFF);
+    $stats = *(uint64 *) uptr($saddr + KSUSE_STATS_OFF);
+    @long_waits[pid] = *(uint64 *) uptr($stats + STA_REDO_SYNCH_LONG * 8);
+
+    @fast_sync[pid] = *(int32 *) uptr(KCRF_FAST_SYNC);
+    @alfs_poll[pid] = *(uint32 *) uptr(ALFS_INFO_POLLING);
+    $lgwr_mode = *(uint32 *) uptr(KCRFWSLV_LGWR_MODE);
+    $fast_sync_str = @fast_sync[pid] == 0 ? "disabled" : "enabled";
+    $alfs_poll_str = @alfs_poll[pid] == 0 ? "disabled" : "enabled";
+    $lgwr_mode_str =  $lgwr_mode == 0 ? "serial" : "parallel";
+
+    printf("%ld %s -> kcrf_commit_force_int: 0x%lx 0x%lx 0x%lx\n", 
+           pid, comm, arg0, arg1, arg2);
+    printf("%ld %s    fast sync is %s\n", pid, comm, $fast_sync_str);
+    printf("%ld %s    alfs polling is %s\n", pid, comm, $alfs_poll_str);
+    printf("%ld %s    lgwr mode is %s\n", pid, comm, $lgwr_mode_str);
+
+    /* 
+     * Only enable tracing when we are in post/wait mode.
+     * If polling mode is active, consider switching it
+     * off. 
+     * Note that we should collect the alfs_info_ data in
+     * the entry probe to get consistent measurements, as
+     * lgwr may change them before the retprobe fires.
+     */
+    if(@alfs_poll[pid]) {
+        @no_trace[pid] = 1;
+        printf("%ld %s    not in post/wait mode (polling is enabled), nothing to see here!\n", pid, comm);
+    } else {
+        @in_trace[pid] = 1;
+        @rw_avg[pid] = *(uint32 *) uptr(ALFS_INFO_RW_AVG);
+        @min_usleep[pid] = *(uint32 *) uptr(ALFS_INFO_USLEEP_MIN);
+        @sched_delay[pid] = *(uint32 *) uptr(ALFS_INFO_SCHED_DELAY);
+        @bcast_avg[pid] = *(uint32 *) uptr(ALFS_INFO_BCAST_ACK_AVG);
+    }
+}
+
+/* Default retprobe when we are not tracing */
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrf_commit_force_int
+/ pid == $1 && @no_trace[pid] /
+{
+    printf("%ld %s <- kcrf_commit_force_int: %d\n", pid, comm, retval);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrf_commit_force_int
+/ @in_trace[pid] /
+{
+    /*
+     * Notes: 
+     * kcrf_commit_force_int stores the lfs start and end
+     * times in the same tls variable at different points 
+     * in time. We take advantage of that by extracting the 
+     * lfs end time here in the retprobe.
+     *
+     * Some of the values below are calculated using an
+     * initialization parameter. For simplicity, the parameter
+     * values are not retrieved at runtime, but are instead
+     * based on static defines using default values (see top 
+     * of the script).
+     */
+    $fsbase = (uint64) uptr(curtask->thread.fsbase);
+    $lfs_t2 = *(uint64 *) uptr($fsbase - TLS_TIME_OFF);
+
+    $sync_time = $lfs_t2 - @lfs_t1[pid];
+    $write_time = $sync_time - @overhead[pid];
+
+    /*
+     * Collect value of "redo synch long waits"
+     * when the retprobe fires so that we can
+     * compare that against the entry probe 
+     * measurement.
+     */
+    $saddr = *(uint64 *) uptr($fsbase - KSUSE_TLS_OFF);
+    $stats = *(uint64 *) uptr($saddr + KSUSE_STATS_OFF);
+    $long_waits = *(uint64 *) uptr($stats + STA_REDO_SYNCH_LONG * 8);
+
+    /* 
+     * Expected lfs time calculation.
+     * Use integer ceiling division for 
+     * sleep_cycles calculation.
+     */
+    $min_usleep = @min_usleep[pid];
+    $sched_delay = @sched_delay[pid];
+    $rw_avg = @rw_avg[pid];
+    $bcast_avg = @bcast_avg[pid];
+    $delay = $rw_avg < $bcast_avg ? $bcast_avg : $rw_avg;
+
+    $poll_aggressiveness = KSP_POLL_AGGRESSIVE_VAL;
+    $usleep = $delay - ($poll_aggressiveness * $sched_delay / 100);
+ 
+    $sleep_interval = $min_usleep < $usleep ? $usleep : $min_usleep;
+    $sleep_cycles = (($write_time + $sleep_interval - 1) / $sleep_interval);
+    $expected_time = $sleep_cycles * ($sleep_interval + $sched_delay);
+  
+    $use_poll_thresh = KSP_USE_POLL_THRESH_VAL;
+    $expected_time_thresh = ($use_poll_thresh * $expected_time / 100);
+
+    printf("%ld %s    poll_aggressivness = %u\n", pid, comm, $poll_aggressiveness); 
+    printf("%ld %s    use_poll_thresh = %u\n", pid, comm, $use_poll_thresh);
+    printf("%ld %s    sync_time = %lu\n", pid, comm, $sync_time);
+    printf("%ld %s    overhead = %lu\n", pid, comm, @overhead[pid]);
+    printf("%ld %s    min_usleep = %u\n", pid, comm, $min_usleep);
+    printf("%ld %s    rw_avg = %u\n", pid, comm, $rw_avg);
+    printf("%ld %s    bcast_avg = %u\n", pid, comm, $bcast_avg);
+    printf("%ld %s    sched_delay = %u\n", pid, comm, $sched_delay);
+    printf("%ld %s    delay = max(rw_avg, bcast_avg) = %u\n", pid, comm, $delay);
+    printf("%ld %s    usleep = delay - (poll_aggressiveness * sched_delay / 100) = %u\n", pid, comm, $usleep);
+    printf("%ld %s    write_time = sync_time - overhead = %lu\n", pid, comm, ($sync_time - @overhead[pid]));
+    printf("%ld %s    sleep_interval = max(usleep, min_usleep) = %lu\n", pid, comm, $sleep_interval);
+    printf("%ld %s    sleep_cycles = ceil(write_time / sleep_interval) = %lu\n", pid, comm, $sleep_cycles);
+    printf("%ld %s    expected_time = sleep_cycles * (sleep_interval + sched_delay) = %lu\n", pid, comm, $expected_time);
+    printf("%ld %s    expected_time_thresh = use_poll_thresh * expected_time / 100 = %lu\n", pid, comm, $expected_time_thresh);
+
+    if ($sync_time > $expected_time_thresh) {
+        printf("%ld %s    sync_time > expected_time_thresh\n", pid, comm);
+    } else {
+        printf("%ld %s    sync_time <= expected_time_thresh\n", pid, comm);
+    }
+
+    printf("%ld %s    redo synch long waits: old=%lu, new=%lu\n", pid, comm, @long_waits[pid], $long_waits);
+    printf("%ld %s <- kcrf_commit_force_int: %d\n\n", pid, comm, retval);
+
+    delete(@in_trace[pid]);
+    delete(@min_usleep[pid]);
+    delete(@sched_delay[pid]);
+    delete(@rw_avg[pid]);
+    delete(@bcast_avg[pid]);
+    delete(@long_waits[pid]);
+    delete(@fast_sync[pid]);
+    delete(@alfs_poll[pid]);
+    delete(@lfs_t1[pid]);
+    delete(@overhead[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kslwtbctx
+/ @in_trace[pid] && !@alfs_poll[pid] /
+{
+    /*
+     * Note: 
+     * kcrf_commit_force_int stores the lfs start and end
+     * times in the same tls variable at different points 
+     * in time. We take advantage of that by extracting the 
+     * lfs start time here in the entry probe.
+     * Variable wait_start on the other hand, is used to 
+     * measure the lfs wait event elapsed time. This there-
+     * fore differs from the lfs elapsed time ("sync_time")
+     * measured by alfs, because alfs records the start and 
+     * end times slightly before and after the actual wait 
+     * event.
+     */
+    $fsbase = (uint64) uptr(curtask->thread.fsbase);
+    @lfs_t1[pid] = *(uint64 *) uptr($fsbase - TLS_TIME_OFF);
+    @wait_start[pid] = nsecs;
+
+    $wait_ctx = (uint64) arg0;
+    $ev_num = *(uint64 *) ($wait_ctx + KSL_WAIT_CTX_EV_OFF);
+    $ksledt = *(uint64 *) uptr(KSLEDT);
+    $ev_off = (uint64) ($ev_num * KSLED_SZ);
+    $kslednam_p = *(uint64 *) uptr($ksledt + $ev_off);
+
+    printf("%d %s    -> kslwtbctx:\n", pid, comm);
+    printf("%d %s       wait = %s\n", pid, comm, str($kslednam_p));
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kslwtectx
+/ @in_trace[pid] && !@alfs_poll[pid] && @wait_start[pid] /
+{
+    printf("%d %s       ela (ns) = %lu\n", pid, comm, nsecs - @wait_start[pid]);
+    printf("%d %s    -> kslwtectx\n", pid, comm);
+
+    delete(@wait_start[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_stats_syncoverhead_record
+/ @in_trace[pid] /
+{
+    printf("%ld %s    -> kcrfw_stats_syncoverhead_record: sync_scn_p=%p, lfs_end_ts=%lu\n", pid, comm, arg0, arg1);
+    printf("%ld %s       *sync_scn_p = %p\n", pid, comm, *(uint64 *) arg0);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_stats_syncoverhead_record
+/ @in_trace[pid] /
+{
+    @overhead[pid] = (uint64) retval;
+    printf("%ld %s    <- kcrfw_stats_syncoverhead_record: %lu\n", pid, comm, retval);
+}
+
+END
+{
+    clear(@in_trace);
+    clear(@min_usleep);
+    clear(@sched_delay);
+    clear(@rw_avg);
+    clear(@bcast_avg);
+    clear(@long_waits);
+    clear(@fast_sync);
+    clear(@alfs_poll);
+    clear(@lfs_t1);
+    clear(@wait_start);
+    clear(@overhead);
+}
