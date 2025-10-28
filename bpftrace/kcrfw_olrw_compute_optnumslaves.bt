@@ -1,0 +1,168 @@
+#!/oraacfs/taaluch1/lsl/bpftrace/bpftrace.patched --no-warnings 
+/*
+ * Purpose:
+ *   Show the initial values Oracle computes for the
+ *   number of log writer groups (max_outstanding_log_writes)
+ *   and the number of workers per group (max_log_write_parallelism)
+ *   with Pipelined Log Writes / Overlapped Redo Writes (OLRW).
+ *   OLRW is enabled on Exadata X10M and higher with Oracle versions
+ *   19.22+ and 23ai.
+ *
+ * Date:
+ *   Oct-13 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   BPFTRACE_CACHE_USER_SYMBOLS=1 ./kcrfw_olrw_compute_optnumslaves.bt <oracle_sid> [<stack>?]
+ *
+ * Tested on:
+ *   Oracle 19.26 / Exadata 25.1.7 (X10M)
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ * 
+ *   Use at your own risk!
+ *
+ * Background information:
+ *   Function kcrfw_olrw_compute_optnumslaves re-computes
+ *   the optimal number of log writer groups and log writer
+ *   workers per group at instance startup, based on the 
+ *   CPU_COUNT, as follows:
+ *
+ *   Number of lg groups (max_outstanding_log_writes):
+ *
+ *     CPU_COUNT    Value
+ *           <48        2
+ *         48-95        8
+ *        96-191    (CPU_COUNT + 8) / 12
+ *         >=192       16
+ *
+ *   Number of lg workers per group (max_log_write_parallelism):
+ *
+ *     CPU_COUNT    Value
+ *           <72        1
+ *         48-95        8
+ *        96-191    (CPU_COUNT + 48) / 96
+ *         >=192       16
+ *
+ *   Special case: 
+ *     If (num_grps * grp_sz) > 100, the number of workers per 
+ *     group (max_log_write_parallellism) gets capped at:
+ *     100 / max_outstanding_log_writes
+ *
+ *   Example: 
+ *     With CPU_COUNT=48, you will get 8 lg worker groups
+ *     with 1 worker each.
+ *
+ *   Restrictions:
+ *     Note that the Pipelined Log Writes (OLRW) feature requires 
+ *     a minimum CPU_COUNT of at least 48 ("static" CPU_COUNT, 
+ *     specified at instance startup time). That is, with a CPU_COUNT
+ *     lower than 48, OLRW is not enabled at all!
+ */
+
+/* Addresses and offsets my change in every RU!                    */
+#define KSPSSIDST                  0x60009628  /* oracle sid name  */
+
+BEGIN
+{
+    if ($# < 1 || $# > 2) {
+        printf("\nUsage: ./kcrfw_olrw_compute_optnumslaves.bt <oracle_sid> [<stacks>?]\n");
+        exit();
+    }
+
+    if (str($2) == "yes" || str($2) == "y" || str($2) == "stacks") {
+        @OPT_STACKS = 1;
+    }
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_olrw_compute_optnumslaves
+/ str(uptr(KSPSSIDST)) == str($1) /
+{
+    @in_trace[pid] = 1;
+    @num_grp_p[pid] = (uint64) arg0;
+    @grp_sz_p[pid] = (uint64) arg1;
+
+    printf("***** %s", strftime("%Y-%m-%d %H:%M:%S.%f\n", nsecs));
+    printf("%ld %s -> kcrfw_olrw_compute_optnumslaves: num_grps_p=0x%lx, grp_sz_p=0x%lx,\n", 
+           pid, comm, @num_grp_p[pid], @grp_sz_p[pid]);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_olrw_compute_optnumslaves
+/ @in_trace[pid] /
+{
+    $num_grp = *(uint32 *) @num_grp_p[pid];
+    $grp_sz = *(uint32 *) @grp_sz_p[pid]; 
+
+    printf("%ld %s    *num_grp_p=%u\n", pid, comm, $num_grp);
+    printf("%ld %s    *grp_sz_p=%u\n", pid, comm, $grp_sz);
+    printf("%ld %s <- kcrfw_olrw_compute_optnumslaves\n\n", pid, comm);
+
+    if (@OPT_STACKS) {
+        printf("%s\n", ustack());
+    }
+
+    delete(@in_trace[pid]);
+    delete(@num_grp_p[pid]);
+    delete(@grp_sz_p[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:ksb_cpu_count_static_nfy
+/ @in_trace[pid] /
+{
+    printf("%ld %s -> ksb_cpu_count_static_nfy\n", pid, comm);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:ksb_cpu_count_static_nfy
+/ @in_trace[pid] /
+{
+    printf("%ld %s <- ksb_cpu_count_static_nfy: 0x%lx (%d) \n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:ksz_is_sage_enable
+/ @in_trace[pid] /
+{
+    printf("%ld %s -> ksz_is_sage_enable\n", pid, comm);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:ksz_is_sage_enable
+/ @in_trace[pid] /
+{
+    printf("%ld %s <- ksz_is_sage_enable: 0x%lx (%d)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kspgip
+/ @in_trace[pid] /
+{
+    printf("%ld %s -> kspgip: param_id=%u, %u\n", pid, comm, arg0, arg1);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kspgip
+/ @in_trace[pid] /
+{
+    printf("%ld %s <- kspgip: 0x%lx (%d)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kspges
+/ @in_trace[pid] /
+{
+    printf("%ld %s -> kspges: param_id=%u\n", pid, comm, arg0);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kspges
+/ @in_trace[pid] /
+{
+    printf("%ld %s <- kspges: 0x%lx (%d)\n", pid, comm, retval, retval);
+}
+
+END
+{
+    clear(@in_trace);
+    clear(@num_grp_p);
+    clear(@grp_sz_p);
+    clear(@OPT_STACKS);
+}
