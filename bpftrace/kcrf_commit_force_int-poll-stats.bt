@@ -1,0 +1,147 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ * Purpose:
+ *   Show how Oracle increments the following sesstat 
+ *   counters in kcrf_commit_force_int when the Adaptive 
+ *   Log File Sync (ALFS) polling mode is active:
+ * 
+ *    - redo synch writes
+ *    - redo synch poll writes
+ *    - redo synch polls
+ *
+ * Date:
+ *   Aug-16 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./kcrf_commit_force_int-poll-stats.bt <pid>
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *
+ *   Use at your own risk!
+ */
+
+/* Addresses and offsets can (and will) change betweeen RUs!                   */
+#define KCRF_FAST_SYNC          0x60021f1c  /* kcrf_fast_sync_                 */
+
+#define ALFS_POLLING            0x60021f38  /* alfs polling mode (0=no, 1=yes) */
+
+#define KSUSE_TLS_OFF            0xff78      /* ksuse tls offset               */
+#define KSUSE_STATS_OFF          0x7f8       /* ksuse stats array offset       */
+
+#define KSUSDT                   0x140a2c20  /* kernel service user statistics */
+                                             /* description table?             */
+#define KSUSDT_SZ                0x20        /* ksusdt entry size              */
+
+#define STA_REDO_SYNCH_WRI      393
+#define STA_REDO_SYNCH_POLL_WRI 400        /* redo synch poll writes           */
+#define STA_REDO_SYNCH_POLLS    401        /* redo synch polls                 */ 
+
+#define SKIP_FAST_SYNC          0x1         /* fast sync enabled               */
+#define SKIP_ALFS_POLLING       0x2         /* alfs polling not active         */
+
+BEGIN
+{
+    if ($# != 1 ) {
+        printf("\nUsage: ./kcrf_commit_force_int-poll-stats.bt <pid>\n");
+        exit();
+    }
+
+    printf("\nTracing kcrf_commit_force_int calls ... Hit ^C to stop.\n\n");
+
+    @STR_SKIP[SKIP_FAST_SYNC] = "fast sync is active";
+    @STR_SKIP[SKIP_ALFS_POLLING] = "ALFS polling is not active";
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrf_commit_force_int
+/ pid == $1 && arg1 == 1 /
+{
+    @fast_sync[pid] = *(uint32 *) uptr(KCRF_FAST_SYNC);
+    @alfs_polling[pid] = *(uint32 *) uptr(ALFS_POLLING);
+
+
+    printf("%ld %s -> kcrf_commit_force_int: 0x%lx, 0x%lx, 0x%lx\n", pid, comm, arg0, arg1, arg2);
+
+    /* Preconditions */
+    $skip = 0;
+    if (@fast_sync[pid]) {
+        $skip = SKIP_FAST_SYNC;
+    } 
+
+    if (!$skip && !@alfs_polling[pid]) {
+        $skip = SKIP_ALFS_POLLING;
+    }
+
+    if ($skip) {
+        printf("%ld %s    no action, reason: %s\n", pid, comm, @STR_SKIP[$skip]);
+        printf("%ld %s <- kcrf_commit_force_int\n\n", pid, comm);
+    } else {
+        @in_trace[pid] = 1;
+
+        /* Collect sesstat counter values */
+        $fs = uptr(curtask->thread.fsbase);
+        $saddr = *(uint64 *) uptr($fs - KSUSE_TLS_OFF);
+        $stats = *(uint64 *) uptr($saddr + KSUSE_STATS_OFF);
+        $ksusdt = (uint64) uptr(KSUSDT);
+
+        @stats[pid, STA_REDO_SYNCH_WRI]      = *(uint64 *) uptr($stats + STA_REDO_SYNCH_WRI * 8);
+        @stats[pid, STA_REDO_SYNCH_POLL_WRI] = *(uint64 *) uptr($stats + STA_REDO_SYNCH_POLL_WRI * 8);
+        @stats[pid, STA_REDO_SYNCH_POLLS]    = *(uint64 *) uptr($stats + STA_REDO_SYNCH_POLLS * 8);
+    }
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrf_commit_force_int
+/ @in_trace[pid] /
+{
+    /* Collect sesstat counter values */
+    $fs = uptr(curtask->thread.fsbase);
+    $saddr = *(uint64 *) uptr($fs - KSUSE_TLS_OFF);
+    $stats = *(uint64 *) uptr($saddr + KSUSE_STATS_OFF);
+    $ksusdt = (uint64) uptr(KSUSDT);
+
+    $idx = STA_REDO_SYNCH_WRI;
+    $str_p = uptr(*(uint64 *)(KSUSDT + $idx * KSUSDT_SZ));
+    $new = *(uint64 *) uptr($stats + $idx * 8);
+    printf("%ld %s    %s: old=%u, new=%u\n", pid, comm, str($str_p), @stats[pid, $idx], $new);
+
+    $idx = STA_REDO_SYNCH_POLL_WRI;
+    $str_p = uptr(*(uint64 *)(KSUSDT + $idx * KSUSDT_SZ));
+    $new = *(uint64 *) uptr($stats + $idx * 8);
+    printf("%ld %s    %s: old=%u, new=%u\n", pid, comm, str($str_p), @stats[pid, $idx], $new);
+
+    $idx = STA_REDO_SYNCH_POLLS;
+    $str_p = uptr(*(uint64 *)(KSUSDT + $idx * KSUSDT_SZ));
+    $new = *(uint64 *) uptr($stats + $idx * 8);
+    printf("%ld %s    %s: old=%u, new=%u\n", pid, comm, str($str_p), @stats[pid, $idx], $new);
+
+    printf("%ld %s    nanosleeps: %u\n", pid, comm, @nanosleeps[pid]);
+
+    printf("%ld %s <- kcrf_commit_force_int: 0x%lx\n\n", pid, comm, retval);
+    
+    delete(@in_trace[pid]);
+    delete(@fast_sync[pid]);
+    delete(@alfs_polling[pid]);
+    delete(@stats[pid, STA_REDO_SYNCH_WRI]);
+    delete(@stats[pid, STA_REDO_SYNCH_POLL_WRI]);
+    delete(@stats[pid, STA_REDO_SYNCH_POLLS]);
+    delete(@nanosleeps[pid]);
+}
+
+tracepoint:syscalls:sys_enter_nanosleep
+/ @in_trace[pid] /
+{
+    @nanosleeps[pid]++;
+}
+
+END
+{
+    clear(@in_trace);
+    clear(@fast_sync);
+    clear(@alfs_polling);
+    clear(@stats);
+    clear(@nanosleeps);
+    clear(@STR_SKIP);
+}
