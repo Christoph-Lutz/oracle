@@ -1,0 +1,225 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ * Purpose:
+ *   Illustrate how Oracle oomputes the target 
+ *   usleep (poll) time when the Adaptive Log 
+ *   File Sync (ALFS) polling mode is active.
+ *
+ * Date:
+ *   Aug-14 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./kcrf_commit_force_int-usleep.bt <pid>
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *
+ *   Use at your own risk!
+ *
+ * Background information:
+ *   Oracle computes the usleep (poll) time as
+ *   follows, depending on whether or  not the 
+ *   lwn scn is greater than the sync scn at
+ *   commit time.
+ *
+ *    delay = max(rw_avg, bcast_avg)
+ *    aggressiveness = sched_delay * poll_aggressiveness/100
+ *
+ *    if lwn_scn > sync_scn
+ *      usleep = delay - aggressiveness - sleep_overhead
+ *
+ *    if lwn_scn <= sync_scn:
+ *      usleep = (delay * 2) - aggressiveness - sleep_overhead
+ *
+ *    delay:
+ *    Greater of rw_avg or bcast_avg
+ *
+ *    sched_delay:
+ *    Current scheduling delay
+ *
+ *    poll_aggressiveness:
+ *    _adaptive_log_file_sync_poll_aggressiveness
+ *    (default: 0)
+ *
+ *    sleep_overhead:
+ *    Sleep overhead as determined on instance
+ *    startup
+ */
+
+#include <time.h>
+
+/* Addresses and offsets can (and will) change betweeen RUs!                              */
+#define KCRF_FAST_SYNC         0x60021f1c  /* kcrf_fast_sync_                             */
+
+#define ALFS_POLLING           0x60021f38  /* alfs polling mode (0=no, 1=yes)             */
+#define ALFS_INFO_RW_AVG       0x60021f88  /* redo write moving average                   */
+#define ALFS_INFO_BCAST_AVG    0x60021f8c  /* broadcast ack average                       */
+#define ALFS_INFO_SLEEP_OH     0x60021f44  /* sleep overhead (measured at startup)        */
+#define ALFS_INFO_MIN_SLEEP    0x60021f40  /* min sleep (measured at startup)             */
+#define ALFS_INFO_SCHED_DELAY  0x60021F78  /* scheduling delay average                    */
+
+#define ALFS_POLL_AGGR_PRM     0x0         /* _adaptive_log_file_sync_poll_aggressiveness */
+
+#define SKIP_FAST_SYNC         0x1         /* fast sync enabled                           */
+#define SKIP_ALFS_POLLING      0x2         /* alfs polling not active                     */
+
+BEGIN
+{
+    if ($# != 1 ) {
+        printf("\nUsage: ./kcrf_commit_force_int-usleep.bt <pid>\n");
+        exit();
+    }
+
+    printf("\nTracing kcrf_commit_force_int calls ... Hit ^C to stop.\n\n");
+
+    @STR_SKIP[SKIP_FAST_SYNC] = "fast sync is active";
+    @STR_SKIP[SKIP_ALFS_POLLING] = "ALFS polling is not active";
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrf_commit_force_int
+/ pid == $1 && arg1 == 1 /
+{
+    @sync_scn[pid] = *(uint64 *) arg0;
+    @fast_sync[pid] = *(uint32 *) uptr(KCRF_FAST_SYNC);
+    @alfs_polling[pid] = *(uint32 *) uptr(ALFS_POLLING);
+    @rw_avg[pid] = *(uint32 *) uptr(ALFS_INFO_RW_AVG);
+    @bcast_avg[pid] = *(uint32 *) uptr(ALFS_INFO_BCAST_AVG);
+    @sleep_oh[pid] = *(uint32 *) uptr(ALFS_INFO_SLEEP_OH);
+    @min_sleep[pid] = *(uint32 *) uptr(ALFS_INFO_MIN_SLEEP);
+    @delay[pid] = @rw_avg[pid] < @bcast_avg[pid] ? @bcast_avg[pid] : @rw_avg[pid];
+    @sched_delay[pid] = *(uint32 *) uptr(ALFS_INFO_SCHED_DELAY);
+    @aggressiveness_prm[pid] = *(uint32 *) uptr(ALFS_POLL_AGGR_PRM);
+    @aggressiveness[pid] = (@sched_delay[pid] * @aggressiveness_prm[pid] / 100);
+
+    printf("%ld %s -> kcrf_commit_force_int: 0x%lx, 0x%lx, 0x%lx\n", pid, comm, arg0, arg1, arg2);
+
+    /* Preconditions */
+    $skip = 0;
+    if (@fast_sync[pid]) {
+        $skip = SKIP_FAST_SYNC;
+    } 
+
+    if (!$skip && !@alfs_polling[pid]) {
+        $skip = SKIP_ALFS_POLLING;
+    }
+
+    if ($skip) {
+        printf("%ld %s    no action, reason: %s\n", pid, comm, @STR_SKIP[$skip]);
+        printf("%ld %s <- kcrf_commit_force_int\n\n", pid, comm);
+    } else {
+        @in_trace[pid] = 1;
+
+        printf("%ld %s    sync_scn = %p\n", pid, comm, @sync_scn[pid]);
+        printf("%ld %s    rw_avg = %u\n", pid, comm, @rw_avg[pid]);
+        printf("%ld %s    bcast_avg = %u\n", pid, comm, @bcast_avg[pid]);
+        printf("%ld %s    sleep_overhead = %u\n", pid, comm, @sleep_oh[pid]);
+        printf("%ld %s    min_sleep = %u\n", pid, comm, @min_sleep[pid]);
+        printf("%ld %s    delay = %u\n", pid, comm, @delay[pid]);
+        printf("%ld %s    sched_delay = %u\n", pid, comm, @sched_delay[pid]);
+        printf("%ld %s    poll_aggressiveness_prm = %u\n", pid, comm, @aggressiveness_prm[pid]);
+        printf("%ld %s    aggressiveness = sched_delay * poll_aggressiveness_prm/100 = %u * %u/100 = %u\n", 
+               pid, comm, @sched_delay[pid], @aggressiveness_prm[pid], @aggressiveness[pid]); 
+    }
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrf_commit_force_int
+/ @in_trace[pid] /
+{
+    printf("%ld %s <- kcrf_commit_force_int: 0x%lx\n\n", pid, comm, retval);
+
+    delete(@in_trace[pid]);
+    delete(@sync_scn[pid]);
+    delete(@fast_sync[pid]);
+    delete(@alfs_polling[pid]);
+    delete(@rw_avg[pid]);
+    delete(@bcast_avg[pid]);
+    delete(@sleep_oh[pid]);
+    delete(@min_sleep[pid]);
+    delete(@delay[pid]);
+    delete(@sched_delay[pid]);
+    delete(@aggressiveness_prm[pid]);
+    delete(@aggressiveness[pid]); 
+    delete(@lwn_scn_p[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcscu8
+/ @in_trace[pid] /
+{
+    @lwn_scn_p[pid] = (uint64) arg1;
+    printf("%ld %s    -> kcscu8: 0x%lx, lwn_scn_p=0x%lx, 0x%lx\n", pid, comm, arg0, arg1, arg2);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcscu8
+/ @in_trace[pid] /
+{
+    $lwn_scn = *(uint64 *) @lwn_scn_p[pid];
+
+    printf("%ld %s       lwn_scn_p = %p\n", pid, comm, @lwn_scn_p[pid]);
+    printf("%ld %s       lwn_scn = %p\n", pid, comm, $lwn_scn);
+
+    if ($lwn_scn > @sync_scn[pid]) {
+        $sleep_time = (@delay[pid] - @aggressiveness[pid] - @sleep_oh[pid]);
+
+        printf("%ld %s       lwn scn > sync scn\n", pid, comm);
+        printf("%ld %s       sleep_time = delay - aggressiveness - overhead = %u - %u - %u = %u\n", 
+               pid, comm, @delay[pid], @aggressiveness[pid], @sleep_oh[pid], $sleep_time);
+    }
+    else if ($lwn_scn <= @sync_scn[pid]) {
+        $sleep_time = ((@delay[pid] * 2) - @aggressiveness[pid] - @sleep_oh[pid]);
+ 
+        printf("%ld %s       lwn scn <= sync scn\n", pid, comm);
+        printf("%ld %s       sleep_time = (delay * 2) - aggressiveness - overhead = (%u * 2) - %u - %u = %u\n",
+               pid, comm, @delay[pid], @aggressiveness[pid], @sleep_oh[pid], $sleep_time);
+    }
+
+    printf("%ld %s    <- kcscu8: 0x%lx\n", pid, comm, retval);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:sltrusleep
+/ @in_trace[pid] /
+{
+    printf("%ld %s    -> sltrusleep: 0x%lx, usec=%lu\n", pid, comm, arg0, arg1);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:sltrusleep
+/ @in_trace[pid] /
+{
+    printf("%ld %s    <- sltrusleep: 0x%lx\n", pid, comm, retval);
+}
+
+tracepoint:syscalls:sys_enter_nanosleep
+/ @in_trace[pid] /
+{
+    $rqtp = (struct timespec *) args->rqtp;
+
+    printf("%ld %s       -> nanosleep: rqtp=%p, rmtp=%p\n", pid, comm, args->rqtp, args->rmtp);
+    printf("%ld %s          tv_sec = %lu\n", pid, comm, $rqtp->tv_sec); 
+    printf("%ld %s          tv_nsec = %lu\n", pid, comm, $rqtp->tv_nsec); 
+}
+
+tracepoint:syscalls:sys_exit_nanosleep
+/ @in_trace[pid] /
+{
+    printf("%ld %s       <- nanosleep: 0x%lx\n", pid, comm, args->ret);
+}
+
+END
+{
+    clear(@in_trace);
+    clear(@sync_scn);
+    clear(@fast_sync);
+    clear(@alfs_polling);
+    clear(@rw_avg);
+    clear(@bcast_avg);
+    clear(@sleep_oh);
+    clear(@min_sleep);
+    clear(@delay);
+    clear(@sched_delay);
+    clear(@aggressiveness_prm);
+    clear(@aggressiveness); 
+    clear(@lwn_scn_p);
+    clear(@STR_SKIP);
+}
