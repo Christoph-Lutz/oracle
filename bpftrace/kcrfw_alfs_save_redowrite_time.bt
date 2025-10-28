@@ -1,0 +1,188 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ * Purpose:
+ *   Trace calls to kcrfw_alfs_save_redowrite_time to show how
+ *   lgwr maintains a moving average of the redo write time that 
+ *   the Adaptive Log File Sync mechanism uses as an input to 
+ *   decide whether fg processes should use polling rather than 
+ *   posting during log file sync waits.
+ *
+ * Date:
+ *   Jul-12 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./kcrfw_alfs_save_redowrite_time.bt <oracle_sid> [<verbose>?]
+ *
+ * Tested on:
+ *   Oracle 19.26 / Exadata 24.1.2
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *
+ *   Use at your own risk!
+ *
+ * Background information:
+ *   Oracle has enhanced the conventional ALFS mechanism and 
+ *   integrated it with the Fast Sync and Smart Log (pmemlog)
+ *   features on Exadata. 
+ *
+ *   Similar to the conventional ALFS mechanism, Fast Sync 
+ *   calculates an adaptive moving average of the target
+ *   sleep time. The sleep time is dynamically calculated by
+ *   ckpt every 3 sec at runtime, and the decision making logic
+ *   used the avg redo write time as an input.
+ *
+ *   The moving average of the redo write time is based on the
+ *   following formula:
+ *
+ *   diff = curr_redo_write_time - redo_write_time_avg;
+ *   redo_write_time_avg += (diff * 2) / 129;
+ *
+ *   The smoothing factor 2/129 (~0.0155) controls how fast
+ *   the system adapts and smooths out spikes and dips.
+ */
+
+/* Addresses and offsets may change in every RU!                                 */
+#define KSPSSIDST                0x60009628  /* oracle sid name                  */
+
+#define KCRF_ALFS_INFO           0x60021f30  /* kcrf_alfs_info_                  */
+#define KCRF_ALFS_INFO_RW_START  0x60021fd8  /* redo write start time            */
+#define KCRF_ALFS_INFO_RW_AVG    0x60021f88  /* avg redo write time (us)         */
+#define KCRF_ALFS_INFO_RW_AVG_NS 0x60021ff8  /* avg redo write time (ns)         */
+#define KCRF_ALFS_INFO_RW_MIN    0x60021ffc  /* minimum redo write time          */
+#define KCRF_FAST_SYNC           0x60021f1c  /* kcrf_fast_sync_                  */
+#define KCRFWSLV_LGWR_MODE       0x6002200c  /* lgwr mode (0=serial, 1=parallel) */
+
+#define KCRFPIC_STARTTIME_OFF    0x98        /* starttime_kcrfpic                */
+#define KCRFPIC_ENDTIME_OFF      0xb8        /* endtime_kcrfpic                  */
+
+BEGIN
+{
+    if( $# < 1 || $# > 2) {
+        printf("\nUsage: ./kcrfw_alfs_sl_save_redowrite_time.bt <oracle_sid> [<verbose>?]\n");
+        exit();
+    }
+
+    if (str($2) == "yes" || str($2) == "y" || str($2) == "verbose") {
+        @OPT_VERBOSE = 1;
+    }
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_alfs_save_redowrite_time
+/ str(uptr(KSPSSIDST)) == str($1) /
+{
+    @in_trace[pid] = 1;
+    @pic[pid] = (uint64) arg0;
+    @fast_sync[pid] = *(uint64 *) uptr(KCRF_FAST_SYNC);
+    @kcrf_alfs_info[pid] = *(uint32) uptr(KCRF_ALFS_INFO);
+
+    if (!@fast_sync[pid] ) {
+        @rw_avg[pid] = *(int32 *) uptr(KCRF_ALFS_INFO_RW_AVG);
+    } else {
+        @rw_avg[pid] = *(int32 *) uptr(KCRF_ALFS_INFO_RW_AVG_NS);
+    }
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:skgstmGetEpochTs
+/ @in_trace[pid] /
+{
+    /*
+     * When event 10468 is enabled,
+     * skgstmGetEpochTs is called twice.
+     * Therefore, only set @endtime_fs
+     * if it's empty and skgstmGetEpochTs
+     * hasn't been called yet.
+     */
+    if (!@endtime_fs[pid]) {
+        @endtime_fs[pid] = (uint64) retval;
+    }
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_alfs_save_redowrite_time
+/ @in_trace[pid] /
+{
+    $lgwr_mode = *(uint32 *) uptr(KCRFWSLV_LGWR_MODE);
+
+    $fast_sync_str = @fast_sync[pid] == 1 ? "enabled" : "disabled";
+    $alfs_info_str = @kcrf_alfs_info[pid] > 0 ? "enabled" : "disabled";
+    $lgwr_mode_str = $lgwr_mode > 0 ? "parallel" : "serial";
+
+    printf("%ld %s -> kcrfw_alfs_save_redowrite_time: pic=0x%lx\n", pid, comm, @pic[pid]);
+    printf("%ld %s    alfs is %s\n", pid, comm, $alfs_info_str);
+    printf("%ld %s    fast sync is %s\n", pid, comm, $fast_sync_str);
+    printf("%ld %s    lgwr mode is %s\n", pid, comm, $lgwr_mode_str);
+
+    /* 
+     * Calculate the new redo write time
+     * moving average.
+     *
+     * Fast Sync disabled:
+     * The min redo write time value will al-
+     * ways be set to 0.
+     *
+     * Fast Sync enabled: 
+     * The avg and min write time values
+     * are rescaled by a factor of 1000.
+     * The min redo write time value is 
+     * calculated as the difference be-
+     * tween the end and the start time
+     * and stored in kcrf_alfs_info_, if
+     * it is the lowest measured value.
+     */
+    if (!@fast_sync[pid]) {
+        $starttime = *(uint64 *) uptr(@pic[pid] + KCRFPIC_STARTTIME_OFF);
+        $endtime = *(uint64 *) uptr(@pic[pid] + KCRFPIC_ENDTIME_OFF);
+        $rw = (int32) ($endtime - $starttime);
+        $new_avg = *(int32 *) uptr(KCRF_ALFS_INFO_RW_AVG);
+        $min = 0;
+    } else {
+        $starttime = *(uint64 *) uptr(@pic[pid] + KCRFPIC_STARTTIME_OFF);
+        $endtime = @endtime_fs[pid];
+        $rw = (int32) ($endtime - $starttime);
+        $rw_scaled = $rw * 1000;
+        $new_avg = *(int32 *) uptr(KCRF_ALFS_INFO_RW_AVG_NS);
+        $new_avg_scaled = $new_avg / 1000;
+        $min_prv = *(uint32 *) uptr(KCRF_ALFS_INFO_RW_MIN);
+        $min = (uint32) ($endtime - $starttime);
+        $min = $min < $min_prv ? $min : $min_prv;
+    }
+        printf("%ld %s    rw=%d, avg=%d, min=%d\n", pid, comm, $rw, ($new_avg_scaled ? $new_avg_scaled : $new_avg), $min);
+
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s    starttime = %lu\n", pid, comm, $starttime); 
+        printf("%ld %s    endtime = %lu\n", pid, comm, $endtime);
+        printf("%ld %s    rw = %d\n", pid, comm, ($rw_scaled ? $rw_scaled : $rw));
+        printf("%ld %s    rw_avg = %d\n", pid, comm, @rw_avg[pid]);
+        printf("%ld %s    Calculating new rw_avg:\n", pid, comm);
+        printf("%ld %s    rw_avg = rw_avg + ((rw - rw_avg) * 2)/129 =\n", pid, comm);
+        printf("%ld %s    %d + ((%d - %d) * 2)/129 = %d", pid, comm, @rw_avg[pid], ($rw_scaled ? $rw_scaled : $rw), 
+                          @rw_avg[pid], $new_avg);
+        printf(" %s\n", ($rw_scaled ? "(scaled)" : ""));
+    }
+
+    printf("%ld %s <- kcrfw_alfs_save_redowrite_time\n\n", pid, comm);
+
+    delete(@in_trace[pid]);
+    delete(@pic[pid]);
+    delete(@kcrf_alfs_info[pid]);
+    delete(@fast_sync[pid]);
+    delete(@rw_avg[pid]);
+    delete(@endtime_fs[pid]);
+}
+
+END
+{
+    clear(@in_trace);
+    clear(@pic);
+    clear(@kcrf_alfs_info);
+    clear(@rw_avg);
+    clear(@fast_sync);
+    clear(@endtime_fs);
+    clear(@OPT_VERBOSE);
+}
