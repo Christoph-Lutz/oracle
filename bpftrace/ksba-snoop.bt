@@ -1,0 +1,100 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ * Purpose:
+ *   Snoop ksb asynchronous messages by probing ksbasend
+ *   (Kernel Service Background Asynchronous Send).
+ *
+ * Date:
+ *   Oct-31 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   BPFTRACE_CACHE_USER_SYMBOLS=1 ./ksba-snoop.bt <oracle_sid>
+ *
+ * Tested on:
+ *   Oracle 19.26 / Exadata 25.1.7 (X10M)
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ * 
+ *   This script is potentially dangerous, use at your own risk!
+ *
+ * Output columns:
+ *   The script prints the following output:
+ *
+ *   TIME
+ *   Timestamp when ksbasend is called.
+ *
+ *   PID
+ *   OS pid of the process calling ksbasend.
+ *
+ *   COMM
+ *   OS command of the process calling ksbasend.
+ * 
+ *   MESSAGE
+ *   Message text. This corresponds to x$messages.description.
+ *
+ *   DEST
+ *   Destination process name.
+ * 
+ *   MSG_IDX
+ *   Message index. This corresponds to x$messages.indx.
+ * 
+ *   CALLER_IP
+ *   Caller instruction pointer.
+ *
+ *   CALLER_FUNC
+ *   The parent function calling ksbasend.
+ */
+
+/* Addresses and offsets my change in every RU!                            */
+#define KSPSSIDST             0x60009628  /* oracle sid name               */
+
+#define KSBSDT                0x15aa3720  /* ksb string description table? */
+#define KSBSDT_STR_OFF        0x8         /* description string offset     */
+
+#define KSBDP_NAME_OFF        0x4         /* process name offset (ksbdp)   */
+
+BEGIN
+{
+    if ($# < 1) {
+        printf("\nUsage: ./ksba-snoop.bt <oracle_sid>\n");
+        exit();
+    }
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n\n");
+
+    printf("%-27s %-9s %-16s %-64s %-16s %7s %-16s %-32s\n",
+           "TIME", "PID", "COMM", "MESSAGE", "DEST", "MSG_IDX", "CALLER_IP", "CALLER_FUNC");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:ksbasend
+/ str(uptr(KSPSSIDST)) == str($1) /
+{
+    @in_trace[pid] = 1;
+
+    $tgt_paddr = (uint64) arg0;
+    $msg_idx   = *(uint32 *) arg1;
+    $sz        = (uint64) arg2;
+    $caller_ip = *(uint64 *) reg("sp");
+
+    $msg_p = *(uint64 *) uptr(KSBSDT + ($msg_idx * $sz) + KSBSDT_STR_OFF);
+    $dst_p = (uint64 *) uptr($tgt_paddr + KSBDP_NAME_OFF); 
+
+    printf("%-27s ", strftime("%Y-%m-%d %H:%M:%S.%f", nsecs));
+    printf("%-9d %-16s %-64s %-16s %7d %-16p %-32s\n",
+           pid, comm, str(uptr($msg_p)), str(uptr($dst_p)), $msg_idx, $caller_ip, usym($caller_ip));
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:ksbasend
+/ @in_trace[pid] /
+{
+    delete(@in_trace[pid]);
+}
+
+END
+{
+    clear(@in_trace);
+}
