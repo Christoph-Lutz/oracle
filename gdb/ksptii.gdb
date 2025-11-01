@@ -16,8 +16,6 @@
 #   Oracle 19.26 / Exadata 25.1.7
 #
 # Notes:
-#   This script doesn't print string and list params.
-#
 #   This script is dangerous and higly experimental, 
 #   use at your own risk!
 
