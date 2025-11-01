@@ -1,0 +1,154 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ * Purpose:
+ *   Show how Oracle generates UUID v4 values in ztuguid,
+ *   which uses the OpenSSL RAND_bytes function.
+ *
+ * Date:
+ *   Nov-01 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./RAND_bytes.bt <oracle_pid> [<stacks>?]
+ *
+ * Tested on:
+ *   Oracle 23.26 / Exadata 25.1.7
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *
+ *   Use at your own risk!
+ *
+ * Background information:
+ *   In 23.26 (26ai), RAND_bytes and other OpenSSL functions
+ *   appear to be incorporated into the Oracle libnnzsrv.so
+ *   shared library.
+ *
+ *   RAND_bytes has the following signature, s. also RAND_BYTES(3):
+ *      int RAND_bytes(unsigned char *buf, int num);
+ *
+ *   Oracle uses RAND_bytes to generate a 16 bytes random number
+ *   and overwrites the byte positions 6 and 8 with the following
+ *   fixed values (in ztuguid) to conform with RFC 4122:
+ * 
+ *     byte 6: 0x4f - Reserved for the version. 
+ *             The first nibble has the value 0x4 (0b0100), which 
+ *             corresponds to UUID v4.
+ *             The second nibble can be random, Oracle just fills
+ *             it with 1 (0xf = 0b1111).
+ *
+ *     byte 8: 0xbf - Encodes the variant in bits 7-6 and must be
+ *             10 in binary, bits 5-0 can be random and Oracle fills
+ *             them with 1 (0b111111): 
+ *
+ *             bits 7-6: 0b10
+ *             bits 5-0: 0b111111
+ * 
+ *             0b10111111 = 0xbf
+ */
+
+BEGIN
+{
+    if( $# < 1) {
+        printf("\nUsage: ./RAND_bytes <oracle_pid> [<stacks>?]\n");
+        exit();
+    }
+
+    if (str($2) == "yes" || str($2) == "y" || str($2) == "stacks") {
+        @OPT_STACKS = 1;
+    }
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:ztuguid
+/ pid == $1 /
+{
+    @in_trace[pid] = 1;
+    @buf[pid] = 0;
+    @num[pid] = 0;
+
+    printf("%ld %s -> ztuguid\n", pid, comm);
+
+    if (@OPT_STACKS) {
+        printf("stack: %s\n", ustack());
+    }
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:ztuguid
+/ pid == $1 /
+{
+    /* Only support 16 byte random numbers */
+    if (@num[pid] == 16) {
+        $g0 = *(uint32 *) uptr(@buf[pid]);
+        $g1 = *(uint16 *) uptr(@buf[pid] + 4);
+        $g2 = *(uint16 *) uptr(@buf[pid] + 6);
+        $g3 = *(uint16 *) uptr(@buf[pid] + 8);
+        $g4 = *(uint32 *) uptr(@buf[pid] + 10);
+        $g5 = *(uint16 *) uptr(@buf[pid] + 14);
+
+        $g0_be = bswap($g0);
+        $g1_be = bswap($g1);
+        $g2_be = bswap($g2);
+        $g3_be = bswap($g3);
+        $g4_be = bswap($g4);
+        $g5_be = bswap($g5);
+    
+        printf("%ld %s    Oracle uuid: %08x-%04x-%04x-%04x-%08x%04x\n", 
+               pid, comm, $g0_be, $g1_be, $g2_be, $g3_be, $g4_be, $g5_be);
+    }
+
+    printf("%ld %s <- ztuguid: %d\n\n", pid, comm, retval);
+
+    delete(@in_trace[pid]);
+    delete(@buf[pid]);
+    delete(@num[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:RAND_bytes
+/ @in_trace[pid] /
+{
+    @buf[pid] = (uint64) arg0;
+    @num[pid] = (uint64) arg1;
+
+    printf("%ld %s    -> RAND_bytes: buf=%p, num=%d\n", pid, comm, arg0, arg1);
+
+    if (@OPT_STACKS) {
+        printf("stack: %s\n", ustack());
+    }
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:RAND_bytes
+/ @in_trace[pid] /
+{
+    /* Only support 16 byte random numbers */
+    if (@num[pid] == 16) {
+        $g0 = *(uint32 *) uptr(@buf[pid]);
+        $g1 = *(uint16 *) uptr(@buf[pid] + 4);
+        $g2 = *(uint16 *) uptr(@buf[pid] + 6);
+        $g3 = *(uint16 *) uptr(@buf[pid] + 8);
+        $g4 = *(uint32 *) uptr(@buf[pid] + 10);
+        $g5 = *(uint16 *) uptr(@buf[pid] + 14);
+
+        $g0_be = bswap($g0);
+        $g1_be = bswap($g1);
+        $g2_be = bswap($g2);
+        $g3_be = bswap($g3);
+        $g4_be = bswap($g4);
+        $g5_be = bswap($g5);
+    
+        printf("%ld %s       OpenSSL uuid: %08x-%04x-%04x-%04x-%08x%04x\n", 
+               pid, comm, $g0_be, $g1_be, $g2_be, $g3_be, $g4_be, $g5_be);
+    }
+
+    printf("%ld %s    <- RAND_bytes: 0x%x\n", pid, comm, retval);
+}
+
+END
+{
+    clear(@in_trace);
+    clear(@buf);
+    clear(@num);
+}
