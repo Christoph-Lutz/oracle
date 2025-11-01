@@ -60,26 +60,27 @@ class ParamPrinter(gdb.Command):
         param = eval_arg(args[1]) if len(args) > 1 else None
         desc = truncate(eval_arg(args[2]), 80) if len(args) > 2 else None
         callback = eval_arg(args[3]) if len(args) > 3 else None
-        val = int(eval_arg(args[4])) if len(args) > 4 and eval_arg(args[4]) is not None else None
-        default = (val - 0x100000000) if val is not None and val >= 0x80000000 else val
+        value = eval_arg(args[4]) if len(args) > 4 and eval_arg(args[4]) is not None else None
 
         # Lookup symbol at callback addr
         output = gdb.execute(f"info symbol {callback}", to_string=True)
         match = re.match(r"(\S+)", output)
         symbol_name = match.group(1) if match else None
 
-        print(f"{idx:<5} {param:<60} {desc:<80} {symbol_name:<40} {default:<9}")
+        print(f"{idx:<5} {param:<60} {desc:<80} {symbol_name:<40} {value:<20}")
 
 ParamPrinter()
 end
 
 set $elem_sz = 0x58
+set $type_off = 0xc
+set $default_off = 0x14
+set $strp_off = 0x18
 set $cb_off = 0x40
 set $desc_off = 0x48
-set $default_off = 0x14
 set $i = 0
 
-printf "\n%-5s %-60s %-80s %-40s %-9s\n", "Indx", "Parameter", "Description", "Callback", "Default?"
+printf "\n%-5s %-60s %-80s %-40s %-20s\n", "Indx", "Parameter", "Description", "Callback", "Default?"
 
 while($i < (uint32_t) ksptot_)
     set $addr = (uint64_t) &ksptii + ($i * $elem_sz)
@@ -87,8 +88,23 @@ while($i < (uint32_t) ksptot_)
     set $desc = *(char **) ($addr + $desc_off)
     set $callback = *(uint64_t *) ($addr + $cb_off)
     set $default = *(uint32_t *) ($addr + $default_off)
+    set $type = *(uint32_t *) ($addr + $type_off)
 
-    print_param $i $name $desc $callback $default
+    # Note:
+    # We assume parameters are int by default.
+    set $value = *(int32_t *) ($addr + $default_off)
+ 
+    # Bool parameter
+    if ($type == 1)
+       set $value = ($default == 1) ? "TRUE" : "FALSE" 
+    end
+
+    # String parameter
+    if ($type == 2)
+        set $value = *(char **) ($addr + $strp_off)
+    end
+
+    print_param $i $name $desc $callback $value
 
     set $i=$i+1
 end
