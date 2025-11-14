@@ -20,7 +20,7 @@
  *   Oracle 19.23
  *
  * Usage:
- *   BPFTRACE_CACHE_USER_SYMBOLS=1 ./kgh-alloc-by-reason.bt <oracle_sid>
+ *   BPFTRACE_CACHE_USER_SYMBOLS=1 ./kgh-alloc-by-reason.bt <oracle_sid> <reason_str>
  *
  * Example:
  *   BPFTRACE_CACHE_USER_SYMBOLS=1 ./kgh-alloc-by-reason.bt "PLSQL Collection Bind"
