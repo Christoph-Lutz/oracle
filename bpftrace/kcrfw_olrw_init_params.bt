@@ -1,0 +1,738 @@
+#!/usr/bin/env -S bpftrace --no-warnings 
+/*
+ * Purpose:
+ *   Trace initialization of the Overlapped Redo Write (OLRW)
+ *   structure and related parameters in kcrfw_olrw_init_params.
+ *
+ *   The script output is similar to the trace output in the 
+ *   alert log and lgwr trace file when event 10468 is enabled
+ *   at level 0x8400 (0x8000 + 0x400).
+ * 
+ *   Start the script before (re)starting the target instance.
+ *
+ * Date:
+ *   Nov-09 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./kcrfw_olrw_init_params.bt <oracle_sid> [<verbose>?]
+ *
+ * Tested on:
+ *   Oracle 19.26 / Exadata 25.1.7 (X10M)
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ * 
+ *   This script is potentially dangerous, use at your own risk!
+ */
+
+/* Addresses and offsets my change in every RU!                                           */
+#define KSPSSIDST                  0x60009628  /* oracle sid name                         */
+
+#define KLASSVP7                   0x6005dc00  /* klassvp7_: alwe info                    */
+#define KLASSVP8                   0x6005dc08  /* klassvp8_: olrw info                    */
+
+#define KCRF_SLAVE_INFO            0x60022008  /* kcrf_slave_info_                        */
+#define KCRF_MAX_STRANDS           0x60021e90  /* kcrf_max_strands_                       */
+#define KCRF_ACTV_STRANDS          0x60021ea0  /* kcrf_actv_strands_                      */
+#define KCRF_FAST_SYNC             0x60021f1c  /* kcrf_fast_sync_                         */
+#define KCRF_PLATFORM_FLG_X10      0x100       /* Exadata X10+                            */
+
+#define KCRFSG_LOG_BUFFER_SZ       0x60021820  /* log buffer size (in struct kcrfsg_)     */
+
+#define KCRFWSLV_LGWR_MODE         0x6002200c  /* lgwr mode (0=serial, 1=parallel)        */
+#define KCRFWSLV_STDBY_MODE        0x60022010  /* lgwr stdby mode (0=no, 1=yes)           */
+#define KCRFWSLV_MAX_OUT_LOG_WRI   0x6002202c  /* max_outstanding_log_writes              */
+#define KCRFWSLV_TOT_WORKERS       0x60022270  /* total number of lg workers              */
+
+#define KSPTII                     0x13fb6f60  /* ksptii (parameter table)                */ 
+#define KSPTII_ELEM_SZ             0x58        /* ksptii elem size                        */
+
+#define ALWE_FLG_NORMAL_PHASE      0x1         /* alwe normal phase                       */
+#define ALWE_FLG_EVAL_PHASE        0x2         /* alwe evaluation phase                   */
+#define ALWE_FLG_LFS               0x10        /* alwe log file sync adj                  */
+
+#define OLRW_FLG_ENABLED           0x1         /* olrw enabled                            */
+#define OLRW_FLG_REMAPPED          0x2         /* olrw workers remapped                   */
+#define OLRW_FLG_THICK_MODE        0x4         /* olrw thick mode                         */
+#define OLRW_FLG_REEVAL            0x20        /* olrw reevaluation                       */
+
+#define OLRW_CPU_COUNT_OPT_NGRPS      8        /* olrw minimum nr of lg groups            */
+#define OLRW_CPU_COUNT_MIN_THRESH    48        /* olrw minimum cpu_count                  */
+#define OLRW_WAIT_MAX_SZ_REC       1792        /* olrw max recommended write size         */
+
+#define REDO_BLOCK_SZ              0x200       /* redo block size (512 bytes)             */
+#define KSFD_MAXIO                 0x100000    /* ksfd max io size (1 MB)                 */
+
+#define TGT_LW_SZ                  2000        /* _target_log_write_size                  */
+#define TGT_LW_SZ_PCT_POKE_PRM     2003        /* _target_log_write_size_percent_for_poke */
+#define USE_SINGLE_LOG_WRITER_PRM  2011        /* _use_single_log_writer param            */
+#define LGWR_THICK_MODE_CFG_PRM    5496        /* _lgwr_thick_mode_config param           */
+
+#define DEFAULT_POKE_PCT           80          /* default poke pct value                  */
+
+#define SKIP_PLATFORM_FLG          0x0         /* skip: Exadata platform flag             */
+#define SKIP_KCRF_SLV_INFO         0x1         /* skip: kcrf_slave_info                   */
+#define SKIP_CPU_COUNT             0x2         /* skip: cpu_count                         */
+#define SKIP_OPT_NUMGROUPS         0x3         /* skip: olrw opt_numgrsp                  */
+#define SKIP_MAX_OUT_LW            0x4         /* skip: _max_outstanding_log_writes       */
+#define SKIP_TGT_LW_SZ_TMO         0x5         /* skip: _target_log_write_size_timeout    */
+#define SKIP_WRITE_SZ              0x6         /* skip: write size not set                */
+
+struct olrw_info {
+    uint32_t flags;                            /* klassvp8[0]                             */
+    uint32_t write_sz;                         /* klassvp8[1]                             */
+    uint32_t stall_sz;                         /* klassvp8[2]                             */
+    uint32_t write_sz_prv;                     /* klassvp8[3]                             */
+    uint32_t poke_pct;                         /* klassvp8[4]                             */
+    uint32_t tgt_log_write_sz;                 /* klassvp8[5]                             */
+    uint32_t tgt_log_write_tmo;                /* klassvp8[6]                             */
+    uint32_t thin_p1;                          /* klassvp8[7]                             */
+    uint32_t wait_zone_start;                  /* klassvp8[8]                             */
+    uint32_t thin_p2;                          /* klassvp8[9]                             */
+    uint32_t wait_min_sz;                      /* klassvp8[10]                            */
+    uint32_t thin_p3;                          /* klassvp8[11]                            */
+    uint32_t wait_max_sz;                      /* klassvp8[12]                            */
+    uint32_t thin_p4;                          /* klassvp8[13]                            */
+    uint32_t wait_min_tmo_usec;                /* klassvp8[14]                            */
+    uint32_t thin_p5;                          /* klassvp8[15]                            */
+    uint32_t wait_max_tmo_usec;                /* klassvp8[16]                            */
+    uint32_t thick_p1;                         /* klassvp8[17]                            */
+    uint32_t fallback_zone_end;                /* klassvp8[18]                            */
+    uint32_t thick_p2;                         /* klassvp8[19]                            */
+    uint32_t overflow_zone_start;              /* klassvp8[20]                            */
+    uint32_t thick_p3;                         /* klassvp8[21]                            */
+    uint32_t thick_min_sz;                     /* klassvp8[22]                            */
+    uint32_t thick_p4;                         /* klassvp8[23]                            */
+    uint32_t thick_max_sz;                     /* klassvp8[24]                            */
+    uint32_t thick_tmo_usec;                   /* klassvp8[25]                            */
+    uint32_t arbiter;                          /* klassvp8[26]                            */
+    uint32_t opt_numgrps;                      /* klassvp8[27]                            */
+    uint32_t opt_grp_sz;                       /* klassvp8[28]                            */
+};
+
+BEGIN
+{
+    if ($# < 1) {
+        printf("\nUsage: ./kcrfw_olrw_init_params.bt <oracle_sid> [<verbose>?]\n");
+        exit();
+    }
+
+    if (str($2) == "yes" || str($2) == "y" || str($2) == "verbose") {
+        @OPT_VERBOSE = 1;
+    }
+
+    @thin_cfg_p1[pid] = 0;
+    @thin_cfg_p2[pid] = 0;
+    @thin_cfg_p3[pid] = 0;
+    @thin_cfg_p4[pid] = 0;
+    @thin_cfg_p5[pid] = 0;
+
+    @thick_cfg_p1[pid] = 0;
+    @thick_cfg_p2[pid] = 0;
+    @thick_cfg_p3[pid] = 0;
+    @thick_cfg_p4[pid] = 0;
+    @thick_cfg_p5[pid] = 0;
+
+    @tgt_lw_sz_prm[pid] = 0;
+    @tgt_lw_sz_pct_poke_prm[pid] = 0;
+    @lgwr_thick_mode_cfg_prm[pid] = 0;
+    @use_single_log_writer_prm[pid] = 0;
+
+    @STR_SKIP[SKIP_PLATFORM_FLG]   = "platform does not support OLRW";
+    @STR_SKIP[SKIP_KCRF_SLV_INFO]  = "kcrf_slave_info_ not set";
+    @STR_SKIP[SKIP_CPU_COUNT]      = "CPU_COUNT < 48";
+    @STR_SKIP[SKIP_OPT_NUMGROUPS]  = "optimal nr of groups < 8";
+    @STR_SKIP[SKIP_MAX_OUT_LW]     = "max_outstanding_log_writes < 2";
+    @STR_SKIP[SKIP_TGT_LW_SZ_TMO]  = "target_log_write_size_timeout is 0";
+    @STR_SKIP[SKIP_WRITE_SZ]       = "write size is 0";
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_olrw_init_params
+/ str(uptr(KSPSSIDST)) == str($1) /
+{
+    @in_trace[pid] = 1;
+
+    /* $olrw = *(struct olrw_info **) uptr(KLASSVP8); */
+
+    printf("***** %s\n", strftime("%Y-%m-%d %H:%M:%S.%f", nsecs));
+    printf("%ld %s -> kcrfw_olrw_init_params: 0x%lx\n", pid, comm, arg0);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_olrw_init_params
+/ @in_trace[pid] /
+{
+    $olrw = *(struct olrw_info **) uptr(KLASSVP8);
+
+    $kcrf_fast_sync  = *(uint32 *) uptr(KCRF_FAST_SYNC);
+    $lgwr_mode       = *(uint32 *) uptr(KCRFWSLV_LGWR_MODE);
+    $max_strands     = *(uint32 *) uptr(KCRF_MAX_STRANDS);
+    $actv_strands    = *(uint32 *) uptr(KCRF_ACTV_STRANDS);
+    $kcrf_slave_info = *(uint32 *) uptr(KCRF_SLAVE_INFO);
+    $max_out_log_wr  = *(uint32 *) uptr(KCRFWSLV_MAX_OUT_LOG_WRI);
+    $tot_workers     = *(uint32 *) uptr(KCRFWSLV_TOT_WORKERS);
+    $log_buf_sz      = *(uint64 *) uptr(KCRFSG_LOG_BUFFER_SZ);
+  
+    /* OLRW preconditions */
+    $skip = 0;
+    if (!$skip && $kcrf_slave_info == 0) {
+        $skip = SKIP_KCRF_SLV_INFO;
+    }
+
+    if (!$skip && (@cpu_count[pid] < OLRW_CPU_COUNT_MIN_THRESH)) {
+        $skip = SKIP_CPU_COUNT;
+    }
+
+    if (!$skip && ($olrw->opt_numgrps < OLRW_CPU_COUNT_OPT_NGRPS)) {
+        $skip = SKIP_OPT_NUMGROUPS;
+    }
+
+    /* OLRW supported, but disabled (not remapped) */
+    if (!$skip && !($olrw->flags & OLRW_FLG_REMAPPED)) {
+        printf("%ld %s    Adaptive overlapped redo/writes are disabled\n", pid, comm); 
+        printf("%ld %s    (it was not configured at instance start up)\n", pid, comm);
+    }
+
+    /* OLRW supported and enabled (remapped) */
+    if (!$skip && ($olrw->flags & OLRW_FLG_REMAPPED)) {
+
+        /* 
+         * Adjust start of wait zone: 
+         * If wait_zone_start equals or exceeds max_
+         * outstanding_log_writes, it is adjusted to
+         * max_outstanding_lg_writes - 1 
+         */
+        $wait_zone_start = ($max_out_log_wr - 1);
+
+        if (@thin_cfg_p1[pid] >= $max_out_log_wr) {
+            printf("%ld %s    OLRW: Start of wait zone in thin mode\n", pid, comm); 
+            printf("%ld %s          adjusted from %u to %u\n", pid, comm, @thin_cfg_p1[pid], $wait_zone_start);
+        }
+
+        /*
+         * Adjust thin mode max write size in 
+         * wait zone:
+         * Enforce a max wait size of at least 8, 
+         * but only when the write_sz is larger 
+         * than or equal to the configured size 
+         * and the configured size is currently 
+         * below 8.
+         */
+        $write_sz = (KSFD_MAXIO / REDO_BLOCK_SZ * $max_strands);
+
+        $wait_max_sz = (($write_sz >= @thin_cfg_p3[pid]) && (@thin_cfg_p3[pid] < 8)) ? 8 : @thin_cfg_p3[pid];
+  
+        if ($wait_max_sz != @thin_cfg_p3[pid]) {
+            printf("%ld %s    OLRW: Maximum write size for the wait zone\n", pid, comm);  
+            printf("%ld %s          in thin mode adjusted from %u to %u\n", pid, comm, @thin_cfg_p3[pid], $wait_max_sz);
+        }
+
+        /* 
+         * Print a warning if the wait_max_sz
+         * exceeds the recommended max size of
+         * 1792 KB.
+         */
+        $wait_max_sz_rec = OLRW_WAIT_MAX_SZ_REC * REDO_BLOCK_SZ / 1024;
+
+        if ($wait_max_sz > OLRW_WAIT_MAX_SZ_REC) {
+            printf("%ld %s    OLRW: Warning: the maximum write size for the\n", pid, comm); 
+            printf("%ld %s          wait zone in thin mode (%u KB) is greater\n", pid, comm, ($wait_max_sz * REDO_BLOCK_SZ / 1024));
+            printf("%ld %s          than the recommended maximum value (%u KB)\n", pid, comm, $wait_max_sz_rec);
+        }
+
+        /*
+         * Adjust thin mode min write size in
+         * wait zone:
+         * The write_sz is set to the smaller of 
+         * the two min and max size limits, but
+         * never less than 8.
+         */
+        $write_sz = (@thin_cfg_p3[pid] < @thin_cfg_p2[pid]) ? @thin_cfg_p3[pid] : @thin_cfg_p2[pid];
+
+        $wait_min_sz = ($write_sz > 8) ? $write_sz : 8;
+
+        if ($wait_min_sz != @thin_cfg_p2[pid]) {
+            printf("%ld %s    OLRW: Minimum write size for wait zone in thin mode adjusted from %u to %u\n", pid, comm, @thin_cfg_p2[pid], $wait_min_sz);
+        }
+
+        /* 
+         * Adjust thin mode min timeout in the 
+         * wait zone:
+         * The min timeout is the smaller of 
+         * the two min and max timeout limits.
+         */
+        if (@thin_cfg_p5[pid] < @thin_cfg_p4[pid]) {
+            $tmo_min_usec = @thin_cfg_p5[pid];
+            printf("%ld %s    OLRW: Minimum timeout for wait zone in thin mode adjusted from %u to %u\n", pid, comm, @thin_cfg_p4[pid], $tmo_min_usec);
+        }
+
+        /*
+         * Adjust thick mode overflow zone: 
+         * Set it to a minimum value of 1, if 
+         * it's set to 0.
+         * If the overflow zone is greater than 
+         * or equal to _max_outstanding_log__
+         * writes, set it to: 
+         * max_outstanding_log_writes - 1
+         */
+        if (@thick_cfg_p2[pid] == 0) {
+            $overflow_zone = 1; 
+            printf("%ld %s    OLRW: Start of overflow zone\n", pid, comm); 
+            printf("%ld %s          adjusted from %u to %u\n", pid, comm, @thick_cfg_p2[pid], $overflow_zone);
+        }
+        else {
+            if ($max_out_log_wr <= @thick_cfg_p2[pid]) {
+                $overflow_zone = $max_out_log_wr - 1;
+                printf("%ld %s    OLRW: Start of overflow zone\n", pid, comm); 
+                printf("%ld %s          adjusted from %u to %u\n", pid, comm, @thick_cfg_p2[pid], $overflow_zone);
+            }
+        }
+
+        /*
+         * Adjust thick mode fallback zone:
+         * If the overflow zone is less than
+         * or equal to the end of the fallback
+         * zone, set the fallback zone to:
+         * overflow_zone - 1
+         */
+        if (@thick_cfg_p2[pid] <= @thick_cfg_p1[pid]) {
+            $fallback_zone = $overflow_zone - 1;
+            printf("%ld %s    OLRW: Start of fallback zone\n", pid, comm); 
+            printf("%ld %s          adjusted from %u to %u\n", pid, comm, @thick_cfg_p1[pid], $fallback_zone);
+        }
+
+        /*
+         * Adjust thick mode max write size:
+         * If the max write size is less than 
+         * or equal to the total size of all 
+         * strands, use the configured value. 
+         * However, if the configured value is
+         * less than 256, set it to 256 instead.
+         */
+        $thick_max_sz = (KSFD_MAXIO / REDO_BLOCK_SZ * $max_strands);
+
+        if (@thick_cfg_p4[pid] <= $thick_max_sz) {
+            $thick_max_sz = (@thick_cfg_p4[pid] < 256) ? 256 : @thick_cfg_p4[pid];
+        }
+
+        if($thick_max_sz != @thick_cfg_p4[pid]) {
+            printf("%ld %s    OLRW: Maximum write size for all zones\n", pid, comm); 
+            printf("%ld %s          in thick mode adjusted from %u to %u\n", pid, comm, @thick_cfg_p4[pid], $thick_max_sz);
+        }
+
+        /*
+         * Adjust thick mode minimum write size:
+         * The adjustment is calculated according
+         * to the formula below if the parameter 
+         * _lgwr_thick_mode_config is not set at
+         * session level (kspges).
+         * Note: lgwr_thick_mode_cfg_prm is set
+         * in the kspges retprobe further down 
+         * below.
+         * If _lgwr_thick_mode_config is set at
+         * session level, use the smaller of the
+         * min and max write sizes, but never 
+         * less than 256.
+         */
+        if (@lgwr_thick_mode_cfg_prm[pid] == 0) {
+            $thick_min_sz_calc = 1;
+            $thick_min_sz = ($max_out_log_wr - $olrw->wait_zone_start) * 2 * ($olrw->wait_max_sz + $olrw->wait_min_sz) / ($olrw->fallback_zone_end * 5 + 5);
+
+        }
+        else {
+            $thick_min_sz_calc = 0;
+            $thick_min_sz = (@thick_cfg_p4[pid] < @thick_cfg_p3[pid]) ? @thick_cfg_p4[pid] : @thick_cfg_p3[pid];
+            $thick_min_sz = ($thick_min_sz <= 256) ? 256 : $thick_min_sz;
+
+        }
+
+        if ($thick_min_sz != @thick_cfg_p3[pid]) {
+            printf("%ld %s    OLRW: Minimum %scalculated starget size for all zones\n", pid, comm, ($thick_min_sz_calc ? "calulated " : "")); 
+            printf("%ld %s          in thick mode adjusted from %u to %u\n", pid, comm, @thick_cfg_p3[pid], $thick_min_sz);
+        }
+
+        printf("%ld %s    Adaptive overlapped redo writes %s log writer,\n", pid, comm, ($kcrf_slave_info == 3 ? "using evaluative" : "by"));
+        printf("%ld %s    are enabled (size=%u, stall size=%u, poke=%u%)\n", pid, comm, 0, $olrw->stall_sz, @tgt_lw_sz_pct_poke_prm[pid]);
+    }
+
+    /* OLRW unsupported */
+    if ($skip) {
+        printf("%ld %s    Adaptive overlapped redo/writes are disabled\n", pid, comm);
+        printf("%ld %s    Reason: %s\n", pid, comm, @STR_SKIP[$skip]);
+
+        $write_sz = ($log_buf_sz / REDO_BLOCK_SZ / $max_strands);
+        $stall_sz = (@tgt_lw_sz_prm[pid] / $max_strands);
+
+        /* 
+         * Stall size computation.
+         * Note: with OLRW enabled, same stall size 
+         * computation is performed in kcrfw_olrw_
+         * stall_sz().
+         */ 
+        if ($stall_sz == 0) {
+            $stall_sz = ($write_sz / 3);
+        }
+        else {
+            if ($stall_sz > ($write_sz / 2)) {
+                $stall = ($write_sz / 2);
+            }
+        }
+
+        if (($stall_sz * REDO_BLOCK_SZ) > KSFD_MAXIO) {
+            $stall_sz = (KSFD_MAXIO / REDO_BLOCK_SZ);
+        }
+
+        printf("%ld %s    Overlapped redo/writes by log writer are disabled\n", pid, comm);
+        printf("%ld %s    (size=%u, stall size=%u, poke=%u%, LGWR mode=heuristic)\n", pid, comm, $olrw->write_sz, $stall_sz, $olrw->poke_pct);
+    }
+
+    /* 
+     * OLRW supported, but disabled.
+     * The checks below are needed to 
+     * determine whether overlapped redo 
+     * writes are disabled, or if non-
+     * adaptive overlapped redo writes 
+     * are enabled.
+     */
+    if(!($olrw->flags & OLRW_FLG_ENABLED)) {
+        $skip2 = 0;
+        if (!$skip2 && ($kcrf_slave_info == 0)) {
+            $skip2 = SKIP_KCRF_SLV_INFO;
+        }
+
+        if (!$skip2 && ($max_out_log_wr < 2)) {
+            $skip2 = SKIP_MAX_OUT_LW;
+        }
+
+        if (!$skip2 && ($olrw->write_sz == 0)) {
+            $skip2 = SKIP_WRITE_SZ;
+        }
+
+        if (!$skip2 && ($olrw->tgt_log_write_tmo == 0)) {
+            $skip2 = SKIP_TGT_LW_SZ_TMO;
+        }
+ 
+        if ($skip2) {
+            printf("%ld %s    OLRW: overlapped redo writes are disabled,\n", pid, comm); 
+            printf("%ld %s          %s: write_sz=%u\n", pid, comm, ($kcrf_slave_info == 2 ? "using heuristic LGWR" : ""), $olrw->write_sz);
+            printf("%ld %s    Reason2: %s\n", pid, comm, @STR_SKIP[$skip2]);
+        }
+        else {
+            printf("%ld %s    OLRW: non-adaptive overlapped redo writes\n", pid, comm);
+            printf("%ld %s           %s: write_sz=(%u, %u), tmo_msec=(%u, %u)\n", pid, comm, 
+                   ($kcrf_slave_info == 2 ? "using heuristic LGWR" : ""), $olrw->tgt_log_write_sz, $olrw->write_sz,
+                   $olrw->tgt_log_write_tmo, $olrw->tgt_log_write_tmo);
+        }
+
+    }
+    /* OLRW supported and enabled */
+    else {
+        printf("%ld %s    OLRW: adaptive overlapped redo writes %s:\n", pid, comm, ($kcrf_slave_info == 3 ? "using evaluative LGWR" : "")); 
+        printf("%ld %s          CPUs=%d, groups=%u, slaves=%u\n", pid, comm, @cpu_count[pid], $max_out_log_wr, ($tot_workers / $max_out_log_wr));
+
+        printf("%ld %s    OLRW: thin mode:\n", pid, comm); 
+        printf("%ld %s          wait_zone_start=(%u, %u)\n", pid, comm, @thin_cfg_p1[pid], $olrw->wait_zone_start);
+        printf("%ld %s          wait_min_sz=(%u, %u)\n", pid, comm, @thin_cfg_p2[pid], $olrw->wait_min_sz); 
+        printf("%ld %s          wait_max_sz=(%u, %u)\n", pid, comm, @thin_cfg_p3[pid], $olrw->wait_max_sz);  
+        printf("%ld %s          wait_min_tmo_usec=(%u, %u)\n", pid, comm, @thin_cfg_p4[pid], $olrw->wait_min_tmo_usec); 
+        printf("%ld %s          wait_max_tmo_usec=(%u, %u)\n", pid, comm, @thin_cfg_p5[pid], $olrw->wait_max_tmo_usec);
+
+        printf("%ld %s    OLRW: thick mode:\n", pid, comm); 
+        printf("%ld %s          fallback_zone_end=(%u, %u)\n", pid, comm, @thick_cfg_p1[pid], $olrw->fallback_zone_end); 
+        printf("%ld %s          overflow_zone_start=(%u, %u)\n", pid, comm, @thick_cfg_p2[pid], $olrw->overflow_zone_start); 
+        printf("%ld %s          thick_min_sz=(%u, %u)\n", pid, comm, @thick_cfg_p3[pid], $olrw->thick_min_sz); 
+        printf("%ld %s          thick_max_sz=(%u, %u)\n", pid, comm, @thick_cfg_p4[pid], $olrw->thick_max_sz); 
+        printf("%ld %s          thick_tmo_usec=(%u, %u)\n", pid, comm, $olrw->thick_tmo_usec, $olrw->thick_tmo_usec);
+
+        if ($olrw->flags & OLRW_FLG_REEVAL) {
+            printf("%ld %s    ORLW: Using evaluative LGWR with re-evaluation if switched to thick mode\n", pid, comm);
+        }
+
+        $stall_sz = (($olrw->write_sz * $olrw->poke_pct) / $max_strands) / 100;
+ 
+        $stall_sz = ($stall_sz < 1) ? 1 : $stall_sz; 
+
+        printf("%ld %s    OLRW: start with %s LGWR,\n", pid, comm, ($kcrf_fast_sync == 0 && $lgwr_mode ? "parallel" : "serial"));
+        printf("%ld %s          mode=%s, write_sz=%u, poke_pct=%u,\n", pid, comm, ($olrw->flags & OLRW_FLG_ENABLED) ? "thin" : "n/a", 
+               $olrw->write_sz, $olrw->poke_pct);
+        printf("%ld %s          (min per-strand) stall_sz=%u\n", pid, comm, $stall_sz);
+    }
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s    Verbose details:\n", pid, comm);
+        printf("%ld %s    max_strands = %u\n", pid ,comm, $max_strands);
+        printf("%ld %s    actv_strands = %u\n", pid ,comm, $actv_strands);
+        printf("%ld %s    lgwr_mode = %u (%s)\n", pid, comm, $lgwr_mode, ($lgwr_mode ? "parallel" : "serial"));
+
+        printf("%ld %s    olrw struct:\n", pid, comm);
+        printf("%ld %s      flags = 0x%x (%u%u%u%u%u%u%u%u)\n", pid, comm, $olrw->flags, 
+               $olrw->flags     & 0x80 ? 1 : 0,
+               $olrw->flags     & 0x40 ? 1 : 0,
+               $olrw->flags     & 0x20 ? 1 : 0,
+               $olrw->flags     & 0x10 ? 1 : 0,
+               $olrw->flags     & 0x08 ? 1 : 0,
+               $olrw->flags     & 0x04 ? 1 : 0,
+               $olrw->flags     & 0x02 ? 1 : 0,
+               $olrw->flags     & 0x01 ? 1 : 0);
+
+        printf("%ld %s      write_sz = %u\n", pid ,comm, $olrw->write_sz);
+        printf("%ld %s      stall_sz = %u\n", pid ,comm, $olrw->stall_sz);
+        printf("%ld %s      write_sz_prv = %u\n", pid ,comm, $olrw->write_sz_prv);
+        printf("%ld %s      poke_pct = %u\n", pid ,comm, $olrw->poke_pct);
+        printf("%ld %s      tgt_log_write_sz = %u\n", pid ,comm, $olrw->tgt_log_write_sz);
+        printf("%ld %s      tgt_log_write_tmo = %u\n", pid ,comm, $olrw->tgt_log_write_tmo);
+
+        printf("%ld %s      thin_p1 = %u\n", pid ,comm, $olrw->thin_p1);
+        printf("%ld %s      wait_zone_start = %u\n", pid ,comm, $olrw->wait_zone_start);
+        printf("%ld %s      thin_p2 = %u\n", pid ,comm, $olrw->thin_p2);
+        printf("%ld %s      wait_min_sz = %u\n", pid ,comm, $olrw->wait_min_sz);
+        printf("%ld %s      thin_p3 = %u\n", pid ,comm, $olrw->thin_p3);
+        printf("%ld %s      wait_max_sz = %u\n", pid ,comm, $olrw->wait_max_sz);
+        printf("%ld %s      thin_p4 = %u\n", pid ,comm, $olrw->thin_p4);
+        printf("%ld %s      wait_min_tmo_usec = %u\n", pid ,comm, $olrw->wait_min_tmo_usec);
+        printf("%ld %s      thin_p5 = %u\n", pid ,comm, $olrw->thin_p5);
+        printf("%ld %s      wait_max_tmo_usec = %u\n", pid ,comm, $olrw->wait_max_tmo_usec);
+
+        printf("%ld %s      thick_p1 = %u\n", pid ,comm, $olrw->thick_p1);
+        printf("%ld %s      fallback_zone_end = %u\n", pid ,comm, $olrw->fallback_zone_end );
+        printf("%ld %s      thick_p2 = %u\n", pid ,comm, $olrw->thick_p2);
+        printf("%ld %s      overflow_zone_start = %u\n", pid ,comm, $olrw->overflow_zone_start);
+        printf("%ld %s      thick_p3 = %u\n", pid ,comm, $olrw->thick_p3);
+        printf("%ld %s      thick_min_sz = %u\n", pid ,comm, $olrw->thick_min_sz);
+        printf("%ld %s      thick_p4 = %u\n", pid ,comm, $olrw->thick_p4);
+        printf("%ld %s      thick_max_sz = %u\n", pid ,comm, $olrw->thick_max_sz);
+        printf("%ld %s      thick_tmo_usec = %u\n", pid ,comm, $olrw->thick_tmo_usec);
+
+        printf("%ld %s      arbiter = %u\n", pid ,comm, $olrw->arbiter);
+        printf("%ld %s      opt_numgrps = %u\n", pid ,comm, $olrw->opt_numgrps);
+        printf("%ld %s      opt_grp_sz = %u\n", pid ,comm, $olrw->opt_grp_sz);
+    }
+
+    printf("%ld %s <- kcrfw_olrw_init_params\n\n", pid, comm);
+
+    delete(@in_trace[pid]);
+    delete(@cpu_count[pid]);
+
+    delete(@tgt_lw_sz_prm[pid]);
+    delete(@tgt_lw_sz_pct_poke_prm[pid]);
+    delete(@lgwr_thick_mode_cfg_prm[pid]);
+    delete(@use_single_log_writer_prm[pid]);
+
+    delete(@thin_cfg_p1[pid]);
+    delete(@thin_cfg_p2[pid]);
+    delete(@thin_cfg_p3[pid]);
+    delete(@thin_cfg_p4[pid]);
+    delete(@thin_cfg_p5[pid]);
+
+    delete(@thick_cfg_p1[pid]);
+    delete(@thin_cfg_p2[pid]);
+    delete(@thin_cfg_p3[pid]);
+    delete(@thin_cfg_p4[pid]);
+    delete(@thin_cfg_p5[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:ksb_cpu_count_static_nfy
+/ @in_trace[pid] /
+{
+    printf("%ld %s -> ksb_cpu_count_static_nfy\n", pid, comm);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:ksb_cpu_count_static_nfy
+/ @in_trace[pid] /
+{
+    @cpu_count[pid] = (uint32) retval;
+
+    printf("%ld %s <- ksb_cpu_count_static_nfy: %u\n", pid, comm, retval);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_olrw_parse_thin
+/ @in_trace[pid] /
+{
+    @p0[pid] = arg0;
+    @p1[pid] = arg1;
+    @p2[pid] = arg2;
+    @p3[pid] = arg3;
+    @p4[pid] = arg4;
+
+    printf("%ld %s -> kcrfw_olrw_parse_thin: %p, %p, %p, %p, %p\n", pid, comm, arg0, arg1, arg2, arg3, arg4); 
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_olrw_parse_thin
+/ @in_trace[pid] / 
+{
+    @thin_cfg_p1[pid] = *(uint32 *) @p0[pid];
+    @thin_cfg_p2[pid] = *(uint32 *) @p1[pid];
+    @thin_cfg_p3[pid] = *(uint32 *) @p2[pid];
+    @thin_cfg_p4[pid] = *(uint32 *) @p3[pid];
+    @thin_cfg_p5[pid] = *(uint32 *) @p4[pid];
+
+    printf("%ld %s    thin_cfg_p1 = %u\n", pid, comm, @thin_cfg_p1[pid]);
+    printf("%ld %s    thin_cfg_p2 = %u\n", pid, comm, @thin_cfg_p2[pid]);
+    printf("%ld %s    thin_cfg_p3 = %u\n", pid, comm, @thin_cfg_p3[pid]);
+    printf("%ld %s    thin_cfg_p4 = %u\n", pid, comm, @thin_cfg_p4[pid]);
+    printf("%ld %s    thin_cfg_p5 = %u\n", pid, comm, @thin_cfg_p5[pid]);
+
+    printf("%ld %s <- kcrfw_olrw_parse_thin\n", pid, comm); 
+
+    delete(@p0[pid]);
+    delete(@p1[pid]);
+    delete(@p2[pid]);
+    delete(@p3[pid]);
+    delete(@p4[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_olrw_parse_thick
+/ @in_trace[pid] /
+{
+    @p0[pid] = arg0;
+    @p1[pid] = arg1;
+    @p2[pid] = arg2;
+    @p3[pid] = arg3;
+    @p4[pid] = arg4;
+
+    printf("%ld %s -> kcrfw_olrw_parse_thick: %p, %p, %p, %p, %p\n", pid, comm, arg0, arg1, arg2, arg3, arg4); 
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_olrw_parse_thick
+/ @in_trace[pid] / 
+{
+    @thick_cfg_p1[pid] = *(uint32 *) @p0[pid];
+    @thick_cfg_p2[pid] = *(uint32 *) @p1[pid];
+    @thick_cfg_p3[pid] = *(uint32 *) @p2[pid];
+    @thick_cfg_p4[pid] = *(uint32 *) @p3[pid];
+    @thick_cfg_p5[pid] = *(uint32 *) @p4[pid];
+
+    printf("%ld %s    thick_cfg_p1 = %u\n", pid, comm, @thick_cfg_p1[pid]);
+    printf("%ld %s    thick_cfg_p2 = %u\n", pid, comm, @thick_cfg_p2[pid]);
+    printf("%ld %s    thick_cfg_p3 = %u\n", pid, comm, @thick_cfg_p3[pid]);
+    printf("%ld %s    thick_cfg_p4 = %u\n", pid, comm, @thick_cfg_p4[pid]);
+    printf("%ld %s    thick_cfg_p5 = %u\n", pid, comm, @thick_cfg_p5[pid]);
+
+    printf("%ld %s <- kcrfw_olrw_parse_thick\n", pid, comm); 
+
+    delete(@p0[pid]);
+    delete(@p1[pid]);
+    delete(@p2[pid]);
+    delete(@p3[pid]);
+    delete(@p4[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_olrw_stall_sz
+/ @in_trace[pid] /
+{
+    printf("%ld %s -> kcrfw_olrw_stall_sz: 0x%x\n", pid, comm, arg0);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_olrw_stall_sz
+/ @in_trace[pid] /
+{
+    printf("%ld %s <- kcrfw_olrw_stall_sz: 0x%x (%d)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kspges
+/ @in_trace[pid] && (arg0 == LGWR_THICK_MODE_CFG_PRM || arg0 == USE_SINGLE_LOG_WRITER_PRM || arg0 == TGT_LW_SZ_PCT_POKE_PRM) / 
+{
+    @in_kspges[pid] = 1; 
+    @p0[pid] = arg0;
+    $indx = arg0 - 1;
+    $param_p = *(uint64 **) (KSPTII + $indx * KSPTII_ELEM_SZ);
+
+    printf("%ld %s -> kspges: %u (%s)\n", pid, comm, arg0, str(uptr($param_p)));
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kspges
+/ @in_trace[pid] && @in_kspges[pid] / 
+{
+    if (@p0[pid] == LGWR_THICK_MODE_CFG_PRM) {
+        @lgwr_thick_mode_cfg_prm[pid] = retval;
+    }
+    else if (@p0[pid] == USE_SINGLE_LOG_WRITER_PRM) {
+        @use_single_log_writer_prm[pid] = retval;
+    }
+    else if(@p0[pid] == TGT_LW_SZ_PCT_POKE_PRM){
+        /* If poke_pct is not set at session level, use the default */
+        @tgt_lw_sz_pct_poke_prm[pid] = retval == 0 ? DEFAULT_POKE_PCT : retval;
+    }
+
+    printf("%ld %s <- kspges: 0x%x (%d)\n", pid, comm, retval, retval);
+
+    delete(@in_kspges[pid]);
+    delete(@p0[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kspgip
+/ @in_trace[pid] && (arg0 == TGT_LW_SZ_PCT_POKE_PRM || arg0 == TGT_LW_SZ) / 
+{
+    @in_kspgip[pid] = 1;
+    @p0[pid] = arg0;
+    $indx = arg0 - 1;
+    $param_p = *(uint64 **) (KSPTII + $indx * KSPTII_ELEM_SZ);
+
+    printf("%ld %s -> kspgip: %u (%s), %u \n", pid, comm, arg0, str(uptr($param_p)), arg1);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kspgip
+/ @in_trace[pid] && @in_kspgip[pid] / 
+{
+    /* Only set poke pct if not yet set */
+    if((@p0[pid] == TGT_LW_SZ_PCT_POKE_PRM) && !@tgt_lw_sz_pct_poke_prm[pid]){
+        @tgt_lw_sz_pct_poke_prm[pid] = retval;
+    } else if (@p0[pid] == TGT_LW_SZ) {
+        @tgt_lw_sz_prm[pid] = retval;
+    }
+
+    printf("%ld %s <- kspgip: 0x%x (%d)\n", pid, comm, retval, retval);
+
+    delete(@in_kspgip[pid]);
+    delete(@p0[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kspset0
+/ @in_trace[pid] && !@use_single_log_writer_prm[pid] /
+{
+    printf("%ld %s -> kspset0: %s, %s, 0x%lx, %s, ...\n", pid, comm, str(uptr(arg0)), str(uptr(arg1)), arg2, str(uptr(arg3)));
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kspset0
+/ @in_trace[pid] && !@use_single_log_writer_prm[pid] /
+{
+    printf("%ld %s <- kspset0\n", pid, comm);
+}
+
+END
+{
+    clear(@in_trace);
+    clear(@cpu_count);
+    clear(@tgt_lw_sz_prm);
+    clear(@tgt_lw_sz_pct_poke_prm);
+    clear(@lgwr_thick_mode_cfg_prm);
+    clear(@use_single_log_writer_prm);
+
+    clear(@p0);
+    clear(@p1);
+    clear(@p2);
+    clear(@p3);
+    clear(@p4);
+
+    clear(@thin_cfg_p1);
+    clear(@thin_cfg_p2);
+    clear(@thin_cfg_p3);
+    clear(@thin_cfg_p4);
+    clear(@thin_cfg_p5);
+
+    clear(@thick_cfg_p1);
+    clear(@thick_cfg_p2);
+    clear(@thick_cfg_p3);
+    clear(@thick_cfg_p4);
+    clear(@thick_cfg_p5);
+
+    clear(@in_kspges);
+    clear(@in_kspgip);
+
+    clear(@OPT_VERBOSE);
+    clear(@STR_SKIP);
+}
