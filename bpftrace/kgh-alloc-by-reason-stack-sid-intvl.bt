@@ -1,0 +1,77 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Trace kgh memory allocations by reason and print 
+ *   the call stacks leading to the allocations at re-
+ *   gular intervals. This can be helpful for analyzing 
+ *   memory leaks.
+ *
+ * Credits:
+ *   Based on the following scripts: 
+ *     - dtrace_kghal_pga_code.sh by Stefan Koehler:
+ *       https://github.com/skoehler-soocs/soocs-scripts/blob/main/Oracle_DTrace/dtrace_kghal_pga_code.sh
+ *     - trace_kghal.sh by Tanel Poder:
+ *       https://github.com/tanelpoder/tpt-oracle/blob/master/dtrace/trace_kghal.sh
+ *       
+ * Author:
+ *   Christoph Lutz
+ * 
+ * Date:
+ *   Nov-14 2025
+ *
+ * Tested on:
+ *   Oracle 19.27
+ *
+ * Usage:
+ *   BPFTRACE_CACHE_USER_SYMBOLS=1 ./kgh-alloc-by-reason-stack-sid-intvl.bt <oracle_sid> <reason_str> <interval>
+ *
+ * Example:
+ *   BPFTRACE_CACHE_USER_SYMBOLS=1 ./kgh-alloc-by-reason-stack-sid-intvl.bt "kol raw" 10
+ *
+ * Notes:
+ *   The script only probes kghalo, but can be changed
+ *   to also probe kghalf and kghalp, if needed (in that
+ *   case, note that the alloc reason is passed in arg5).
+ * 
+ *   Adjust the ORACLE_HOME path for your environment.
+ *
+ *   Use at your own risk!
+ */
+
+#define KSPSSIDST_ADDR 0x60009628
+
+BEGIN
+{
+    if ($# != 3) {
+        printf("\nUsage: kgh-alloc-by-reason-stack-sid-intvl.bt <oracle_sid> <reason_str> <interval>\n");
+        exit();
+    }
+
+    printf("\nTracing kgh calls ... Hit ^C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1927_1/bin/oracle:kghalo
+/ str(uptr(KSPSSIDST_ADDR)) == str($1)  / 
+{
+    /* Stack argument */
+    $rsp     = (uint64) reg("sp");
+    $reason  = *(uint64 *) ($rsp + 0x18);
+
+    if (str(uptr($reason)) == str($2)) {
+        @stack[comm,ustack()] = count();
+    }
+}
+
+interval:s:$3
+{
+    printf("***** %s *****\n\n", strftime("%H:%M:%S.%f", nsecs));
+    printf("Call stacks:\n");
+    printf("~~~~~~~~~~~~\n");
+    print(@stack);
+    clear(@stack);
+}
+
+END
+{
+    clear(@stack);
+}
