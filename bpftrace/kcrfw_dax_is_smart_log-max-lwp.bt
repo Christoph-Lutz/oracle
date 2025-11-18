@@ -1,0 +1,86 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ * Purpose:
+ *   Illustrate how kcrfw_dax_is_smart_log fixes the
+ *   max_log_write_parallelism to 1 when the Exadata
+ *   PMEM log is enabled (Exadata X8 and X9).
+ *
+ * Date:
+ *   Sep-08 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   PFTRACE_CACHE_USER_SYMBOLS=1 ./kcrfw_dax_is_smart_log.bt <oracle_sid> [<stacks>?
+ *
+ * Tested on:
+ *   Oracle 19.26 / Exadata 25.1.2
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *  
+ *   Use at your own risk!
+ */
+
+#define KSPSSIDST_ADDR       0x60009628  /* sid name                    */
+#define KCRF_LGWR_WRITE_CNT  0x60021f0c  /* lgwr write count            */
+#define KCRFWSLV_MAX_PAR_LW  0x60022274  /* max log write parallelism   */
+
+BEGIN
+{
+    if ($# < 1 || $# > 2) {
+        printf("\nUsage: BPFTRACE_CACHE_USER_SYMBOLS=1 ./kcrfw_dax_is_smart_log.bt <oracle_sid> [<stacks>?]\n\n");
+        exit();
+    }
+
+    if (str($2) == "yes" || str($2) == "y" || str($2) == "stacks") {
+        @OPT_STACKS = 1;
+    }
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrf_determine_storage
+/ str(uptr(KSPSSIDST_ADDR)) == str($1) /
+{
+    @in_trace[pid] = 1;
+    printf("%ld %s -> kcrf_determine_storage: %p, %p\n", pid, comm, arg0, arg1);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrf_determine_storage
+/ @in_trace[pid] /
+{
+    printf("%ld %s <- kcrf_determine_storage: 0x%lx (%d)\n\n", pid, comm, retval, retval);
+    delete(@in_trace[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_dax_is_smart_log
+/ @in_trace[pid] /
+{
+    @max_par_lw[pid] = *(uint32 *) uptr(KCRFWSLV_MAX_PAR_LW);
+
+    printf("%ld %s -> kcrfw_dax_is_smart_log: %p\n", pid, comm, arg0);
+
+    if(@OPT_STACKS) {
+        printf("%s\n", ustack());
+    }
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_dax_is_smart_log
+/ str(uptr(KSPSSIDST_ADDR)) == str($1) /
+{
+    $max_par_lw = *(uint32 *) uptr(KCRFWSLV_MAX_PAR_LW);
+
+    printf("%ld %s    max_log_write_parallelism: start=%u, end=%u\n", pid, comm, @max_par_lw[pid], $max_par_lw);
+    printf("%ld %s <- kcrfw_dax_is_smart_log: %d\n", pid, comm, retval);
+
+    delete(@max_par_lw[pid]);
+}
+
+END
+{
+    clear(@in_trace);
+    clear(@max_par_lw);
+    clear(@OPT_STACKS);
+}
