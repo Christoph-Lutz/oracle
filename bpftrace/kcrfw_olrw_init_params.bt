@@ -1,4 +1,4 @@
-#!/usr/bin/env -S bpftrace --no-warnings 
+#!/oraacfs/taaluch1/lsl/bpftrace/bpftrace.patched --no-warnings
 /*
  * Purpose:
  *   Trace initialization of the Overlapped Redo Write (OLRW)
@@ -351,7 +351,7 @@ uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_olrw_i
         }
 
         if ($thick_min_sz != @thick_cfg_p3[pid]) {
-            printf("%ld %s    OLRW: Minimum %scalculated starget size for all zones\n", pid, comm, ($thick_min_sz_calc ? "calulated " : "")); 
+            printf("%ld %s    OLRW: Minimum %sstarget size for all zones\n", pid, comm, ($thick_min_sz_calc ? "calulated " : "")); 
             printf("%ld %s          in thick mode adjusted from %u to %u\n", pid, comm, @thick_cfg_p3[pid], $thick_min_sz);
         }
 
