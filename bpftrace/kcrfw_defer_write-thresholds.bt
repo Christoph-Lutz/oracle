@@ -1,0 +1,447 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Show how lgwr computes the following thresholds with 
+ *   Pipelined Log Writes on Exadata (19.22+ and 23ai/26ai
+ *   on Exadata X10+).
+ *
+ *    write_sz:
+ *    Dynamically computed optimal log write size; lgwr
+ *    defers a redo write until the write_sz is reached
+ *    or the timeout expires (s. below).
+ * 
+ *    timeout:
+ *    How long lgwr waits for the optimal log write size
+ *    to accumulate in the log buffer (in us).
+ *
+ *    write_thresh: 
+ *    Threshold at which an FG posts lgwr to start writing.
+ *
+ * Date:
+ *   Nov-29 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./kcrfw_defer_write-thresholds.bt <oracle_sid> [<show_serial>?] [<verbose>?]
+ *
+ *   Arguments:
+ *     oracle_sid : name of oracle sid (mandatory) 
+ *     show_serial: Show output when lgwr is in serial mode.
+ *                  By default, the script only prints output
+ *                  when lgwr is in parallel mode (optional).
+ *     verbose    : Print verbose output (optional and usually
+ *                  not neeed).
+ *
+ * Tested on:
+ *   Oracle 19.26 / Exadata 25.1.7 (X10M)
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ * 
+ *   Use at your own risk!
+ *
+ * Background information:
+ *   With Pipelined Log Writes, lgwr transitions between
+ *   different modes and zones, in which write_sz, time-
+ *   out, and write_thresh are computed differently.
+ * 
+ *   The write_sz and timeout thresholds are computed by
+ *   lgwr in kcrfw_defer_write, whereas the write_thresh
+ *   is computed by the FGs in kcrfw_redo_gen_ext.
+ *
+ *   Serial mode:
+ *     stall_sz  = min(1MB/redo_block_sz, strand_sz/3)
+ *     write_sz  = stall_sz * kcrf_max_strands
+ *     timeout   = n/a
+ *     wr_thresh = write_sz * poke_pct/100 / kcrf_actv_strands
+ *
+ *     Note: poke_pct = _target_log_write_size_percent_for_poke
+ *   
+ *   Parallel/thin mode in no-wait zone:
+ *     write_sz  = 0 (fixed)
+ *     timeout   = 0 (fixed)
+ *     wr_thresh = 1 (fixed; FGs post lgwr after
+ *                    every redo buffer allocation)
+ *
+ *   Parallel/thin mode in wait zone:
+ *     In this mode, the write_sz and timeout thresholds
+ *     are computed based on the highest busy worker group,
+ *     the number of lg worker groups (_max_outstanding_log_writes),
+ *     and the parameters defined in _lgwr_thin_mode_config.
+ * 
+ *     write_sz:
+ *       step_inc = (max_write_sz - min_write_sz) /
+ *                  (max_outs_log_writes - wait_zone_start - 1)
+ * 
+ *       write_sz = min_write_sz + step_inc * (hi_busy_grp_num - wait_zone_start)
+ *
+ *     timeout: 
+ *       step_inc = (wait_max_tmo - wait_min_tmo) /  
+ *                  (max_outs_log_writes - wait_zone_start -1)
+ *
+ *       timeout  = wait_min_tmo + step_inc * (hi_busy_grp_num - wait_zone_start)
+ *
+ *     wr_thresh:  
+ *       1 (fixed; FGs post lgwr after every redo buffer alloation).
+ *
+ *   Parallel/thick mode in core zone:
+ *     write_sz  = write_sz - 64
+ *     timeout   = 1500 (fixed default from _lgwr_thick_mode_config)
+ *     wr_thresh = write_sz * 80/100 / active_strands
+ *                 (note: the ratio of 80/100 is hard-coded)
+ * 
+ *   Parallel/thick mode in overflow zone:
+ *     write_sz  = write_sz + 64
+ *     timeout   = 1500 (fixed default from _lgwr_thick_mode_config)
+ *     wr_thresh = write_sz * 80/100 / active_strands
+ *                 (note: the ratio of 80/100 is hard-coded)
+ */
+
+#include <stdint.h>
+
+/* Addresses and offsets my change in every RU!                                      */
+#define KSPSSIDST                  0x60009628  /* oracle sid name                    */
+
+#define KCRF_SLAVE_INFO            0x60022008  /* kcrf_slave_info_                   */
+#define KCRF_FAST_SYNC             0x60021f1c  /* kcrf_fast_sync_                    */
+#define KCRF_ACTV_STRANDS          0x60021ea0  /* kcrf_actv_strands_                 */
+#define KCRF_MAX_STRANDS           0x60021e90  /* kcrf_max_strands_                  */
+#define KCRF_OLRW_ENABLED          0x3         /* olrw enabled (kcrf_slave_info_)    */
+
+#define KLASSVP7                   0x6005dc00  /* klassvp7_: alwe info               */
+#define KLASSVP8                   0x6005dc08  /* klassvp8_: olrw info               */
+
+#define KCRFWSLV_LGWR_MODE         0x6002200c  /* lgwr mode (0=serial, 1=parallel)   */
+#define KCRFWSLV_MAX_OUT_LOG_WRI   0x6002202c  /* max_outstanding_log_writes         */
+
+#define ALWE_FLG_NORMAL_PHASE      0x1         /* alwe normal phase                  */
+#define ALWE_FLG_EVAL_PHASE        0x2         /* alwe evaluation phase              */
+#define ALWE_FLG_LFS               0x10        /* alwe log file sync adj             */
+#define ALWE_MIN_WRITE_THRESH      0x20        /* alwe minimum write threshold (32)  */
+
+#define OLRW_FLG_ENABLED           0x1         /* olrw enabled                       */
+#define OLRW_FLG_THICK_MODE        0x4         /* olrw thick mode                    */
+
+#define SKIP_KCRF_FAST_SYNC        0x1         /* fast sync                          */
+#define SKIP_KCRF_SLAVE_INFO_OLRW  0x2         /* olwr enabled                       */
+#define SKIP_MAX_OUT_LOG_WRI       0x3         /* max outstanding lgwr writes < 2    */
+
+struct alwe_info {
+    uint32_t eval_intvl_us;                    /* klassvp7[0]                        */
+    uint32_t blocks_per_sec;                   /* klassvp7[1]                        */
+    uint64_t epoch_ts_prv;                     /* klassvp7[2]                        */
+    uint64_t normal_writes;                    /* klassvp7[4]                        */
+    uint32_t seqno;                            /* klassvp7[6]                        */
+    uint32_t eval_fraction;                    /* klassvp7[7]                        */
+    int64_t  eval_writes;                      /* klassvp7[8]                        */
+    uint64_t blocks;                           /* klassvp7[10]                       */
+    int64_t  blocks_fraction;                  /* klassvp7[12]                       */
+    uint64_t pic_start;                        /* klassvp7[14]                       */
+    uint64_t ow_blocks;                        /* klassvp7[16]                       */
+    uint64_t tot_blocks;                       /* klassvp7[18]                       */
+    uint64_t tot_time;                         /* klassvp7[20]                       */
+    uint64_t epoch_ts;                         /* klassvp7[22]                       */
+    uint32_t unknown1;                         /* klassvp7[24]                       */
+    uint32_t unknown2;                         /* klassvp7[25]                       */
+    uint32_t unknown3;                         /* klassvp7[26]                       */
+    uint32_t unknown4;                         /* klassvp7[27]                       */
+    uint32_t lfs_factor;                       /* klassvp7[28]                       */
+    int32_t  anomalies;                        /* klassvp7[29]                       */
+    int32_t  ol_writes;                        /* klassvp7[30]                       */
+    int32_t  flags;                            /* klassvp7[31]                       */
+};
+
+struct olrw_info {
+    uint32_t flags;                            /* klassvp8[0]                        */
+    uint32_t write_sz;                         /* klassvp8[1]                        */
+    uint32_t stall_sz;                         /* klassvp8[2]                        */ 
+    uint32_t write_sz_prv;                     /* klassvp8[3]                        */ 
+    uint32_t poke_pct;                         /* klassvp8[4]                        */ 
+    uint32_t tgt_log_write_sz;                 /* klassvp8[5]                        */
+    uint32_t tgt_log_write_tmo;                /* klassvp8[6]                        */
+    uint32_t thin_p1;                          /* klassvp8[7]                        */
+    uint32_t wait_zone_start;                  /* klassvp8[8]                        */
+    uint32_t thin_p2;                          /* klassvp8[9]                        */
+    uint32_t wait_min_sz;                      /* klassvp8[10]                       */
+    uint32_t thin_p3;                          /* klassvp8[11]                       */
+    uint32_t wait_max_sz;                      /* klassvp8[12]                       */
+    uint32_t thin_p4;                          /* klassvp8[13]                       */
+    uint32_t wait_min_tmo_usec;                /* klassvp8[14]                       */
+    uint32_t thin_p5;                          /* klassvp8[15]                       */
+    uint32_t wait_max_tmo_usec;                /* klassvp8[16]                       */
+    uint32_t thick_p1;                         /* klassvp8[17]                       */
+    uint32_t fallback_zone_end;                /* klassvp8[18]                       */
+    uint32_t thick_p2;                         /* klassvp8[19]                       */ 
+    uint32_t overflow_zone_start;              /* klassvp8[20]                       */
+    uint32_t thick_p3;                         /* klassvp8[21]                       */
+    uint32_t thick_min_sz;                     /* klassvp8[22]                       */
+    uint32_t thick_p4;                         /* klassvp8[23]                       */
+    uint32_t thick_max_sz;                     /* klassvp8[24]                       */
+    uint32_t thick_tmo_usec;                   /* klassvp8[25]                       */
+    uint32_t arbiter;                          /* klassvp8[26]                       */
+    uint32_t opt_numgrps;                      /* klassvp8[27]                       */
+    uint32_t opt_grp_sz;                       /* klassvp8[28]                       */
+};
+
+BEGIN
+{
+    if ($# < 1 || $# > 4) {
+        printf("\nUsage: ./kcrfw_defer-write-thresholds.bt <oracle_sid> [<page_lines>?] [<show_serial>?] [<verbose>?]\n");
+        exit();
+    }
+
+    if ($2 > 1) {
+        @OPT_LINES = $2;
+    }
+    
+    if (str($3) == "yes" || str($3) == "y" || str($3) == "show_serial") {
+        @OPT_SERIAL = 1;
+    }
+
+    if (str($4) == "yes" || str($4) == "y" || str($4) == "verbose") {
+        @OPT_VERBOSE = 1;
+    }
+
+    @STR_SKIP[SKIP_KCRF_FAST_SYNC]       = "fast sync active";
+    @STR_SKIP[SKIP_KCRF_SLAVE_INFO_OLRW] = "olrw not enabled";
+    @STR_SKIP[SKIP_MAX_OUT_LOG_WRI]      = "max out log wries < 2";
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_defer_write
+/ str(uptr(KSPSSIDST)) == str($1) /
+{
+    @in_trace[pid]     = 1;
+    $olrw              = *(struct olrw_info **) uptr(KLASSVP8);
+    @write_sz_beg[pid] = $olrw->write_sz;
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_defer_write
+/ @in_trace[pid] / 
+{
+
+    $alwe = *(struct alwe_info **) uptr(KLASSVP7); 
+    $olrw = *(struct olrw_info **) uptr(KLASSVP8);
+
+    @fast_sync[pid]       = *(uint32 *) uptr(KCRF_FAST_SYNC);
+    @kcrf_slave_info[pid] = *(uint32 *) uptr(KCRF_SLAVE_INFO);
+    @max_strands[pid]     = *(uint32 *) uptr(KCRF_MAX_STRANDS);
+    @actv_strands[pid]    = *(uint32 *) uptr(KCRF_ACTV_STRANDS);
+    @max_out_lw[pid]      = *(uint32 *) uptr(KCRFWSLV_MAX_OUT_LOG_WRI);
+    @lgwr_mode[pid]       = *(uint32 *) uptr(KCRFWSLV_LGWR_MODE);
+    @thick_mode[pid]      = ($olrw->flags & OLRW_FLG_THICK_MODE) ? OLRW_FLG_THICK_MODE : 0;
+    @wr_thresh[pid]       = $olrw->write_sz * $olrw->poke_pct/100 / @actv_strands[pid];
+    @wr_thresh_adj[pid]   = @wr_thresh[pid] ? @wr_thresh[pid] : 1;
+
+    /* Check phase */
+    if ($alwe->flags & ALWE_FLG_NORMAL_PHASE) {
+        $phase = "normal"
+    } 
+    else if ($alwe->flags & ALWE_FLG_EVAL_PHASE) {
+        $phase = "evaluation";
+    }
+    else {
+        $phase = "n/a";
+    }
+
+    /*
+     * In thin mode, the write_sz and timeout
+     * are not stored in the olrw structure,
+     * but calculated at runtime.
+     * So, we must calculate them here as well
+     * and store them in a map to keep track
+     * of changes over time. Note that the 
+     * timeout is only calculated in the wait
+     * zone when thin mode is active.
+     */
+    if (!@thick_mode[pid]) {
+        /* Thin mode wait zone */
+        if ((@hi_busy_grp_num[pid] != (-1)) &&
+            ($olrw->wait_zone_start <= @hi_busy_grp_num[pid]))
+        {
+            /* Stay in thin mode */
+            if ($olrw->arbiter <= 2) {
+                if (($olrw->wait_zone_start + 1) == @max_out_lw[pid]) {
+                    $tmo_inc = 0;
+                    $write_sz_inc = 0;
+                }
+                else {
+                    $tmo_inc = ($olrw->wait_max_tmo_usec - $olrw->wait_min_tmo_usec) /
+                               ((@max_out_lw[pid] - $olrw->wait_zone_start) - 1);
+
+                    $write_sz_inc = ($olrw->wait_max_sz - $olrw->wait_min_sz) /
+                                    ((@max_out_lw[pid] - $olrw->wait_zone_start) - 1)
+                }
+
+                $timeout = ((@hi_busy_grp_num[pid] - $olrw->wait_zone_start) * $tmo_inc + $olrw->wait_min_tmo_usec);
+                $t_diff = (int32) ($timeout - @timeout_prv[pid]);
+
+                /* 
+                 * In thick mode, the w_diff is the difference
+                 * between the end and start value, as Oracle
+                 * writes the computed write_sz back into the 
+                 * olrw struct when the function returns.
+                 * However, in thin mode, Oracle sets the
+                 * write_sz in the olrw struct to 0 and com-
+                 * putes the the write_sz at runtime, so we
+                 * need to store the computed write_sz value
+                 * in the write_sz_prv map to track it across
+                 * function calls.
+                 */
+                $write_sz = ((@hi_busy_grp_num[pid] - $olrw->wait_zone_start) * $write_sz_inc + $olrw->wait_min_sz);
+                $w_diff = (@write_sz_prv[pid]) ? (int32) ($write_sz - @write_sz_prv[pid]) : 0;
+            }
+            /* Switch to thick mode */
+            else {
+                $timeout = $olrw->thick_tmo_usec;
+                $t_diff = 0;
+                $write_sz = $olrw->write_sz;
+                $w_diff = 0;
+            }
+        }
+        /* Thin mode nowait zone */
+        else {
+            $timeout = 0;
+            $t_diff = 0;
+            $write_sz = $olrw->write_sz;
+            $w_diff = 0;
+        }
+    }
+    /* Thick mode */
+    else {
+        $timeout = 0;
+        $t_diff = 0;
+        $write_sz = $olrw->write_sz;
+        $w_diff = (int32) ($olrw->write_sz - @write_sz_beg[pid]);
+    }
+
+    @timeout_prv[pid] = $timeout;
+    @write_sz_prv[pid] = $write_sz;
+
+    /*
+     * Prereqs:
+     * If they are not met and verbose mode is
+     * not enabled, do not print any output.
+     */
+    $skip = 0;
+    if (@fast_sync[pid]) {
+        $skip = SKIP_KCRF_FAST_SYNC;
+    }
+
+    if (!$skip && (@kcrf_slave_info[pid] != KCRF_OLRW_ENABLED)) {
+        $skip = SKIP_KCRF_SLAVE_INFO_OLRW;
+    }
+ 
+    if (!$skip && @max_out_lw[pid] < 2) {
+        $skip = SKIP_MAX_OUT_LOG_WRI;
+    }
+
+    if($skip && @OPT_VERBOSE) {
+        printf("Skip: reason: %s\n", @STR_SKIP[$skip]);
+    }
+    else {
+        /* Print header every nth lines */
+        if ((!@lines[pid]) || (@OPT_LINES > 1 && @lines[pid] > 1 && (@lines[pid] % @OPT_LINES == 0))) {
+            printf("\n%-26s %-10s %-9s %-9s %9s %10s %8s %6s %6s %7s %6s %8s %11s %12s %9s\n",
+                  "TIME", "PHASE", "LGWR_MODE", "OLRW_MODE", "ARBITER", "HI_BSY_GRP", "WRITE_SZ", "W_DIFF", 
+                  "W_TGT?", "TIMEOUT", "T_DIFF", "POKE_PCT", "MAX_STRANDS", "ACT_STRANDS", "WR_THRESH");
+
+            @lines[pid]++;
+        }
+
+        /* 
+         * Serial mode: 
+         * Only print serial mode output if 
+         * explicitly requested.
+         */
+        if (!@lgwr_mode[pid] && @OPT_SERIAL) {
+            printf("%-26s %-10s %-9s %-9s %9s %10s %8u %6s %-6s %7s %6s %8u %11u %12u %9u\n",
+                  strftime("%Y-%m-%d %H:%M:%S.%f", nsecs), $phase, (@lgwr_mode[pid] ? "parallel" : "serial"), 
+                  "n/a", "n/a", "n/a", $olrw->write_sz, "n/a", "n/a", "n/a", "n/a", $olrw->poke_pct, @max_strands[pid], 
+                  @actv_strands[pid], @wr_thresh_adj[pid]);
+
+            @lines[pid]++;
+
+        }
+        /* Parallel mode */
+        else if (@lgwr_mode[pid]) {
+            printf("%s ", strftime("%Y-%m-%d %H:%M:%S.%f", nsecs));
+
+            printf("%-10s %-9s %-9s %9u %10d %8u %6d %-6s %7d %6d %8u %11u %12u %9u\n",
+                  $phase, (@lgwr_mode[pid] ? "parallel" : "serial"), (@thick_mode[pid] ? "thick" : "thin"), 
+                  $olrw->arbiter, @hi_busy_grp_num[pid], $write_sz, $w_diff, (@is_target_sz[pid] ? "yes" : "no"), 
+                  $timeout, $t_diff, $olrw->poke_pct, @max_strands[pid], @actv_strands[pid], @wr_thresh_adj[pid]);
+
+            @lines[pid]++;
+        }
+    }
+
+    delete(@in_trace[pid]);
+    delete(@write_sz_beg[pid]);
+    delete(@write_sz_prv[pid]);
+    delete(@fast_sync[pid]);
+    delete(@kcrf_slave_info[pid]);
+    delete(@max_strands[pid]);
+    delete(@actv_strands[pid]);
+    delete(@max_out_lw[pid]);
+    delete(@lgwr_mode[pid]);
+    delete(@thick_mode[pid]);
+    delete(@wr_thresh[pid]);
+    delete(@wr_thresh_adj[pid]);
+    delete(@hi_busy_grp_checks[pid]);
+    delete(@hi_busy_grp_num[pid]);
+    delete(@is_target_sz[pid]);
+}
+
+/* 
+ * Note: 
+ * Only trace the first call to kcrfw_slave_queue_hi_busy_group
+ * (when it is called on kcrfw_defer_write function entry).
+ */
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_slave_queue_hi_busy_group
+/ @in_trace[pid] && !@hi_busy_grp_checks[pid] /
+{
+    @hi_busy_grp_checks[pid]++;
+    @hi_busy_grp_num[pid] = (int32) retval;
+}
+
+/* 
+ * Note: 
+ * Oracle may call kcrfw_is_target_size multiple
+ * times in the kcrfw_defer_write wait loop. 
+ * However, we are only interested in the last
+ * result.
+ */
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_is_target_size
+/ @in_trace[pid] /
+{
+    @is_target_sz[pid] = retval ? 1 : 0;
+}
+
+END
+{
+    clear(@in_trace);
+    clear(@write_sz_beg);
+    clear(@write_sz_prv);
+    clear(@timeout_prv);
+    clear(@fast_sync);
+    clear(@kcrf_slave_info);
+    clear(@max_strands);
+    clear(@actv_strands);
+    clear(@max_out_lw);
+    clear(@lgwr_mode);
+    clear(@thick_mode);
+    clear(@wr_thresh);
+    clear(@wr_thresh_adj);
+    clear(@hi_busy_grp_checks);
+    clear(@hi_busy_grp_num);
+    clear(@is_target_sz);
+    clear(@lines);
+    clear(@STR_SKIP);
+    clear(@OPT_LINES);
+    clear(@OPT_SERIAL);
+    clear(@OPT_VERBOSE);
+}
