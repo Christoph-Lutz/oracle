@@ -1,0 +1,76 @@
+#!/usr/bin/env -S bpftrace --no-warning
+/*
+ *  Purpose:
+ *    Trace aio syscall latencies and print a histogram showing
+ *    the latency distribution every second.
+ *
+ * Date:
+ *   Sep-24 2025
+ *
+ *  Author:
+ *    Christoph Lutz
+ * 
+ *  Usage: 
+ *    ./aio-hist.bt
+ *
+ *  Notes: 
+ *    This script is potentially dangerous, use at your own risk!
+ */
+
+BEGIN
+{
+    printf("\nTracing aio syscalls ... Hit ^C to stop.\n\n");
+}
+
+tracepoint:syscalls:sys_enter_io_submit
+{
+    @io_submit_start[tid] = nsecs;
+    @io_submit_tot++;
+
+    @nr[tid] = args->nr;
+    @nr_tot++;
+}
+
+tracepoint:syscalls:sys_exit_io_submit
+/ @io_submit_start[tid] /
+{
+    $io_submit_us = (nsecs - @io_submit_start[tid] ) / 1e3;
+
+    @io_submit_us_tot += $io_submit_us;
+    @io_submit_hist = hist($io_submit_us);
+    @nr_hist = hist(@nr[tid]);
+
+    delete(@io_submit_start[tid]);
+}
+
+interval:s:1
+{
+    $io_submit_avg_us = @io_submit_us_tot / @io_submit_tot;
+    $nr_avg = @nr_tot / @io_submit_tot;
+
+    printf("\n*** %s\n", strftime("%Y-%m-%dT%H:%M:%S", nsecs));
+    printf("io_submit requests: %ld\n", @io_submit_tot);
+    printf("io_submit avg (us): %ld\n", $io_submit_avg_us);
+    printf("nr avg: %ld\n", $nr_avg);
+
+    printf("\nio_submit latency histogram (us):\n");
+    print(@io_submit_hist);
+
+    printf("request count histogram (nr):\n");
+    print(@nr_hist);
+
+    clear(@io_submit_tot);
+    clear(@io_submit_hist);
+    clear(@nr_tot);
+    clear(@nr_hist);
+}
+
+END
+{
+    clear(@io_submit_tot);
+    clear(@io_submit_us_tot);
+    clear(@io_submit_hist);
+    clear(@nr_hist);
+    clear(@nr);
+    clear(@nr_tot);
+}
