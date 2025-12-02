@@ -34,10 +34,10 @@ tracepoint:syscalls:sys_enter_io_submit
 tracepoint:syscalls:sys_exit_io_submit
 / @io_submit_start[tid] /
 {
-    $io_submit_us = (nsecs - @io_submit_start[tid] ) / 1e3;
+    @io_submit_us[tid] = (uint64) (nsecs - @io_submit_start[tid] ) / 1e3;
 
-    @io_submit_us_tot += $io_submit_us;
-    @io_submit_hist = hist($io_submit_us);
+    @io_submit_us_tot += @io_submit_us[tid];
+    @io_submit_hist = hist(@io_submit_us[tid]);
     @nr_hist = hist(@nr[tid]);
 
     delete(@io_submit_start[tid]);
@@ -59,6 +59,8 @@ interval:s:1
     printf("request count histogram (nr):\n");
     print(@nr_hist);
 
+    clear(@io_submit_us);
+    clear(@io_submit_us_tot);
     clear(@io_submit_tot);
     clear(@io_submit_hist);
     clear(@nr_tot);
@@ -67,8 +69,9 @@ interval:s:1
 
 END
 {
-    clear(@io_submit_tot);
+    clear(@io_submit_us);
     clear(@io_submit_us_tot);
+    clear(@io_submit_tot);
     clear(@io_submit_hist);
     clear(@nr_hist);
     clear(@nr);
