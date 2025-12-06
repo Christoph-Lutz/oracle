@@ -1,4 +1,4 @@
-#!/usr/bin/env -S bpftrace --no-warnings
+#!/oraacfs/taaluch1/lsl/bpftrace/bpftrace.patched --no-warnings 
 /*
  * Purpose:
  *   Show how lgwr computes the following thresholds with 
@@ -312,7 +312,7 @@ uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_defer_
     }
     /* Thick mode */
     else {
-        $timeout = 0;
+        $timeout = $olrw->thick_tmo_usec;
         $t_diff = 0;
         $write_sz = $olrw->write_sz;
         $w_diff = (int32) ($olrw->write_sz - @write_sz_beg[pid]);
