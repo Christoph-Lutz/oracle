@@ -24,13 +24,16 @@
 #
 # Usage:
 #   gdb -q                                \
-#   -ex 'set $p_hi_busy_grp_num = <num>]' \
+#   -ex 'set $p_hi_busy_grp_num = <num>]  \
+#   [-ex 'set $p_actv_strands = <num>]    \
 #   -x olrw-sim-hi_busy_grp_num.gdb       \
 #   -p <lgwr_pid>
 #
-#    Set hi_busy_grp_num to 5:
+#    Set hi_busy_grp_num to 7 and the
+#    number of active strands to 4:
 #     gdb -q                              \
-#     -ex 'set $p_hi_busy_grp_num=5'      \
+#     -ex 'set $p_hi_busy_grp_num=7'      \
+#     -ex 'set $p_actv_strands=4          \
 #     -x olrw-sim-hi_busy_grp_num.gdb     \
 #     -p 1234 
 #
@@ -53,15 +56,16 @@ set pagination off
 handle SIGSEGV nostop noprint
 handle SIGUSR2 nostop noprint
 
-set $ALWE             = (uint64_t) klassvp7_
-set $ALWE_FLAGS       = ($ALWE + 124)
+set $ALWE              = (uint64_t) klassvp7_
+set $ALWE_FLAGS        = ($ALWE + 124)
 
-set $OLRW             = (uint64_t) klassvp8_
-set $OLRW_TRC         = 0x8
-set $OLRW_TRC_VERBOSE = 0x10 
+set $OLRW              = (uint64_t) klassvp8_
+set $OLRW_TRC          = 0x8
+set $OLRW_TRC_VERBOSE  = 0x10 
 
-set $LGWR_MODE        = 0x6002200c
-set $MAX_LOG_WRI_PAR  = 0x6002202c
+set $LGWR_MODE         = 0x6002200c
+set $MAX_LOG_WRI_PAR   = 0x6002202c
+set $KCRF_ACTV_STRANDS = 0x60021ea0
 
 printf "\n"
 printf "alwe->flags     = 0x%x\n", *(uint32_t *) $ALWE_FLAGS
@@ -81,9 +85,17 @@ if (!((*(uint32_t *) $OLRW) & $OLRW_TRC_VERBOSE))
     printf "olrw->flags = 0x%x\n", *(uint32_t *) $OLRW
 end
 
-break kcrfw_defer_write
+# Note: Break on offset +2 so that the function
+# can be probed by bpftrace at the same time.
+break *kcrfw_defer_write+2
 command 1
     printf "-> kcrfw_defer_write\n"
+    if ($p_actv_strands) 
+        printf "   Changing kcrf_actv_strands to: %u\n", *(uint32_t * ) $KCRF_ACTV_STRANDS
+        set *(uint32_t *) $KCRF_ACTV_STRANDS = $p_actv_strands
+        printf "   Changed kcrf_actv_strands to: %u\n", *(uint32_t * ) $KCRF_ACTV_STRANDS
+    end
+
     if (! *(uint32_t *) $LGWR_MODE)
         printf "   lgwr_mode is serial, changing to parallel\n"
         set *(uint32_t *) $LGWR_MODE = 1
@@ -92,7 +104,9 @@ command 1
     continue
 end
 
-break kcrfw_slave_queue_hi_busy_group
+# Note: Break on offset +2 so that the function
+# can be probed by bpftrace at the same time.
+break *kcrfw_slave_queue_hi_busy_group+2
 command 2
     printf "-> kcrfw_slave_queue_hi_busy_goup\n"
     continue
