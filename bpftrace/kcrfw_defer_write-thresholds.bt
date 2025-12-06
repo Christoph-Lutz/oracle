@@ -1,4 +1,4 @@
-#!/oraacfs/taaluch1/lsl/bpftrace/bpftrace.patched --no-warnings 
+#!/usr/bin/env -S bpftrace --no-warning
 /*
  * Purpose:
  *   Show how lgwr computes the following thresholds with 
