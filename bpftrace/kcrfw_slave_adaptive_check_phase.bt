@@ -1,0 +1,794 @@
+#!/oraacfs/taaluch1/lsl/bpftrace/bpftrace.patched --no-warnings 
+/*
+ * Purpose:
+ *   Show how the Oracle lgwr transitions between the normal
+ *   and evaluation phases with Pipelined Log Writes on Exadata.
+ *
+ *   Pipelined Log Writes are available on Exadata X10M+ with
+ *   releases 19.22+ or 23ai/26ai.
+ *
+ *   The script provides similar information to what lgwr trace
+ *   event 10468 prints at levels 0x400 and 0x800 (1024 and 2048). 
+ *
+ * Date:
+ *   Sep-21 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./kcrfw_slave_adaptive_check_phase.bt <oracle_sid>
+ *
+ * Tested on:
+ *   Oracle 19.26 / Exadata 25.1.7
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ * 
+ *   Use at your own risk!
+ *
+ * Background information:
+ *   With Pipelined Log Writes on Exadata, lgwr transitions
+ *   automatically between the following phases at runtime:
+ *
+ *     Normal phase:
+ *     In this phase, lgwr measures the number of redo 
+ *     blocks written and uses it to calculate the average 
+ *     redo rate per second. Based on the redo rate, it calc-
+ *     ulates an "evaluation fraction" that determines how 
+ *     long the evaluation phase will run (s. below). The 
+ *     evaluation fraction is 1% of the total number of redo 
+ *     blocks written during the normal phase (default defined 
+ *     by _adaptive_scalable_log_writer_evaluation_fraction).
+ * 
+ *     Evaluation phase:
+ *     Every 15 sec, lgwr transitions to the evaluation phase
+ *     and measures the average redo rate until the total
+ *     number of redo blocks written during the evaluation 
+ *     phase reaches the number of blocke defined by the
+ *     evaluation fraction (as calculated during the normal 
+ *     phase).
+ * 
+ *  The normal and evaluation phase redo rates are measured when
+ *  lgwr runs in serial or parallel mode. A switch from one mode
+ *  to the other occurs when the average redo rate measured during 
+ *  evaluation exceeds or falls below the redo rate measured.
+ *
+ *  This means, lgwr goes through the following phase and mode 
+ *  transitions:
+ *
+ *    normal/serial -> evaluation/parallel:
+ *    A transition from normal/serial to evaluation/parallel
+ *    occurs every 15 sec.
+ *
+ *    evaluation/parallel -> normal/parallel:
+ *    lgwr switches from evaluation/parallel to normal/parallel 
+ *    if: evaluation_rate > normal_rate
+ *
+ *    normal/parallel -> evaluation/serial:
+ *    A transition from normal/parallel to evaluation/serial
+ *    occurs every 15 sec.
+ * 
+ *    evaluation/serial -> normal/serial
+ *    lgwr switches from evaluation/serial to normal/serial
+ *    if: evaluation_rate < normal_rate
+ */
+
+#include <stdint.h>
+
+/* Addresses and offsets my change in every RU!                                     */
+#define KSPSSIDST                  0x60009628  /* oracle sid name                   */
+
+#define KCRF_SLAVE_INFO            0x60022008  /* kcrf_slave_info_                  */
+#define KCRF_FAST_SYNC             0x60021f1c  /* kcrf_fast_sync_                   */
+#define KCRF_MAX_STRANDS           0x60021e90  /* kcrf_max_strands_                 */
+
+#define KCRFS_SEQNO                0x600217f8  /* current seqno in kcrfsg_          */
+
+#define KCRFPIC_BLKS_OFF           0xd0        /* kcrfspic blocks offset            */
+
+#define KLASSVP7                   0x6005dc00  /* klassvp7_: alwe info              */
+#define KLASSVP8                   0x6005dc08  /* klassvp8_: olrw info              */
+#define KLASSVU1                   0x6005df90  /* klassvu1_                         */
+
+#define KCRFWSLV_LGWR_MODE         0x6002200c  /* lgwr mode (0=serial, 1=parallel)  */
+#define KCRFWSLV_STDBY_MODE        0x60022010  /* lgwr stdby mode (0=no, 1=yes)     */
+#define KCRFWSLV_MAX_LOG_WRITE_PAR 0x60022274  /* max_log_write_parallelism         */
+#define KCRFWSLV_MAX_OUT_LOG_WRI   0x6002202c  /* max_outstanding_log_writes        */
+#define KCRFWSLV_MY_INFO_TLS_OFF   0xec80      /* kcrfw_slave_my_info tls offset    */ 
+
+#define ALWE_FLG_NORMAL_PHASE      0x1         /* alwe normal phase                 */
+#define ALWE_FLG_EVAL_PHASE        0x2         /* alwe evaluation phase             */
+#define ALWE_FLG_LFS               0x10        /* alwe log file sync adj            */
+#define ALWE_MIN_WRITE_THRESH      0x20        /* alwe minimum write threshold (32) */
+
+#define OLRW_FLG_ENABLED           0x3         /* olrw enabled                      */
+
+#define KSUSE_TLS_OFF              0xff78      /* ksuse tls offset                  */
+#define KSUSE_STATS_OFF            0x7f8       /* ksuse stats array offset          */
+
+#define REDO_BLOCK_SIZE            512         /* redo block size                   */
+
+#define STA_REDO_WRI_ADAPT_ALL     329         /* redo writes adaptive all          */
+#define STA_REDO_WRI_ADAPT_WRKR    330         /* redo writes adaptive worker       */
+
+#define SKIP_KCRF_FAST_SYNC        0x1         /* fast sync                         */
+#define SKIP_KCRF_SLAVE_INFO_OLRW  0x2         /* olwr enabled                      */
+#define SKIP_KCRFWSLV_STDBY_MODE   0x3         /* lgwr standby mode                 */
+#define SKIP_KCRFSPIC_BLKS         0x4         /* kcrfspic.blks empty               */
+
+struct alwe_info {
+    uint32_t eval_intvl_us;                    /* klassvp7[0]                       */
+    uint32_t blocks_per_sec;                   /* klassvp7[1]                       */
+    uint64_t epoch_ts_prv;                     /* klassvp7[2]                       */
+    uint64_t normal_writes;                    /* klassvp7[4]                       */
+    uint32_t seqno;                            /* klassvp7[6]                       */
+    uint32_t eval_fraction;                    /* klassvp7[7]                       */
+    int64_t  eval_writes;                      /* klassvp7[8]                       */
+    uint64_t blocks;                           /* klassvp7[10]                      */
+    int64_t  blocks_fraction;                  /* klassvp7[12]                      */
+    uint64_t pic_start;                        /* klassvp7[14]                      */
+    uint64_t ow_blocks;                        /* klassvp7[16]                      */
+    uint64_t tot_blocks;                       /* klassvp7[18]                      */
+    uint64_t tot_time;                         /* klassvp7[20]                      */
+    uint64_t epoch_ts;                         /* klassvp7[22]                      */
+    int32_t  unknown1;                         /* klassvp7[24]                      */
+    int32_t  unknown2;                         /* klassvp7[25]                      */
+    int32_t  unknown3;                         /* klassvp7[26]                      */
+    int32_t  unknown4;                         /* klassvp7[27]                      */
+    uint32_t lfs_factor;                       /* klassvp7[28]                      */
+    int32_t  anomalies;                        /* klassvp7[29]                      */
+    int32_t  ol_writes;                        /* klassvp7[30]                      */
+    int32_t  flags;                            /* klassvp7[31]                      */
+};
+
+BEGIN
+{
+    if ($# < 1 || $# > 2) {
+        printf("\nUsage: ./kcrfw_slave_adaptive_check_phase.bt <oracle_sid> [<verbose>?]\n");
+        exit();
+    }
+
+    if (str($2) == "yes" || str($2) == "y" || str($2) == "verbose") {
+        @OPT_VERBOSE = 1;
+    }
+
+    @STR_SKIP[SKIP_KCRF_FAST_SYNC]       = "fast sync active";
+    @STR_SKIP[SKIP_KCRF_SLAVE_INFO_OLRW] = "olrw not enabled";
+    @STR_SKIP[SKIP_KCRFWSLV_STDBY_MODE]  = "lgwr in standby mode";
+    @STR_SKIP[SKIP_KCRFSPIC_BLKS]        = "kcrfpic: no redo blocks";
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_slave_adaptive_check_phase
+/ str(uptr(KSPSSIDST)) == str($1) /
+{
+    @in_trace[pid] = 1;
+
+    $alwe = *(struct alwe_info **) uptr(KLASSVP7); 
+
+    @fast_sync[pid]       = *(uint32 *) uptr(KCRF_FAST_SYNC);
+    @kcrf_slave_info[pid] = *(uint32 *) uptr(KCRF_SLAVE_INFO);
+    @lgwr_mode[pid]       = *(uint32 *) uptr(KCRFWSLV_LGWR_MODE);
+    @lgwr_stdby_mode[pid] = *(uint32 *) uptr(KCRFWSLV_STDBY_MODE);
+    @max_out_lw[pid]      = *(uint32 *) uptr(KCRFWSLV_MAX_OUT_LOG_WRI);
+    @kcrfs_seqno[pid]     = *(uint32 *) uptr(KCRFS_SEQNO);
+
+    @alwe_flags[pid]      = $alwe->flags;
+    @eval_intvl_us[pid]   = $alwe->eval_intvl_us;
+    @blocks_per_sec[pid]  = $alwe->blocks_per_sec;
+    @epoch_ts[pid]        = $alwe->epoch_ts;
+    @epoch_ts_prv[pid]    = $alwe->epoch_ts_prv;
+    @normal_writes[pid]   = $alwe->normal_writes;
+    @eval_writes[pid]     = $alwe->eval_writes;
+    @blocks[pid]          = $alwe->blocks;
+    @blocks_fraction[pid] = $alwe->blocks_fraction;
+    @pic_start[pid]       = $alwe->pic_start;
+    @anomalies[pid]       = $alwe->anomalies;
+    @ol_writes[pid]       = $alwe->ol_writes;
+    @tot_time[pid]        = $alwe->tot_time;
+    @tot_blocks[pid]      = $alwe->tot_blocks;
+    @ow_blocks[pid]       = $alwe->ow_blocks;
+    @seqno[pid]           = $alwe->seqno;
+
+    printf("***** %s", strftime("%Y-%m-%d %H:%M:%S.%f\n", nsecs));
+
+    printf("%ld %s -> kcrfw_slave_adaptive_check_phase\n", pid, comm);
+    printf("%ld %s    fast_sync = %u\n", pid, comm, @fast_sync[pid]);
+    printf("%ld %s    kcrf_slave_info = %u\n", pid, comm, @kcrf_slave_info[pid]);
+    printf("%ld %s    lgwr_mode = %u\n", pid, comm, @lgwr_mode[pid]);
+    printf("%ld %s    lgwr_stdby_mode = %u\n", pid, comm, @lgwr_stdby_mode[pid]);
+    printf("%ld %s    max_outstanding_log_writes = %u\n", pid, comm, @max_out_lw[pid]);
+    printf("%ld %s    alwe_flags = %p\n", pid, comm, @alwe_flags[pid]);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_slave_adaptive_check_phase
+/ @in_trace[pid] / 
+{
+    $alwe = *(struct alwe_info **) uptr(KLASSVP7); 
+    $lgwr_mode = *(uint32 *) uptr(KCRFWSLV_LGWR_MODE);
+
+    $skip = 0;
+    if (@fast_sync[pid]) {
+        $skip = SKIP_KCRF_FAST_SYNC;
+    }
+
+    if (!$skip && (@kcrf_slave_info[pid] != OLRW_FLG_ENABLED)) {
+        $skip = SKIP_KCRF_SLAVE_INFO_OLRW;
+    }
+
+    if (!$skip && @lgwr_stdby_mode[pid]) {
+        $skip = SKIP_KCRFWSLV_STDBY_MODE;
+    }
+
+    if($skip) {
+        printf("%ld %s    Skip: reason: %s\n", pid, comm, @STR_SKIP[$skip]);
+    }
+
+    /* ALWE normal phase */
+    if (!$skip && (@alwe_flags[pid] & ALWE_FLG_NORMAL_PHASE)) {
+
+        /* 
+         * Note: @epoch_ts_cur[pid] is measured 
+         * in the skgstmGetEpochTs retprobe!
+         */
+        $delta_us = (@epoch_ts_cur[pid] - @epoch_ts_prv[pid]);
+        printf("%ld %s    delta_us=%lu (%ld sec)\n", pid, comm, $delta_us, $delta_us/1e6);
+
+        /* Check evaluation interval */
+        if ($delta_us < @eval_intvl_us[pid]) {
+            printf("%ld %s    No action: delta_us < eval_intvl_us\n", pid, comm);
+        }
+        else {
+
+            /* Check minimum nr of writes */
+            if (@normal_writes[pid] < ALWE_MIN_WRITE_THRESH) {
+                printf("%ld %s    ALWE: Too few redo writes in the normal phase (%ld, threshold is %d) to warrant an evaluation.\n", 
+                       pid, comm, @normal_writes[pid], ALWE_MIN_WRITE_THRESH);
+
+                printf("%ld %s    ALWE: Restarting normal phase in %s mode (prev seqno=%u, curr seqno=%u)\n", 
+                       pid, comm, ($lgwr_mode ? "parallel" : "serial"), @kcrfs_seqno[pid], $alwe->seqno);
+
+                printf("%ld %s    ALWE: Normal phase using %s (%u sec) started\n", 
+                       pid, comm, ($lgwr_mode ? "parallel" : "serial"), (uint32) @eval_intvl_us[pid]/1e6); 
+            }
+            else {
+            
+                /* Parallel mode */
+                if (@lgwr_mode[pid]) {
+                    $tot_blocks = @tot_blocks[pid] + @ow_blocks[pid];
+
+                    if (@pic_start[pid] && @ow_blocks[pid]) {
+                        $delta_t = @epoch_ts_cur[pid] > @pic_start[pid] ? (@epoch_ts_cur[pid] - @pic_start[pid]) : 0;
+                    }
+                    $tot_time = @tot_time[pid] + $delta_t; 
+
+                }
+                /* Serial mode */
+                else {
+                    $tot_blocks = @tot_blocks[pid];
+                    $tot_time = @tot_time[pid];
+                }
+
+                $blocks_per_sec = $tot_time ? (($tot_blocks * 1e6) / $tot_time) : 0;
+
+                /* 
+                 * TODO: investigate how the lfs adj 
+                 * factor works in detail (currently, 
+                 * just use the default of 1).
+                 */
+                $lfs_factor = (uint32) 1;
+                $blocks_per_sec_adj = $blocks_per_sec / $lfs_factor;
+                $blocks_eval = ($alwe->eval_fraction * (uint32) @tot_blocks[pid]) / 1e4;
+                $avg_size = $alwe->normal_writes ? (@tot_blocks[pid] / @normal_writes[pid]) : 0;
+
+                printf("%ld %s    ALWE: Normal phase using %s (%lu writes, %u o/l writes, %u anomalies) finished:\n",
+                       pid, comm, (@lgwr_mode[pid] ? "parallel" : "serial"), $alwe->normal_writes, @ol_writes[pid], @anomalies[pid]);
+
+                printf("%ld %s          normal=%u, lfs factor=%u, adj. normal=%u\n",
+                        pid, comm, $blocks_per_sec, $lfs_factor, $blocks_per_sec_adj);
+
+                printf("%ld %s    ALWE: Normal phase: tot_blocks=%u, tot_time=%u, avg size=%u\n", 
+                       pid, comm, @tot_blocks[pid], @tot_time[pid], $avg_size);
+
+                /*
+                 * Note: At this stage, oracle also checks
+                 * if lgwr is in serial mode and if yes,
+                 * does the following:
+                 *
+                 * 1. Check max_outstanding_log_writes 
+                 * 2. If _max_outstanding_log_writes < 8,
+                 *    use the value of 8
+                 * 3. Negate the value of max_outstanding_ 
+                 *    log_writes.
+                 * 4. Store the value in alwe->eval_writes
+                 *
+                 * alwe->eval_writes stores the number of
+                 * evaluation writes and the evaluation phase
+                 * is only completed when the alwe->eval_writes
+                 * threshod is reached, which is 16 by default.
+                 *
+                 * However, due to the special case mentioned
+                 * above, if lgwr is in serial mode and _max_
+                 * outstanding_log_writes < 8, the threshold
+                 * becomes rather:
+                 *  eval_writes >= 24
+                 */ 
+
+                printf("%ld %s    ALWE: evaluation of %s (%d blocks) started\n", pid, comm, ($lgwr_mode ? "parallel" : "serial"), $alwe->blocks);
+            }
+        }
+    }
+
+    /* ALWE evaluation phase */
+    if (!$skip && (@alwe_flags[pid] & ALWE_FLG_EVAL_PHASE)) {
+
+        /* 
+         * Check prerequisites 
+         *
+         * Note: blocks_fraction is computed during the
+         * normal phase and after every redo write in 
+         * evaluation mode, the the number of written
+         * redo blocks gets decremented from this 
+         * counter (in kcrfw_slave_adaptive_end_ow).
+         * The evaluation end when this counter reaches
+         * 0. Also, there must be at least 16 redo 
+         * writes during an evaluation.
+         */
+        if (@blocks_fraction[pid] > 0) {
+            printf("%ld %s    No action: blocks_fraction > 0\n", pid, comm);
+        }
+        else if (@eval_writes[pid] < 16) {
+            printf("%ld %s    No action: eval_writes? < 16\n", pid, comm);
+        }
+        else {
+
+            /* Parallel mode */
+            if (@lgwr_mode[pid]) {
+                $tot_blocks = @tot_blocks[pid] + @ow_blocks[pid];
+
+                if(@pic_start[pid] && @ow_blocks[pid]) {
+                    $delta_t = @epoch_ts_cur[pid] > @pic_start[pid] ? (@epoch_ts_cur[pid] - @pic_start[pid]) : 0;
+                }
+                $tot_time = @tot_time[pid] + $delta_t; 
+
+            }
+            /* Serial mode */
+            else {
+                $tot_blocks = @tot_blocks[pid];
+                $tot_time = @tot_time[pid];
+            }
+
+            /* 
+            * TODO: investigate how the lfs adj 
+            * factor works in detail (currently, 
+            * just use the default of 1).
+            */
+            $lfs_factor = (uint32) 1;
+            $eval = $tot_time ? (($tot_blocks * 1e6) / $tot_time) : 0;
+            $eval_adj = $eval / $lfs_factor;
+            $normal_adj = @blocks_per_sec[pid] / $lfs_factor;
+            $avg_size = @eval_writes[pid] ? (@tot_blocks[pid] / @eval_writes[pid]) : 0;
+
+            printf("%ld %s    eval = (tot_blocks / (tot_time / 1e6)) = (%ld / (%ld / 1e6)) = %u (%u KB/sec)\n",
+                   pid, comm, $tot_blocks, $tot_time, $eval, ($eval * REDO_BLOCK_SIZE / 1024));
+
+            printf("%ld %s    normal = blocks_per_sec = %u (%u KB/sec)\n", 
+                   pid, comm, @blocks_per_sec[pid], (@blocks_per_sec[pid] * REDO_BLOCK_SIZE / 1024));
+
+            /* Evaluation positive - switch to new mode */
+            if ($eval_adj > $normal_adj) {
+
+                printf("%ld %s    ALWE: Evaluation of %s finished (%u o/l writes, %u anomalies):\n", 
+                       pid, comm, (@lgwr_mode[pid] ? "parallel" : "serial"), @ol_writes[pid], @anomalies[pid]);
+
+                printf("%ld %s          eval=%u, lfs factor=%u, adj. eval=%u, adj. normal=%u, switch to %s\n",
+                       pid, comm, $eval, $lfs_factor, $eval_adj, $normal_adj, (!@lgwr_mode[pid] ? "parallel" : "serial"));
+
+                printf("%ld %s    ALWE: Evaluation phase: tot_blocks=%u, tot_time=%u, avg_size=%u\n",
+                       pid, comm, @tot_blocks[pid], @tot_time[pid], $avg_size);
+            }
+            /* Evaluation negative - return to old mode */
+            else {
+                printf("%ld %s    ALWE: Evaluation of %s finished (%u o/l writes, %u anomalies):\n",
+                       pid, comm, (@lgwr_mode[pid] ? "parallel" : "serial"), @ol_writes[pid], @anomalies[pid]);
+
+                printf("%ld %s          eval=%u, lfs factor=%u, adj. eval=%u, adj. normal=%u, return to %s\n",
+                       pid, comm, $eval, $lfs_factor, $eval_adj, $normal_adj, (!@lgwr_mode[pid] ? "parallel" : "serial"));
+
+                printf("%ld %s    ALWE: Evaluation phase: tot_blocks=%u, tot_time=%u, avg_size=%u\n", 
+                       pid, comm, @tot_blocks[pid], @tot_time[pid], $avg_size);
+            }
+        }
+    }
+
+    printf("%ld %s    %-18s %16s %16s %16s\n", pid, comm, "alwe stats", "begin", "end", "diff");
+    printf("%ld %s    %-18s %16ld %16ld %16ld\n", pid, comm, "  epoch_ts", @epoch_ts[pid], $alwe->epoch_ts, ($alwe->epoch_ts - @epoch_ts[pid]));
+    printf("%ld %s    %-18s %16ld %16ld %16ld\n", pid, comm, "  epoch_ts_prv", @epoch_ts_prv[pid], $alwe->epoch_ts_prv, ($alwe->epoch_ts_prv - @epoch_ts_prv[pid]));
+    printf("%ld %s    %-18s %16u %16u %16u\n", pid, comm, "  blocks_per_sec", @blocks_per_sec[pid], $alwe->blocks_per_sec, ($alwe->blocks_per_sec - @blocks_per_sec[pid]));
+    printf("%ld %s    %-18s %16ld %16ld %16ld\n", pid, comm, "  normal_writes", @normal_writes[pid], $alwe->normal_writes, ($alwe->normal_writes - @normal_writes[pid]));
+    printf("%ld %s    %-18s %16d %16d %16d\n", pid, comm, "  eval_writes", @eval_writes[pid], $alwe->eval_writes, ($alwe->eval_writes - @eval_writes[pid]));
+    printf("%ld %s    %-18s %16ld %16ld %16ld\n", pid, comm, "  blocks", @blocks[pid], $alwe->blocks, ($alwe->blocks - @blocks[pid]));
+    printf("%ld %s    %-18s %16ld %16ld %16ld\n", pid, comm, "  blocks_fraction", @blocks_fraction[pid], $alwe->blocks_fraction, ($alwe->blocks_fraction - @blocks_fraction[pid]));
+    printf("%ld %s    %-18s %16d %16d %16ld\n", pid, comm, "  anomalies", @anomalies[pid], $alwe->anomalies, ($alwe->anomalies - @anomalies[pid]));
+    printf("%ld %s    %-18s %16d %16d %16d\n", pid, comm, "  ol_writes", @ol_writes[pid], $alwe->ol_writes, ($alwe->ol_writes - @ol_writes[pid]));
+    printf("%ld %s    %-18s %16ld %16ld %16d\n", pid, comm, "  tot_time", @tot_time[pid], $alwe->tot_time, ($alwe->tot_time - @tot_time[pid]));
+    printf("%ld %s    %-18s %16ld %16ld %16ld\n", pid, comm, "  tot_blocks", @tot_blocks[pid], $alwe->tot_blocks, ($alwe->tot_blocks - @tot_blocks[pid]));
+    printf("%ld %s    %-18s %16ld %16ld %16ld\n", pid, comm, "  ow_blocks", @ow_blocks[pid], $alwe->ow_blocks, ($alwe->ow_blocks - @ow_blocks[pid]));
+    printf("%ld %s    %-18s %16u %16u %16s\n", pid, comm, "  seqno", @seqno[pid], $alwe->seqno, "n/a");
+
+    printf("%ld %s    %-18s %16p %16p %16s\n", pid, comm, "  alwe_flags", @alwe_flags[pid], $alwe->flags, "n/a");
+    printf("%ld %s    %-18s %8s%u%u%u%u%u%u%u%u %8s%u%u%u%u%u%u%u%u %16s\n", pid, comm, "  alwe flag bits", "",
+                      @alwe_flags[pid] & 0x80 ? 1 : 0,
+                      @alwe_flags[pid] & 0x40 ? 1 : 0,
+                      @alwe_flags[pid] & 0x20 ? 1 : 0,
+                      @alwe_flags[pid] & 0x10 ? 1 : 0,
+                      @alwe_flags[pid] & 0x08 ? 1 : 0,
+                      @alwe_flags[pid] & 0x04 ? 1 : 0,
+                      @alwe_flags[pid] & 0x02 ? 1 : 0,
+                      @alwe_flags[pid] & 0x01 ? 1 : 0,
+                      "",
+                      $alwe->flags     & 0x80 ? 1 : 0,
+                      $alwe->flags     & 0x40 ? 1 : 0,
+                      $alwe->flags     & 0x20 ? 1 : 0,
+                      $alwe->flags     & 0x10 ? 1 : 0,
+                      $alwe->flags     & 0x08 ? 1 : 0,
+                      $alwe->flags     & 0x04 ? 1 : 0,
+                      $alwe->flags     & 0x02 ? 1 : 0,
+                      $alwe->flags     & 0x01 ? 1 : 0,
+                      "n/a");
+ 
+    printf("%ld %s <- kcrfw_slave_adaptive_check_phase\n\n", pid, comm);
+
+    delete(@in_trace[pid]);
+    delete(@fast_sync[pid]);
+    delete(@kcrf_slave_info[pid]);
+    delete(@lgwr_mode[pid]);
+    delete(@lgwr_stdby_mode[pid]);
+    delete(@max_out_lw[pid]);
+    delete(@kcrfs_seqno[pid]);
+    delete(@eval_intvl_us[pid]);
+    delete(@epoch_ts[pid]);
+    delete(@epoch_ts_cur[pid]);
+    delete(@epoch_ts_prv[pid]);
+    delete(@blocks_per_sec[pid]);
+    delete(@normal_writes[pid]);
+    delete(@eval_writes[pid]);
+    delete(@blocks[pid]);
+    delete(@blocks_fraction[pid]);
+    delete(@pic_start[pid]);
+    delete(@anomalies[pid]);
+    delete(@ol_writes[pid]);
+    delete(@tot_time[pid]);
+    delete(@tot_blocks[pid]);
+    delete(@ow_blocks[pid]);
+    delete(@seqno[pid]);
+    delete(@alwe_flags[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:skgstmGetEpochTs
+/ @in_trace[pid] && ! @epoch_ts_cur[pid] /
+{
+    printf("%ld %s    -> skgstmGetEpochTs\n", pid, comm);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:skgstmGetEpochTs
+/ @in_trace[pid] && ! @epoch_ts_cur[pid] /
+{
+    $alwe = (struct alwe_info *) *(uint64 *) uptr(KLASSVP7); 
+
+    @epoch_ts_cur[pid] = (uint64) retval;
+
+    printf("%ld %s    <- skgstmGetEpochTs: %lu\n", pid, comm, retval);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_slave_adaptive_disableslaves
+/ @in_trace[pid] /
+{
+    printf("%ld %s    -> kcrfw_slave_adaptive_disableslaves\n", pid, comm);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_slave_adaptive_enableslaves
+/ @in_trace[pid] /
+{
+    printf("%ld %s    -> kcrfw_slave_adaptive_enableslaves\n", pid, comm);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_slave_adaptive_switch_olrw
+/ @in_trace[pid] /
+{
+    printf("%ld %s    -> kcrfw_slave_adaptive_switch_olrw\n", pid, comm);
+} 
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_slave_adaptive_start_ow
+/ str(uptr(KSPSSIDST)) == str($1) /
+{
+    @in_trace[pid] = 1;
+
+    @pic[pid]    = (uint64) arg0;
+    @lg_grp[pid] = (uint32) arg1;
+    @lg_slv[pid] = (uint32) arg2;
+
+    $fsbase              = uptr(curtask->thread.fsbase);
+    $saddr               = *(uint64 *) uptr($fsbase - KSUSE_TLS_OFF);
+    $stats               = *(uint64 *) uptr($saddr + KSUSE_STATS_OFF);
+    @writes_all[pid]     = *(uint64 *) uptr($stats + STA_REDO_WRI_ADAPT_ALL * 8);
+    @writes_worker[pid]  = *(uint64 *) uptr($stats + STA_REDO_WRI_ADAPT_WRKR * 8);
+
+    @fast_sync[pid]       = *(uint32 *) uptr(KCRF_FAST_SYNC);
+    @kcrf_slave_info[pid] = *(uint32 *) uptr(KCRF_SLAVE_INFO);
+    @lgwr_mode[pid]       = *(uint32 *) uptr(KCRFWSLV_LGWR_MODE);
+    @lgwr_stdby_mode[pid] = *(uint32 *) uptr(KCRFWSLV_STDBY_MODE);
+
+    $alwe                 = *(struct alwe_info **) uptr(KLASSVP7); 
+    @pic_start[pid]       = $alwe->pic_start;
+    @epoch_ts[pid]        = $alwe->epoch_ts;
+    @alwe_flags[pid]      = $alwe->flags;
+
+    /* 
+     * In serial mode, get the lg_grp
+     * from kcrfwslv_my_info stored in 
+     * tls and set lg_slv to 0.
+     */
+    if (!@lgwr_mode[pid]) {
+        @lg_grp[pid] = **(uint64 **) uptr($fsbase - KCRFWSLV_MY_INFO_TLS_OFF);
+        @lg_slv[pid] = 0;
+    }
+
+    printf("%ld %s -> kcrfw_slave_adaptive_start_ow: pic=0x%lx, grp?=0x%lx, slv?=0x%lx, 0x%lx, 0x%lx, 0x%lx\n",
+           pid, comm, @pic[pid], arg1, arg2, arg3, arg4, arg5);
+    printf("%ld %s    lgwr_mode = %u\n", pid, comm, @lgwr_mode[pid]);
+    printf("%ld %s    lgwr_stdby_mode = %u\n", pid, comm, @lgwr_stdby_mode[pid]);
+    printf("%ld %s    alwe_flags = %p\n", pid, comm, @alwe_flags[pid]);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_slave_adaptive_start_ow
+/ @in_trace[pid] /
+{
+    $alwe          = *(struct alwe_info **) uptr(KLASSVP7); 
+    $fsbase        = uptr(curtask->thread.fsbase);
+    $saddr         = *(uint64 *) uptr($fsbase - KSUSE_TLS_OFF);
+    $stats         = *(uint64 *) uptr($saddr + KSUSE_STATS_OFF);
+    $writes_all    = *(uint64 *) uptr($stats + STA_REDO_WRI_ADAPT_ALL * 8);
+    $writes_worker = *(uint64 *) uptr($stats + STA_REDO_WRI_ADAPT_WRKR * 8);
+
+    /* Precondition checks */
+    $skip = 0;
+    if (@fast_sync[pid]) {
+        $skip = SKIP_KCRF_FAST_SYNC;
+    }
+
+    if (!$skip && (@kcrf_slave_info[pid] != OLRW_FLG_ENABLED)) {
+        $skip = SKIP_KCRF_SLAVE_INFO_OLRW;
+    }
+
+    if (!$skip && @lgwr_stdby_mode[pid]) {
+        $skip = SKIP_KCRFWSLV_STDBY_MODE;
+    }
+
+    if (!$skip && ! *(uint32 *) uptr(@pic[pid] + KCRFPIC_BLKS_OFF)) {
+        $skip = SKIP_KCRFSPIC_BLKS;
+    }
+
+    if($skip) {
+        printf("%ld %s    Skip: reason: %s\n", pid, comm, @STR_SKIP[$skip]);
+    }
+    else {
+
+        if (!@pic_start[pid]) {
+            printf("%ld %s    Setting alwe->pic_start to: 0x%lx (%ld)\n", pid, comm, @epoch_ts[pid], @epoch_ts[pid]);
+            printf("%ld %s    ALWE: (%u, %u): Non-overlapped %s write starting: ow_start=0x%lx\n", 
+                   pid, comm, @lg_grp[pid], @lg_slv[pid], (@lgwr_mode[pid] ? "parallel" : "serial"), $alwe->pic_start);
+        }
+        else {
+            printf("%ld %s    ALWE: (%u, %u): Overlapped %s write starting: ow_start=0x%lx\n", 
+                   pid, comm, @lg_grp[pid], @lg_slv[pid], (@lgwr_mode[pid] ? "parallel" : "serial"), @pic_start[pid]);
+        }
+
+        printf("%ld %s    Setting klassvu1_ to: 0x%lx (%ld)\n", pid, comm, $alwe->pic_start, $alwe->pic_start);
+
+        /* 
+         * Note: Oracle only increments the
+         * session stat counters below during
+         * the normal phase; they are not in-
+         * cremented during the evaluation
+         * phase!
+         */
+        printf("%ld %s    %-30s %16s %16s %16s\n", pid, comm, "session stats", "begin", "end", "diff");
+        printf("%ld %s    %-30s %16ld %16ld %16ld\n", pid, comm, "  redo writes adaptive all", @writes_all[pid], $writes_all, ($writes_all - @writes_all[pid]));
+        printf("%ld %s    %-30s %16ld %16ld %16ld\n", pid, comm, "  redo writes adaptive worker", @writes_worker[pid], $writes_worker, ($writes_worker - @writes_worker[pid]));
+    }
+
+    printf("%ld %s <- kcrfw_slave_adaptive_start_ow\n\n", pid, comm);
+
+    delete(@in_trace[pid]);
+    delete(@pic[pid]);
+    delete(@lg_grp[pid]);
+    delete(@lg_slv[pid]);
+    delete(@writes_all[pid]);
+    delete(@writes_worker[pid]);
+    delete(@fast_sync[pid]);
+    delete(@kcrf_slave_info[pid]);
+    delete(@lgwr_mode[pid]);
+    delete(@lgwr_stdby_mode[pid]);
+    delete(@pic_start[pid]);
+    delete(@epoch_ts[pid]);
+    delete(@alwe_flags[pid]);
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_slave_adaptive_end_ow
+/ str(uptr(KSPSSIDST)) == str($1) /
+{
+    @in_trace[pid] = 1;
+
+    $alwe = *(struct alwe_info **) uptr(KLASSVP7); 
+
+    @pic[pid]             = (uint64) arg0;
+
+    @fast_sync[pid]       = *(uint32 *) uptr(KCRF_FAST_SYNC);
+    @kcrf_slave_info[pid] = *(uint32 *) uptr(KCRF_SLAVE_INFO);
+    @lgwr_mode[pid]       = *(uint32 *) uptr(KCRFWSLV_LGWR_MODE);
+    @lgwr_stdby_mode[pid] = *(uint32 *) uptr(KCRFWSLV_STDBY_MODE);
+    @klassvu1[pid]        = *(uint64 *) uptr(KLASSVU1);
+    @blocks[pid]          = *(uint32 *) uptr(@pic[pid] + KCRFPIC_BLKS_OFF);
+
+    $fsbase               = uptr(curtask->thread.fsbase);
+    @slv_my_info[pid]     = *(uint64 *) uptr($fsbase - KCRFWSLV_MY_INFO_TLS_OFF);
+
+    @pic_start[pid]       = $alwe->pic_start;
+    @ow_blocks[pid]       = $alwe->ow_blocks;
+    @ow_blocks_new[pid]   = ($alwe->ow_blocks + @blocks[pid]);
+    @tot_time[pid]        = $alwe->tot_time;
+    @tot_blocks[pid]      = $alwe->tot_blocks;
+    @ol_writes[pid]       = $alwe->ol_writes;
+    @eval_writes[pid]     = $alwe->eval_writes;
+    @blocks_fraction[pid] = $alwe->blocks_fraction;
+    @normal_writes[pid]   = $alwe->normal_writes;
+    @alwe_flags[pid]      = $alwe->flags;
+
+    printf("%ld %s -> kcrfw_slave_adaptive_end_ow: pic=0x%lx\n", pid, comm, @pic[pid]);
+    printf("%ld %s    lgwr_mode = %u\n", pid, comm, @lgwr_mode[pid]);
+    printf("%ld %s    lgwr_stdby_mode = %u\n", pid, comm, @lgwr_stdby_mode[pid]);
+    printf("%ld %s    alwe_flags = %p\n", pid, comm, @alwe_flags[pid]);
+    printf("%ld %s    blocks = %u\n", pid, comm, @blocks[pid]);
+    printf("%ld %s    ow_blocks = %u\n", pid, comm, $alwe->ow_blocks);
+    printf("%ld %s    ow_blocks_new = %u\n", pid, comm, @ow_blocks_new[pid]);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_slave_adaptive_end_ow
+/ @in_trace[pid] /
+{
+    $alwe = *(struct alwe_info **) uptr(KLASSVP7); 
+    $lg_grp = *(uint32 *) uptr(@slv_my_info[pid]);
+    $lg_slv = *(uint32 *) uptr(@slv_my_info[pid] + 4);
+
+    /* Precondition checks */
+    $skip = 0;
+    if (@fast_sync[pid]) {
+        $skip = SKIP_KCRF_FAST_SYNC;
+    }
+
+    if (!$skip && (@kcrf_slave_info[pid] != OLRW_FLG_ENABLED)) {
+        $skip = SKIP_KCRF_SLAVE_INFO_OLRW;
+    }
+
+    if (!$skip && @lgwr_stdby_mode[pid]) {
+        $skip = SKIP_KCRFWSLV_STDBY_MODE;
+    }
+
+    if($skip) {
+        printf("%ld %s    Skip: reason: %s\n", pid, comm, @STR_SKIP[$skip]);
+    }
+    else {
+
+        /* Anomalies */
+        if (!@pic_start[pid] || ! @klassvu1[pid] || @klassvu1[pid] != @pic_start[pid]) {
+            printf("%ld %s    ALWE: (%u, %u): %s write anomaly: pic_start=0x%lx, ow_start=0x%lx\n", 
+                   pid, comm, $lg_grp, $lg_slv, (@lgwr_mode[pid] ? "parallel" : "serial"), @pic_start[pid], @klassvu1[pid]);
+        }
+
+        /* 
+         * Note:
+         * When, on function return, the number of 
+         * ow_blocks in the alwe struct matches the 
+         * sum of the ow_blocks and redo blocks in 
+         * the pic (pending I/O context) on function 
+         * entry, this indicates an overlapped redo 
+         * write.
+         * Note that we cannot easily measure the 
+         * "active=(grp,slv)" and "ow_time" values 
+         * with bpftrace, which is why we do not
+         * show them in the printf below.
+         */
+        if ($alwe->ow_blocks == @ow_blocks_new[pid]) {
+            printf("%ld %s    ALWE: (%u, %u): In %s overlapped write: active=(n/a, n/a), blks=%u, ow_time=n/a, start=(0x%lx, 0x%lx)\n",
+                   pid, comm, $lg_grp, $lg_slv, (@lgwr_mode[pid] ? "parallel" : "serial"), @blocks[pid], @klassvu1[pid], @pic_start[pid]);
+        }
+        /* Non-overlapped redo write */
+        else {
+            printf("%ld %s    In %s non-overlapped write (alwe->ow_blocks=%u)\n", 
+                   pid, comm, (@lgwr_mode[pid] ? "parallel" : "serial"), $alwe->ow_blocks);    
+        }
+
+        printf("%ld %s    ALWE: (%u, %u): End of %s overlapped %s write: ow_blks=%u, ow_time=n/a, start=(0x%lx, 0x%lx)\n", 
+               pid, comm, $lg_grp, $lg_slv, ($alwe->flags & 1 ? "normal" : "evaluative"), (@lgwr_mode[pid] ? "parallel" : "serial"),
+               @blocks[pid], @klassvu1[pid], @pic_start[pid]);
+
+        printf("%ld %s    %-18s %16s %16s %16s\n", pid, comm, "alwe stat", "begin", "end", "diff");
+        printf("%ld %s    %-18s %16ld %16ld %16ld\n", pid, comm, "  ow_blocks", @ow_blocks[pid], $alwe->ow_blocks, ($alwe->ow_blocks - @ow_blocks[pid]));
+        printf("%ld %s    %-18s %16ld %16ld %16s\n", pid, comm, "  pic_start", @pic_start[pid], $alwe->pic_start, "n/a");
+        printf("%ld %s    %-18s %16ld %16ld %16d\n", pid, comm, "  tot_time", @tot_time[pid], $alwe->tot_time, ($alwe->tot_time - @tot_time[pid]));
+        printf("%ld %s    %-18s %16ld %16ld %16ld\n", pid, comm, "  tot_blocks", @tot_blocks[pid], $alwe->tot_blocks, ($alwe->tot_blocks - @tot_blocks[pid]));
+        printf("%ld %s    %-18s %16d %16d %16d\n", pid, comm, "  ol_writes", @ol_writes[pid], $alwe->ol_writes, ($alwe->ol_writes - @ol_writes[pid]));
+        printf("%ld %s    %-18s %16d %16d %16d\n", pid, comm, "  eval_writes", @eval_writes[pid], $alwe->eval_writes, ($alwe->eval_writes - @eval_writes[pid]));
+        printf("%ld %s    %-18s %16ld %16ld %16ld\n", pid, comm, "  blocks_fraction", @blocks_fraction[pid], $alwe->blocks_fraction, ($alwe->blocks_fraction - @blocks_fraction[pid]));
+        printf("%ld %s    %-18s %16ld %16ld %16ld\n", pid, comm, "  normal_writes", @normal_writes[pid], $alwe->normal_writes, ($alwe->normal_writes - @normal_writes[pid]));
+    }
+    
+    printf("%ld %s <- kcrfw_slave_adaptive_end_ow\n\n", pid, comm);
+
+    delete(@in_trace[pid]);
+    delete(@pic[pid]);
+    delete(@fast_sync[pid]);
+    delete(@kcrf_slave_info[pid]);
+    delete(@lgwr_mode[pid]);
+    delete(@lgwr_stdby_mode[pid]);
+    delete(@klassvu1[pid]);
+    delete(@blocks[pid]);
+    delete(@slv_my_info[pid]);
+    delete(@pic_start[pid]);
+    delete(@ow_blocks[pid]);
+    delete(@ow_blocks_new[pid]);
+    delete(@tot_time[pid]);
+    delete(@tot_blocks[pid]);
+    delete(@ol_writes[pid]);
+    delete(@eval_writes[pid]);
+    delete(@blocks_fraction[pid]);
+    delete(@normal_writes[pid]);
+    delete(@alwe_flags[pid]);
+    delete(@epoch_ts_cur[pid]);
+}
+
+END
+{
+    /* kcrfw_slave_adaptive_phase_check */
+    clear(@in_trace);
+    clear(@fast_sync);
+    clear(@kcrf_slave_info);
+    clear(@lgwr_mode);
+    clear(@lgwr_stdby_mode);
+    clear(@max_out_lw);
+    clear(@kcrfs_seqno);
+    clear(@eval_intvl_us);
+    clear(@epoch_ts);
+    clear(@epoch_ts_cur);
+    clear(@epoch_ts_prv);
+    clear(@blocks_per_sec);
+    clear(@normal_writes);
+    clear(@eval_writes);
+    clear(@blocks);
+    clear(@blocks_fraction);
+    clear(@pic_start);
+    clear(@anomalies);
+    clear(@ol_writes);
+    clear(@tot_time);
+    clear(@tot_blocks);
+    clear(@ow_blocks);
+    clear(@seqno);
+    clear(@alwe_flags);
+    clear(@STR_SKIP);
+
+    /* kcrfw_slave_adaptive_start_ow */
+    clear(@lg_grp);
+    clear(@lg_slv);
+    clear(@writes_all);
+    clear(@writes_worker);
+
+    /* kcrfw_slave_adaptive_end_ow */
+    clear(@pic);
+    clear(@klassvu1);
+    clear(@blocks);
+    clear(@ow_blocks_new);
+    clear(@slv_my_info);
+}
