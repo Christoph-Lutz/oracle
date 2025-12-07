@@ -62,24 +62,32 @@
  *    occurs every 15 sec.
  *
  *    evaluation/parallel -> normal/parallel (switch):
- *    lgwr switches from evaluation/parallel to normal/parallel 
- *    if: evaluation_rate > normal_rate
+ *    The evaluation phase runs until 1% of the blocks written
+ *    during the normal phase have been evaluated ("evaluation 
+ *    fraction") and lgwr switches from evaluation/parallel to 
+ *    normal/parallel if: evaluation_rate > normal_rate
  *
  *    evaluation/parallel -> normal/serial (fallback):
- *    lgwr falls back from evaluation/parallel to normal/serial
- *    if: evaluation_rate < normal_rate
+ *    The evaluation phase runs until 1% of the blocks written
+ *    during the normal phase have been evaluated ("evaluation 
+ *    fraction") and lgwr falls back from evaluation/parallel to 
+ *    normal/serial if: evaluation_rate < normal_rate
  *
  *    normal/parallel -> evaluation/serial:
  *    A transition from normal/parallel to evaluation/serial
  *    occurs every 15 sec.
  *
  *    evaluation/serial -> normal/serial (switch):
- *    lgwr switches from evaluation/serial to normal/serial
- *    if: evaluation_rate > normal_rate
+ *    The evaluation phase runs until 1% of the blocks written
+ *    during the normal phase have been evaluated ("evaluation 
+ *    fraction") and lgwr switches from evaluation/serial to 
+ *    normal/serial if: evaluation_rate > normal_rate
  *
  *    evaluation/serial -> normal/parallel (fallback):
- *    lgwr falls back from evaluation/serial to normal/parallel
- *    if: evaluation_rate < normal_rate
+ *    The evaluation phase runs until 1% of the blocks written
+ *    during the normal phase have been evaluated ("evaluation 
+ *    fraction") and lgwr falls back from evaluation/serial to 
+ *    normal/parallel if: evaluation_rate < normal_rate
  */
 
 #include <stdint.h>
