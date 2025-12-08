@@ -1,0 +1,95 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Show how lgwr and the lg workers are put into "standby
+ *   mode" in kcrfw_slave_pool_setstandbymode.
+ *   They are put into standby mode when Data Guard's LogXptMode 
+ *   is set to SYNC, for example. 
+ * 
+ *   Technically, lgwr standby mode is controlled by a flag
+ *   in the kcrf_slave_info_ sga structure (0 = stdby mode off,
+ *   1 = stdby mode on).
+ * 
+ *   To test this, execute the following commands while this 
+ *   script is running:
+ *
+ *     1. DGMGRL> edit database <db_uq_name> set property 'LogXptMode' = 'SYNC';
+ *     2. SQLPLUS> alter system switch logfile; 
+ *
+ * Date:
+ *   Dec-08 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *  ./kcrfw_slave_pool_setstandbymode.bt <oracle_sid>
+ *
+ * Tested on:
+ *   Oracle 19.26 / Exadata 25.1.7 (X10M)
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ * 
+ *   This script is potentially dangerous, use at your own risk!
+ */
+
+/* Addresses and offsets my change in every RU!                                      */
+#define KSPSSIDST                  0x60009628  /* oracle sid name                    */
+
+#define KCRFWSLV_LGWR_MODE         0x6002200c  /* lgwr mode (0=serial, 1=parallel)   */
+#define KCRFWSLV_STDBY_MODE        0x60022010  /* lgwr stdby mode (0=no, 1=yes)      */
+
+BEGIN
+{
+    if ($# < 1 || $# > 2) {
+        printf("\nUsage: ./kcrfw_slave_pool_setstandbymode.bt <oracle_sid> [<stack>?]\n");
+        exit();
+    }
+
+    if (str($2) == "stack" || str($2) == "yes" || str($2) == "y") {
+        @OPT_STACK = 1;
+    }
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_slave_pool_setstandbymode
+/ str(uptr(KSPSSIDST)) == str($1) /
+{
+    @in_trace[pid] = 1;
+
+    @lgwr_mode[pid]  = *(uint32 *) uptr(KCRFWSLV_LGWR_MODE);
+    @stdby_mode[pid] = *(uint32 *) uptr(KCRFWSLV_STDBY_MODE);
+    
+    printf("***** %s\n", strftime("%Y-%m-%d %H:%M:%S.%f", nsecs));
+    printf("%ld %s -> kcrfw_slave_pool_setstandbymode: 0x%lx\n", pid, comm, arg0);
+
+    if (@OPT_STACK) {
+        printf("%ld %s    Stack:\n", pid, comm);
+        print(ustack());
+    }
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_slave_pool_setstandbymode
+/ @in_trace[pid] /
+{
+    $lgwr_mode  = *(uint32 *) uptr(KCRFWSLV_LGWR_MODE);
+    $stdby_mode = *(uint32 *) uptr(KCRFWSLV_STDBY_MODE);
+
+    printf("%ld %s    lgwr_mode : beg = 0x%x, end = 0x%x\n", pid, comm, @lgwr_mode[pid], $lgwr_mode);
+    printf("%ld %s    stdby_mode: beg = 0x%x, end = 0x%x\n", pid, comm, @stdby_mode[pid], $stdby_mode);
+    printf("%ld %s <- kcrfw_slave_pool_setstandbymode\n\n", pid, comm);
+
+    delete(@in_trace[pid]);
+    delete(@lgwr_mode[pid]);
+    delete(@stdby_mode[pid]);
+}
+
+END
+{
+    clear(@in_trace);
+    clear(@lgwr_mode);
+    clear(@stdby_mode);
+    clear(@OPT_STACK);
+}
