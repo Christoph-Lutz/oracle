@@ -7,7 +7,7 @@
 #   slowdowns and hangs.
 # 
 # Date:
-#   December 09 2025
+#   Dec-09 2025
 #
 # Author:
 #   Christoph Lutz
