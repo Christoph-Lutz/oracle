@@ -31,7 +31,7 @@
  *
  *   Oracle uses RAND_bytes to generate a 16 bytes random number
  *   and overwrites the byte positions 6 and 8 with the following
- *   fixed values (in ztuguid) to conform with RFC 4122:
+ *   fixed values (in ztuguid) to conform with RFC 4122/9562:
  * 
  *     byte 6: 0x4f - Reserved for the version. 
  *             The first nibble has the value 0x4 (0b0100), which 
