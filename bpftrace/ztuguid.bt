@@ -11,7 +11,7 @@
  *   Christoph Lutz
  *
  * Usage:
- *   ./RAND_bytes.bt <oracle_pid> [<stacks>?]
+ *   ./ztuguid.bt <oracle_pid> [<stacks>?]
  *
  * Tested on:
  *   Oracle 23.26 / Exadata 25.1.7
@@ -52,7 +52,7 @@
 BEGIN
 {
     if( $# < 1) {
-        printf("\nUsage: ./RAND_bytes <oracle_pid> [<stacks>?]\n");
+        printf("\nUsage: ./ztuguid.bt <oracle_pid> [<stacks>?]\n");
         exit();
     }
 
