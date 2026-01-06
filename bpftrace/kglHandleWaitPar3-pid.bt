@@ -1,0 +1,113 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Trace calls to kglHandleWaitPar3 to demonstrate how 
+ *   Oracle computes and encodes the P3 wait event para-
+ *   meter for the library cache lock, library cache load 
+ *   lock, and library cache pin wait events.
+ *
+ * Date:
+ *   Jan-06 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./kglHandleWaitPar3.bt <pid>
+ *
+ * Tested on:
+ *   Oracle 23.26 / Exadata 25.1.7
+ * 
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ * 
+ *   This script is potentially dangerous, use at your 
+ *   own risk!
+ * 
+ * Background information:
+ *   When kglHandleWaitPar3 computes the P3 wait event,
+ *   it encodes the following information into a 64-bit 
+ *   value:
+ * 
+ *   - idn << 32      : handle identifier (upper 32 bits 
+ *                      of P3 value)
+ *   - namespace << 16: namespace (middle 16 bits of P3 
+ *                      value)
+ *   - mode           : requested lock or pin mode (lowest 
+ *                      16 bits of P3 value)
+ *  
+ *   Note: for parent and child cursors, idn does not 
+ *   represent the handle identifier, but rather the 
+ *   object's hash value; for other object types, such
+ *   as tables, packaged, procedures, etc., the idn
+ *   value represents the identifier.
+ */
+
+BEGIN
+{
+    if ($# != 1) 
+    {
+        printf("\nUsage: kglHandleWaitPar3-pid.bt <pid>\n");
+        exit()
+    }
+
+    printf("\nTracing kglHandleWaitPar3 ... Hit ^C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kglHandleWaitPar3
+/ pid == $1 /
+{
+    @in_trace[pid] = 1;
+    $kglhdadr = (uint64) arg1;
+
+    printf("%ld %s -> kglHandleWaitPar3: 0x%lx, 0x%lx, 0x%lx, 0x%lx\n", 
+           pid, comm, arg0, arg1, arg2, arg3);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kglHandleWaitPar3
+/ @in_trace[pid] /
+{
+    printf("%ld %s <- kglHandleWaitPar3: %p\n\n", pid, comm, retval);
+    delete(@in_trace[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kglHandleParent
+/ @in_trace[pid] /
+{
+    printf("%ld %s    -> kglHandleParent: 0x%lx, 0x%lx\n", pid, comm, arg0, arg1);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kglHandleParent
+/ @in_trace[pid] /
+{
+    printf("%ld %s    <- kglHandleParent: 0x%lx (%ld)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kglHandleIdn
+/ @in_trace[pid] /
+{
+    printf("%ld %s    -> kglHandleIdn: 0x%lx, 0x%lx\n", pid, comm, arg0, arg1);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kglHandleIdn
+/ @in_trace[pid] /
+{
+    printf("%ld %s    <- kglHandleIdn: 0x%lx (%ld)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kglHandleHash
+/ @in_trace[pid] /
+{
+    printf("%ld %s    -> kglHandleHash: 0x%lx, 0x%lx\n", pid, comm, arg0, arg1);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kglHandleHash
+/ @in_trace[pid] /
+{
+    printf("%ld %s    <- kglHandleHash: 0x%lx (%ld)\n", pid, comm, retval, retval);
+}
+
+END
+{
+    clear(@in_trace);
+}
