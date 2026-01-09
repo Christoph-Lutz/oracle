@@ -26,7 +26,7 @@ define p3=&&1
 select
     bitand(&p3, to_number('ffffffff00000000', 'xxxxxxxxxxxxxxxx')) / power(2, 32) idn,
     bitand(&p3, to_number('0000ffff0000', 'xxxxxxxxxxxxxxxx')) / power(2, 16) namespace,
-    bitand(&p3, to_number('000000000000ffff', 'xxxxxxxxxxxxxxxx')) lmode
+    bitand(&p3, to_number('000000000000ffff', 'xxxxxxxxxxxxxxxx')) rmode
 from 
     dual
 /
