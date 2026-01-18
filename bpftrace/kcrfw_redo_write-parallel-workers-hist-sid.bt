@@ -1,0 +1,97 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Print a histogram showing the number of worker processes
+ *   that lgwr assigns to work on a redo write in parallel
+ *   when operating in Adaptive Scalable mode.
+ *
+ * Date:
+ *   Jan-18 2026
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./kcrfw_redo_write-parallel-workers-hist-sid.bt <oracle_sid> <interval>
+ *
+ * Tested on:
+ *   Oracle 19.26 / Exadata 25.1.7
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ * 
+ *   Use at your own risk!
+ *
+ * Background information:
+ * In Adaptive Scalable mode, lgwr can issue concurrent 
+ * (overlapping) or parallel redo writes.  
+ *
+ * For concurrent redo writes, "_max_outstanding_log_
+ * writes" defines how many redo writes can be in flight 
+ * at any given time.  
+ *
+ * For parallel redo writes, "_max_log_write_parallelism"
+ * defines how many lg worker processes work on a redo 
+ * write in parallel.
+ *
+ * Lgwr only assigns multiple lg workers to process a 
+ * redo write in parallel when the following conditions 
+ * are met:
+ * 
+ *   - Number of drity redo buffers in a public strand > KSFD_MAXIO 
+ *     (usually 1 MB, or 2048 redo blocks/buffers of 512 bytes)
+ *
+ *   - _max_log_write_parallelism > 1
+ * 
+ *   - Number of active public redo strands > 1
+ *
+ * The number of parallel workers that lgwr assigns to
+ * a redo write is dynamically computed at runtime:
+ *
+ *   strands_per_worker = ceil(max_strands / max_log_write_parallelism)  
+ * 
+ *   workers = (highest_active_strand / strands_per_worker) + 1
+ *
+ * The number of parallel workers is computed in function kcrfw_
+ * redo_write_driver and then passed as an argument to kcfrw_slave_
+ * queue_insert (arg6).
+ *
+ */
+
+/* Addresses and offsets my change in every RU!                   */
+#define KSPSSIDST                  0x60009628  /* oracle sid name */
+
+BEGIN
+{
+    if ($# < 1 || $# > 2) {
+        printf("\nUsage: ./kcrfw_redo_write-parallel-workers-hist-sid.bt <oracle_sid> <interval>\n");
+        exit();
+    }
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_slave_queue_insert
+/ str(uptr(KSPSSIDST)) == str($1) /
+{
+    /* 
+     * Note: The number of parallel workers 
+     * is passed via the stack ("arg6").
+     */
+    $rsp = (uint64) reg("sp");
+    $workers = *(uint64 *) ($rsp + 0x8);
+    @workers_hist[pid] = lhist($workers, 0, 16, 1);
+}
+
+interval:s:$2
+{
+    printf("***** %s\n", strftime("%H:%M:%S", nsecs));
+    print(@workers_hist);
+    clear(@workers_hist);
+    printf("\n");
+}
+
+END
+{
+    clear(@workers_hist);
+}
