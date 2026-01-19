@@ -38,7 +38,7 @@
  *   redo write in parallel when the following conditions 
  *   are met:
  * 
- *    - Number of drity redo buffers in a public strand > KSFD_MAXIO 
+ *    - Number of dirty redo buffers in a public strand > KSFD_MAXIO 
  *      (usually 1 MB, or 2048 redo blocks/buffers of 512 bytes)
  *
  *    - _max_log_write_parallelism > 1
