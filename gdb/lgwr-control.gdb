@@ -26,11 +26,11 @@
 #   Oracle 19.26 / Exadata 25.1.7
 #
 # Notes:
-#   The script does not retrieve parameter values from SGA
-#   structures at runtime. Instead, it relies on predefined
+#   The script does not retrieve init.ora parameter values from 
+#   SGA structures at runtime. Instead, it relies on predefined
 #   defaults, which must be manually adjusted if necessary.
 #
-#   This script is dangerous and higly experimental, use at 
+#   This script is dangerous and highly experimental, use at 
 #   your own risk!
 
 set pagination off
@@ -40,6 +40,7 @@ set confirm off
 set $KSBCPUEFFTHRCNT_STARTUP          = 0x600b9d68
 
 set $ALFS_INFO_POLLING                = 0x60021f38
+set $ALFS_INFO_ARBITER                = 0x60021f3c
 
 set $FAST_SYNC_SL_WRITE_COUNT_THRESH  = 128
 set $FAST_SYNC_SL_WRITE_US_LO         = 10 
@@ -127,9 +128,11 @@ define show_lgwr_mode
     printf "  adaptive scalable mode is    : %s\n", $adaptive_mode_str
     printf "  alwe is                      : %s %s\n", $alwe_str, $alwe_phase_str
     printf "  olrw is                      : %s %s\n", $olrw_str, $olrw_mode_str
+    printf "  kcrfwslv arbiter is          : %u\n", *(uint32_t *) $KCRFWSLV_ARBITER
     printf "  slave pool stdby mode is     : %s\n", *(uint32_t *) $KCRFWSLV_STANDBY_MODE > 0 ? "enabled" : "disabled"
     printf "  fast sync is                 : %s\n", (uint32_t) kcrf_fast_sync_ > 0 ? "enabled" : "disabled"
     printf "  alfs polling mode is         : %s\n", *(uint32_t *) $ALFS_INFO_POLLING > 0 ? "enabled" : "disabled"
+    printf "  alfs arbiter is              : %u\n", *(uint32_t *) $ALFS_INFO_ARBITER
     printf "  max log write parallelism is : %u\n", *(uint32_t *) $KCRFWSLV_MAX_LOG_WRITE_PAR
     printf "  nr of active redo strands is : %u\n", (uint32_t) kcrf_actv_strands_
     printf "  max nr of redo strands is    : %u\n", (uint32_t) kcrf_max_strands_
@@ -245,44 +248,53 @@ define disable_fast_sync
 end
 
 define enable_lg_workers
+    set $no_action = 0
     printf "\n"
     printf "----- Enabling LG workers -----\n"
+
+    if (*(uint32_t *) $KCRFWSLV_LGWR_MODE > 0)
+        set $no_action = 1
+        printf "  lgwr mode is parallel, no action!\n"
+    end
  
-    if ((uint8_t) kcrf_slave_info_ != 2)
-        printf "  not in heuristic lgwr mode, no action.\"
-    else
+    if ((!$no_action) && ((uint32_t) kcrf_fast_sync_ > 0)) 
+        set $no_action = 1
+        printf "  Fast Sync is enabled, disable it first. No action!\n"
+    end
+
+    if ((!$no_action) && ((uint8_t) kcrf_slave_info_ != 2))
+        set $no_action = 1
+        printf "  Not in heuristic lgwr mode, no action!\"
+    end
+
+    if (!$no_action)
+        printf "  lgwr mode is serial, enabling workers ...\n"
         printf "  write count all is: %lu\n", *(uint64_t *) $KCRFWSLV_ALL
         printf "  write count all prev is: %lu\n", *(uint64_t *) $KCRFWSLV_ALL_PRV
         printf "  max log write parallelism is: %u\n", *(uint32_t *) $KCRFWSLV_MAX_LOG_WRITE_PAR
         printf "  redorate is: %lu\n", *(uint64_t *) $KCRFWSLV_REDORATE
         printf "  switch threshold is: %lu\n", *(uint64_t *) $KCRFWSLV_SWITCH_THRESH
         printf "  arbiter is: %u\n", *(uint32_t *) $KCRFWSLV_ARBITER
+            
+        if ((*(uint64_t *) $KCRFWSLV_ALL - *(uint64_t *) $KCRFWSLV_ALL_PRV) < $KCRFWSLV_SAMPLING_COUNT_PRM)
+            printf "  changing write count to: %lu\n", (*(uint64_t *) $KCRFWSLV_ALL_PRV + $KCRFWSLV_SAMPLING_COUNT_PRM) 
+            set *(uint64_t *) $KCRFWSLV_ALL = (*(uint64_t *) $KCRFWSLV_ALL_PRV + $KCRFWSLV_SAMPLING_COUNT_PRM)
+            printf "  changed write count to: %u\n", *(uint64_t *) $KCRFWSLV_ALL
+        end
 
-        if (*(uint32_t *) $KCRFWSLV_LGWR_MODE > 0)
-            printf "  lgwr mode is parallel, no action!\n"
+        printf "  changing arbiter from %u to: 1\n", *(uint32_t *) $KCRFWSLV_ARBITER
+        set *(uint32_t *) $KCRFWSLV_ARBITER = 1
+        printf "  changed arbiter to: %u\n", *(uint32_t *) $KCRFWSLV_ARBITER
+
+        if (*(uint32_t *) $KCRFWSLV_MAX_LOG_WRITE_PAR == 1)
+            printf "  changing redorate to: (4 x switch threshold) + 1: %lu\n", (4 * *(uint64_t *) $KCRFWSLV_SWITCH_THRESH) + 1
+            set *(uint64_t *) $KCRFWSLV_REDORATE = (4 * *(uint64_t *) $KCRFWSLV_SWITCH_THRESH) + 1
+            printf "  changed redorate to: %lu\n", *(uint64_t *) $KCRFWSLV_REDORATE
         else
-            printf "  lgwr mode is serial, enabling workers ...\n"
-
-            if ((*(uint64_t *) $KCRFWSLV_ALL - *(uint64_t *) $KCRFWSLV_ALL_PRV) < $KCRFWSLV_SAMPLING_COUNT_PRM)
-                printf "  changing write count to: %lu\n", (*(uint64_t *) $KCRFWSLV_ALL_PRV + $KCRFWSLV_SAMPLING_COUNT_PRM) 
-                set *(uint64_t *) $KCRFWSLV_ALL = (*(uint64_t *) $KCRFWSLV_ALL_PRV + $KCRFWSLV_SAMPLING_COUNT_PRM)
-                printf "  changed write count to: %u\n", *(uint64_t *) $KCRFWSLV_ALL
-            end
-
-            printf "  changing arbiter to: 1\n"
-            set *(uint32_t *) $KCRFWSLV_ARBITER = 1
-            printf "  changed arbiter to: %u\n", *(uint32_t *) $KCRFWSLV_ARBITER
-
-            if (*(uint32_t *) $KCRFWSLV_MAX_LOG_WRITE_PAR == 1)
-                printf "  changing redorate to: (4 x switch threshold) + 1: %lu\n", (4 * *(uint64_t *) $KCRFWSLV_SWITCH_THRESH) + 1
-                set *(uint64_t *) $KCRFWSLV_REDORATE = (4 * *(uint64_t *) $KCRFWSLV_SWITCH_THRESH) + 1
-                printf "  changed redorate to: %lu\n", *(uint64_t *) $KCRFWSLV_REDORATE
-            else
-                printf "  changing redorate to: (2 x switch threshold) + 1\n"
-                set *(uint64_t *) $KCRFWSLV_REDORATE = (2 * *(uint64_t *) $KCRFWSLV_SWITCH_THRESH) + 1
-                printf "  changed redorate to: %lu\n", *(uint64_t *) $KCRFWSLV_REDORATE
-            end
-        end 
+            printf "  changing redorate to: (2 x switch threshold) + 1\n"
+            set *(uint64_t *) $KCRFWSLV_REDORATE = (2 * *(uint64_t *) $KCRFWSLV_SWITCH_THRESH) + 1
+            printf "  changed redorate to: %lu\n", *(uint64_t *) $KCRFWSLV_REDORATE
+        end
     end
     printf "-------------------------------\n"
     printf "\n"
