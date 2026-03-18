@@ -15,7 +15,7 @@
  *   ./kcrfw_redo_write-parallel-workers-hist-sid.bt <oracle_sid> <interval>
  *
  * Tested on:
- *   Oracle 19.26 / Exadata 25.1.7
+ *   Oracle 19.26 / Exadata 25.2.6
  *
  * Notes:
  *   Adjust the ORACLE_HOME path for your environment.
@@ -23,10 +23,10 @@
  *   Use at your own risk!
  *
  * Background information:
- *   In Adaptive Scalable mode, lgwr can issue concurrent 
- *   (overlapping) or parallel redo writes.  
+ *   In Adaptive Scalable mode, lgwr can issue pipelined
+ *   (overlapped) or parallel redo writes.  
  *
- *   For concurrent redo writes, "_max_outstanding_log_
+ *   For pipelined redo writes, "_max_outstanding_log_
  *   writes" defines how many redo writes can be in flight 
  *   at any given time.  
  *
@@ -38,19 +38,22 @@
  *   redo write in parallel when the following conditions 
  *   are met:
  * 
- *    - Number of dirty redo buffers in a public strand > KSFD_MAXIO 
- *      (usually 1 MB, or 2048 redo blocks/buffers of 512 bytes)
+ *    - The size of the redo write must exceed the maximum I/O 
+ *      size defined by _max_io_size, which is 1 MB (1048576 bytes) 
+ *      or 2048 redo blocks of 512 bytes.
  *
  *    - _max_log_write_parallelism > 1
  * 
  *    - Number of active public redo strands > 1
  *
- *   The number of parallel workers that lgwr assigns to
- *   a redo write is dynamically computed at runtime:
- *
- *    strands_per_worker = ceil(max_strands / max_log_write_parallelism)  
+ *   The number of parallel workers that lgwr assigns to a redo
+ *   write is dynamically computed at runtime:
  * 
- *    workers = (highest_active_strand / strands_per_worker) + 1
+ *     strands_per_worker = ceil(max_strands / max_log_write_parallelism) 
+ * 
+ *     active_strands = highest_active_strand + 1
+ * 
+ *     workers = ceil(active_strands / strands_per_worker)
  *
  *   The number of parallel workers is computed in function kcrfw_
  *   redo_write_driver and then passed as an argument to kcfrw_slave_
