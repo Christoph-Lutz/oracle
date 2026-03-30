@@ -26,6 +26,7 @@
 #  To compile the symbol file, use the following command:
 #    gcc -c -g sigaction.c -o sigaction.o
 #
+# This script is dangerous, use at your own risk!
 
 set confirm off
 set pagination off
