@@ -1,0 +1,244 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Show how Oracle 26ai computes the the number of sub-
+ *   pools in the shared pool, large pool, streams pool
+ *   and NUMA pool.
+ *
+ * Date:
+ *   Apr-28 2026
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./ksmc_pool_sdx_chk.bt [<verbose>?]
+ *
+ * Tested on:
+ *   Oracle 23.26 / Exadata 25.2.1
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ * 
+ *   Use at your own risk!
+ */
+
+#define GIGABYTE       (1<<30)  /* 2^30                  */
+
+#define KSPTII_ELM_SZ  0x58     /* param table elem size */
+
+BEGIN
+{
+    printf("Tracing... Hit ^C to stop.\n\n");
+
+    if (str($1) == "verbose" || str($1) == "v" || str($1) == "yes" || str($1) == "y") {
+        @OPT_VERBOSE = 1
+    }
+}
+
+/* shared pool callback */
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmcspsdxchk
+{
+    @pool[pid] = "shared pool";
+    printf("%ld %s -> ksmcspsdxchk\n", pid, comm);
+    printf("%ld %s    pool: %s\n", pid, comm, @pool[pid]);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmcspsdxchk
+{
+    printf("%ld %s <- ksmcspsdxchk: 0x%lx (%lu)\n\n", pid, comm, retval, retval);
+    delete(@pool[pid]);
+}
+
+/* large pool callback */
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmclpsdxchk
+{
+    @pool[pid] = "large pool";
+    printf("%ld %s -> ksmclpsdxchk\n", pid, comm);
+    printf("%ld %s    pool: %s\n", pid, comm, @pool[pid]);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmclpsdxchk
+{
+    printf("%ld %s <- ksmclpsdxchk: 0x%lx (%lu)\n\n", pid, comm, retval, retval);
+    delete(@pool[pid]);
+}
+
+/* streams pool callback */
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmcstrsdxchk
+{
+    @pool[pid] = "streams pool";
+    printf("%ld %s -> ksmcstrsdxchk\n", pid, comm);
+    printf("%ld %s    pool: %s\n", pid, comm, @pool[pid]);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmcstrsdxchk
+{
+    printf("%ld %s <- ksmcstrsdxchk: 0x%lx (%lu)\n\n", pid, comm, retval, retval);
+    delete(@pool[pid]);
+}
+
+/* numa pool callback */
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmcnumasdxchk
+{
+    @pool[pid] = "NUMA pool";
+    printf("%ld %s -> ksmcnumasdxchk\n", pid, comm);
+    printf("%ld %s    pool: %s\n", pid, comm, @pool[pid]);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmcnumasdxchk
+{
+    printf("%ld %s <- ksmcnumasdxchk: 0x%lx (%lu)\n\n", pid, comm, retval, retval);
+    delete(@pool[pid]);
+}
+
+/* callback helper */
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmcpoolsdxchk
+/ @pool[pid] != "" /
+{
+    @sga_min_pct[pid]  = (uint32) arg1;
+    @max_subpools[pid] = (uint32) arg3;
+
+    $ksptii = (uint64) uaddr("ksptii");
+    $idx    = (uint64) (arg2 - 1);
+    $off    = (uint64) ($idx * KSPTII_ELM_SZ);
+    $str_p  = *(uint64 **) uptr($ksptii + $off);
+
+    /*
+     * Note: save the ksptii idx value
+     * for later use in the kspgzp probe
+     * (kspgzp checks the parameter values
+     * configured in the spfile).
+     */
+    @kspgzp_idx[pid] = (uint64) arg2;
+
+    printf("%ld %s    -> ksmcpoolsdxchk: %p, %lu, %lu, %lu\n", pid, comm, arg0, arg1, arg2, arg3);
+    printf("%ld %s       sga_min_pct: %u\n", pid, comm, @sga_min_pct[pid]);
+    printf("%ld %s       pool_prm_idx: %u (x$ksppi.indx=%u: %s)\n", pid, comm, arg2, $idx, str($str_p));
+    printf("%ld %s       max_subpools: %u\n", pid, comm, @max_subpools[pid]);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmcpoolsdxchk
+/ @pool[pid] != "" /
+{
+    if (@OPT_VERBOSE) {
+        $min_pool_sz = @kspgzp_val[pid] ? @kspgzp_val[pid] : 0;
+
+        /* max((sga_sz * pct/100), min_pool_sz) */ 
+        $pool_sz = ((@sga_sz[pid] * @sga_min_pct[pid]/100) > $min_pool_sz) 
+                     ? (@sga_sz[pid] * @sga_min_pct[pid]/100)
+                     : $min_pool_sz;
+
+        $mem_cap  = (uint32) ($pool_sz/GIGABYTE);
+
+        $cpu_cap  = (uint32) (@cpu_count[pid] - 1)/4 + 1;
+
+        /* min(c,m,s) using nested ternary expression */
+        $min = ($cpu_cap < $mem_cap
+                 ? ($cpu_cap < @max_subpools[pid] ? $cpu_cap : @max_subpools[pid])
+                 : ($mem_cap < @max_subpools[pid] ? $mem_cap : @max_subpools[pid]));
+
+        printf("%ld %s       Computation:\n", pid, comm);
+        printf("%ld %s         max_pools = %u\n", pid, comm, @max_subpools[pid]);
+        printf("%ld %s         sga_pct   = %u\n", pid, comm, @sga_min_pct[pid]);
+        printf("%ld %s         cpu_cap   = (cpu_count - 1)/4 + 1\n", pid, comm);
+        printf("%ld %s                   = (%u - 1)/4 + 1\n", pid, comm, @cpu_count[pid]);
+        printf("%ld %s                   = %u\n", pid, comm, ((@cpu_count[pid] - 1)/4 + 1));
+        printf("%ld %s         pool_sz   = max(sga_sz_nonimc * sga_pct/100, pool_sz_spfile)\n", pid, comm);
+        printf("%ld %s                   = max(%lu * %u/100, %lu)\n", pid, comm, @sga_sz[pid], @sga_min_pct[pid], @kspgzp_val[pid]);
+        printf("%ld %s                   = max(%lu, %lu)\n", pid, comm, (@sga_sz[pid] * @sga_min_pct[pid]/100), @kspgzp_val[pid]);
+        printf("%ld %s                   = %lu\n", pid, comm, $pool_sz);
+        printf("%ld %s         mem_cap   = pool_sz/2^30\n", pid, comm); 
+        printf("%ld %s                   = %lu/%u\n", pid, comm, $pool_sz, GIGABYTE);
+        printf("%ld %s                   = %lu\n", pid, comm, $pool_sz/GIGABYTE);
+        printf("%ld %s         subpools  = min(cpu_cap, mem_cap, max)\n", pid, comm);
+        printf("%ld %s                   = min(%u, %u, %u)\n", pid, comm, $cpu_cap, $mem_cap, @max_subpools[pid]);
+        printf("%ld %s                   = %u\n", pid, comm, $min);
+    }
+
+    printf("%ld %s    <- ksmcpoolsdxchk: 0x%lx (%lu)\n", pid, comm, retval, retval);
+
+    delete(@sga_min_pct[pid]);
+    delete(@max_subpools[pid]);
+    delete(@kspgzp_idx[pid]);
+
+    /* Set in kspgzp retprobe */
+    delete(@kspgzp_val[pid]);
+
+    /* Set in ksmg_estimate_nonimc_sga_size retprobe */
+    delete(@sga_sz[pid]);
+
+    /* Set in ksb_cpu_eff_thread_count_compute retprobe */
+    delete(@cpu_count[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmg_estimate_nonimc_sga_size
+/ @pool[pid] != "" / 
+{
+    printf("%ld %s       -> ksmg_estimate_nonimc_sga_size: %p\n", pid, comm, arg0)
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmg_estimate_nonimc_sga_size
+/ @pool[pid] != "" /
+{
+    @sga_sz[pid] = (uint64) retval;
+
+    printf("%ld %s       <- ksmg_estimate_nonimc_sga_size: 0x%lx (%lu)\n", pid, comm, retval, retval);
+}
+
+/* 
+ * Note: only trace the call to 
+ * ksb_cpu_eff_thread_count_compute
+ * after the sga size has been determined,
+ * meaning when @sga_sz[pid] is set.
+ */
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksb_cpu_eff_thread_count_compute
+/ @pool[pid] != "" && @sga_sz[pid] /
+{
+    printf("%ld %s       -> ksb_cpu_eff_thread_count_compute\n", pid, comm);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksb_cpu_eff_thread_count_compute
+/ @pool[pid] != "" && @sga_sz[pid]  /
+{
+    @cpu_count[pid] = (uint32) retval;
+
+    printf("%ld %s       <- ksb_cpu_eff_thread_count_compute: 0x%lx (%lu)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kspgzp
+/ (@pool[pid] != "") && (@kspgzp_idx[pid] == arg0) /
+{
+    @trc_kspgzp[pid] = 1;
+
+    $ksptii = (uint64) uaddr("ksptii");
+    $idx    = (uint64) (arg0 - 1);
+    $off    = (uint64) ($idx * KSPTII_ELM_SZ);
+    $str_p  = *(uint64 **) uptr($ksptii + $off);
+
+    printf("%ld %s       -> kspgzp: %lu\n", pid, comm, @kspgzp_idx[pid]);
+    printf("%ld %s          prm_idx: %u (x$ksppi.indx=%u: %s)\n", pid, comm, arg0, $idx, str($str_p));
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kspgzp
+/ @pool[pid] != "" && @trc_kspgzp[pid] /
+{
+    @kspgzp_val[pid] = (uint64) retval;
+
+    printf("%ld %s       <- kspgzp: 0x%lx (%lu)\n", pid, comm, retval, retval);
+
+    delete(@trc_kspgzp[pid]);
+}
+
+END 
+{
+    clear(@pool);
+    clear(@sga_sz);
+    clear(@sga_min_pct);
+    clear(@max_subpools);
+    clear(@kspgzp_idx);
+    clear(@kspgzp_val);
+    clear(@trc_kspgzp);
+    clear(@cpu_count);
+    clear(@OPT_VERBOSE);
+}
