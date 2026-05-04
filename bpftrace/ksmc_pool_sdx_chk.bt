@@ -3,7 +3,9 @@
  * Purpose:
  *   Show how Oracle 26ai computes the the number of sub-
  *   pools in the shared pool, large pool, streams pool
- *   and NUMA pool.
+ *   and NUMA pool when automatic memory management is
+ *   enabled (either of sga_target, memory_target, or 
+ *   memory_size is set).
  *
  * Date:
  *   Apr-28 2026
@@ -175,6 +177,8 @@ uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmcpoolsdxch
 uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmg_estimate_nonimc_sga_size
 / @pool[pid] != "" / 
 {
+    @in_estim_sga[pid] = 1;
+
     printf("%ld %s       -> ksmg_estimate_nonimc_sga_size: %p\n", pid, comm, arg0)
 }
 
@@ -184,22 +188,23 @@ uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmg_estimate
     @sga_sz[pid] = (uint64) retval;
 
     printf("%ld %s       <- ksmg_estimate_nonimc_sga_size: 0x%lx (%lu)\n", pid, comm, retval, retval);
+
+    delete(@in_estim_sga[pid]);
 }
 
 /* 
- * Note: only trace the call to 
- * ksb_cpu_eff_thread_count_compute
- * after the sga size has been determined,
- * meaning when @sga_sz[pid] is set.
+ * Note: we don't want to trace the call
+ * to ksb_cpu_eff_thread_count_compute
+ * in ksmg_estimate_nonimc_sga_size
  */
 uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksb_cpu_eff_thread_count_compute
-/ @pool[pid] != "" && @sga_sz[pid] /
+/ @pool[pid] != "" && !@in_estim_sga[pid] /
 {
     printf("%ld %s       -> ksb_cpu_eff_thread_count_compute\n", pid, comm);
 }
 
 uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksb_cpu_eff_thread_count_compute
-/ @pool[pid] != "" && @sga_sz[pid]  /
+/ @pool[pid] != "" && !@in_estim_sga[pid] /
 {
     @cpu_count[pid] = (uint32) retval;
 
@@ -235,6 +240,7 @@ END
     clear(@pool);
     clear(@sga_sz);
     clear(@sga_min_pct);
+    clear(@in_estim_sga);
     clear(@max_subpools);
     clear(@kspgzp_idx);
     clear(@kspgzp_val);
