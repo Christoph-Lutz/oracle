@@ -1,11 +1,11 @@
 #!/usr/bin/env -S bpftrace --no-warnings
 /*
  * Purpose:
- *   Show how Oracle 26ai computes the the number of sub-
- *   pools in the shared pool, large pool, streams pool
- *   and NUMA pool when automatic memory management is
- *   enabled (either of sga_target, memory_target, or 
- *   memory_size is set).
+ *   Show how Oracle 26ai computes the number of subpools
+ *   in the shared pool, large pool, streams pool, and
+ *   NUMA pool when automatic memory management is enabled
+ *   (either of sga_target, memory_target, or memory_size 
+ *   is set).
  *
  * Date:
  *   Apr-28 2026
