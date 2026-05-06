@@ -160,16 +160,16 @@ uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kcbwmingran
 uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:lrmpsva
 / @in_trace[pid] /
 {
-   /* 
-    * Note: the parameter value is stored 
-    * at a memory address allocated by lrmpsva. 
-    * We store the address in a map here, so 
-    * that we can show the value it stores in 
+   /*
+    * Note: the parameter value is stored
+    * at a memory address allocated by lrmpsva.
+    * We store the address in a map here, so
+    * that we can show the value it stores in
     * the ksmg_max_def_gran_size_chk retprobe.
-    * The second parameter to lrmpsva (arg1) 
-    * seems to define the memory size, e.g. 4
-    * or 8 bytes, but we don't check that here
-    * and just use uint64.
+    * The second parameter to lrmpsva (arg1)
+    * seems to define the size of the allocation,
+    * e.g. 4 or 8 bytes, but we're not concerned
+    * about this here.
     */
    @lrmpsva[pid] = (uint64) retval; 
 }
