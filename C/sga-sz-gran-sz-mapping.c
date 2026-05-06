@@ -1,6 +1,6 @@
 /*
  * Purpose:
- *   Demonstrae how Oracle uses the ksmg_sga_sz and 
+ *   Demonstrate how Oracle uses the ksmg_sga_sz and 
  *   ksmg_gran_sz arrays to determine the granule size 
  *   for a given sga size.
  *
