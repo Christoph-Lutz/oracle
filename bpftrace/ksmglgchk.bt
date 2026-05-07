@@ -1,0 +1,248 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Show how Oracle 26ai determines the granule size 
+ *   by tracing the _ksmg_granule_size parameter call-
+ *   back function ksmglghck.
+ *
+ * Date:
+ *   May-01 2026
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./ksmglgchk.bt [<verbose>?]
+ *
+ * Tested on:
+ *   Oracle 23.26.0.0.0 / Exadata 25.1.2
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *
+ *   Use at your own risk!
+ */
+
+#define MEGABYTE      (1<<20)   /* 2^20 bytes            */
+#define GIGABYTE      (1<<30)   /* 2^30 bytes            */
+
+#define KSPTII_ELM_SZ 0x58      /* param table elem size */
+
+BEGIN
+{
+    printf("Tracing... Hit ^C to stop.\n\n");
+
+    if (str($1) == "verbose" || str($1) == "v" || str($1) == "yes" || str($1) == "y") {
+        @OPT_VERBOSE = 1;
+    }
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmglgchk
+{
+    @in_trace[pid] = 1;
+    $ksmg_sga_sz = (uint64) uaddr("ksmg_sga_sz");
+    $ksmg_gran_sz = (uint64) uaddr("ksmg_gran_sz");
+
+    printf("%ld %s -> ksmglgchk\n", pid, comm);
+
+    if (@OPT_VERBOSE) {
+        /* Manually unroll the mapping table to keep the bpf verifier happy ... */
+        printf("%ld %s    SGA size to granule mapping:\n", pid, comm);
+        printf("%ld %s       > %3luG - %3luM\n", pid, comm, (*(uint64 *) ($ksmg_sga_sz + 0 * 8))/GIGABYTE, 
+               (*(uint64 *) ($ksmg_gran_sz + 0 * 8))/MEGABYTE);
+        printf("%ld %s       > %3luG - %3luM\n", pid, comm, (*(uint64 *) ($ksmg_sga_sz + 1 * 8))/GIGABYTE, 
+               (*(uint64 *) ($ksmg_gran_sz + 1 * 8))/MEGABYTE);
+        printf("%ld %s       > %3luG - %3luM\n", pid, comm, (*(uint64 *) ($ksmg_sga_sz + 2 * 8))/GIGABYTE, 
+               (*(uint64 *) ($ksmg_gran_sz + 2 * 8))/MEGABYTE);
+        printf("%ld %s       > %3luG - %3luM\n", pid, comm, (*(uint64 *) ($ksmg_sga_sz + 3 * 8))/GIGABYTE, 
+               (*(uint64 *) ($ksmg_gran_sz + 3 * 8))/MEGABYTE);
+        printf("%ld %s       > %3luG - %3luM\n", pid, comm, (*(uint64 *) ($ksmg_sga_sz + 4 * 8))/GIGABYTE, 
+               (*(uint64 *) ($ksmg_gran_sz + 4 * 8))/MEGABYTE);
+        printf("%ld %s       > %3luG - %3luM\n", pid, comm, (*(uint64 *) ($ksmg_sga_sz + 5 * 8))/GIGABYTE, 
+               (*(uint64 *) ($ksmg_gran_sz + 5 * 8))/MEGABYTE);
+        printf("%ld %s       < %3luG - %3luM\n", pid, comm, 1, (*(uint64 *) ($ksmg_gran_sz + 6 * 8))/MEGABYTE);
+    }
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmglgchk
+/ @in_trace[pid] /
+{
+    printf("%ld %s    param value = %u\n", pid, comm, *(uint32 *) @lrmpsva[pid]);
+    printf("%ld %s <- ksmglgchk: 0x%lx (%lu)\n", pid, comm, retval, retval);
+
+    /* Set in kcfmingran retprobe */
+    delete(@kcfmingran[pid]);
+
+    /* Set in kcbwmingran retprobe */
+    delete(@kcbwmingran[pid]);
+
+    /* Set in lrmpsva retprobe */
+    delete(@lrmpsva[pid]);
+
+    delete(@in_trace[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kspges
+/ @in_trace[pid] && !@in_estim_sga[pid] && !@in_kcfmingran[pid] && !@in_kcbwmingran[pid] /
+{
+    $ksptii = (uint64) uaddr("ksptii");
+    $idx    = (uint64) (arg0 - 1);
+    $off    = (uint64) ($idx * KSPTII_ELM_SZ);
+    $str_p  = *(uint64 **) uptr($ksptii + $off);
+
+    printf("%ld %s    -> kspges: %u\n", pid, comm, arg0);
+    printf("%ld %s       prm_idx: %u (x$ksppi.indx=%u: %s)\n", pid, comm, arg0, $idx, str($str_p));
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kspges
+/ @in_trace[pid] && !@in_estim_sga[pid] && !@in_kcfmingran[pid] && !@in_kcbwmingran[pid] /
+{
+    printf("%ld %s    <- kspges: 0x%x (%u)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kspgip
+/ @in_trace[pid] && !@in_estim_sga[pid] && !@in_kcfmingran[pid] && !@in_kcbwmingran[pid] /
+{
+    $ksptii = (uint64) uaddr("ksptii");
+    $idx    = (uint64) (arg0 - 1);
+    $off    = (uint64) ($idx * KSPTII_ELM_SZ);
+    $str_p  = *(uint64 **) uptr($ksptii + $off);
+
+    printf("%ld %s    -> kspgip: %u\n", pid, comm, arg0);
+    printf("%ld %s       prm_idx: %u (x$ksppi.indx=%u: %s)\n", pid, comm, arg0, $idx, str($str_p));
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kspgip
+/ @in_trace[pid] && !@in_estim_sga[pid] && !@in_kcfmingran[pid] && !@in_kcbwmingran[pid] /
+{
+    printf("%ld %s    <- kspgip: 0x%x (%u)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kspgzp
+/ @in_trace[pid] && !@in_estim_sga[pid] && !@in_kcfmingran[pid] && !@in_kcbwmingran[pid] /
+{
+    $ksptii = (uint64) uaddr("ksptii");
+    $idx    = (uint64) (arg0 - 1);
+    $off    = (uint64) ($idx * KSPTII_ELM_SZ);
+    $str_p  = *(uint64 **) uptr($ksptii + $off);
+
+    printf("%ld %s    -> kspgzp: %u\n", pid, comm, arg0);
+    printf("%ld %s       prm_idx: %u (x$ksppi.indx=%u: %s)\n", pid, comm, arg0, $idx, str($str_p));
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kspgzp
+/ @in_trace[pid] && !@in_estim_sga[pid] && !@in_kcfmingran[pid] && !@in_kcbwmingran[pid] /
+{
+    printf("%ld %s    <- kspgzp: 0x%x (%u)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmg_estimate_nonimc_sga_size
+/ @in_trace[pid] / 
+{
+    @in_estim_sga[pid] = 1;
+    printf("%ld %s    -> ksmg_estimate_nonimc_sga_size: 0x%lx\n", pid, comm, arg0);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmg_estimate_nonimc_sga_size
+/ @in_trace[pid] / 
+{
+    printf("%ld %s    <- ksmg_estimate_nonimc_sga_size: 0x%lx (%lu)\n", pid, comm, retval, retval);
+    delete(@in_estim_sga[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kcfmingran
+/ @in_trace[pid] /
+{
+    @in_kcfmingran[pid] = 1;
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s    -> kcfmingran\n", pid, comm);
+    }
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kcfmingran
+/ @in_trace[pid] / 
+{
+    @kcfmingran[pid] = (uint64) retval;
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s    <- kcfmingran: 0x%lx (%lu)\n", pid, comm, retval, retval);
+    }
+
+    delete(@in_kcfmingran[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kcbwmingran
+/ @in_trace[pid] /
+{
+    @in_kcbwmingran[pid] = 1;
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s    -> kcbwmingran\n", pid, comm);
+    }
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kcbwmingran
+/ @in_trace[pid] / 
+{
+    @kcbwmingran[pid] = (uint64) retval;
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s    <- kcbwmingran: 0x%lx (%lu)\n", pid, comm, retval, retval);
+    }
+
+    delete(@in_kcbwmingran[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmg_adjust_gransize
+/ @in_trace[pid] /
+{
+    if (@OPT_VERBOSE) {
+        $mingran = (@kcfmingran[pid] < @kcbwmingran[pid]) ? @kcbwmingran[pid] : @kcfmingran[pid];
+        $mingran_adj = $mingran + ($mingran * 10)/100;
+
+        printf("%ld %s       mingran     = max(kcfmingran, kcbwmingran)\n", pid, comm);
+        printf("%ld %s                   = max(%lu, %lu)\n", pid, comm, @kcfmingran[pid], @kcbwmingran[pid]);
+        printf("%ld %s                   = %lu\n", pid, comm, $mingran);
+        printf("%ld %s       mingran_adj = mingran + (mingran * 10)/100\n", pid, comm);
+        printf("%ld %s                   = %lu + (%lu * 10)/100\n", pid, comm, $mingran, $mingran);
+        printf("%ld %s                   = %lu\n", pid, comm, $mingran_adj);
+    }
+
+    printf("%ld %s    -> ksmg_adjust_gransize: %lu, %lu\n", pid, comm, arg0, arg1);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksmg_adjust_gransize
+/ @in_trace[pid] / 
+{
+    printf("%ld %s    <- ksmg_adjust_gransize: 0x%lx (%lu)\n", pid, comm, retval, retval);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:lrmpsva
+/ @in_trace[pid] /
+{
+   /*
+    * Note: the parameter value is stored
+    * at a memory address allocated by lrmpsva.
+    * We store the address in a map here, so
+    * that we can show the value it stores in
+    * the ksmg_max_def_gran_size_chk retprobe.
+    * The second parameter to lrmpsva (arg1)
+    * seems to define the size of the allocation, 
+    * e.g. 4 or 8 bytes, but we're not concerned 
+    * about this here.
+    */
+   @lrmpsva[pid] = (uint64) retval;
+}
+
+END 
+{
+    clear(@in_trace);
+    clear(@in_estim_sga);
+    clear(@in_kcfmingran);
+    clear(@kcfmingran);
+    clear(@in_kcbwmingran);
+    clear(@kcbwmingran);
+    clear(@lrmpsva);
+    clear(@OPT_VERBOSE);
+}
