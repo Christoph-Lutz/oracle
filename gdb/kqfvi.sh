@@ -16,7 +16,9 @@
 #                the definition for (optional)
 # 
 # Tested on:
+#   Oracle 19.26 / Exadata 25.2.1
 #   Oracle 23.26.0.0 / Exadata 25.2.1
+#   Oracle 23.26.1.0 / Exadata 25.2.1
 #
 # Notes:
 #   This script is dangerous, use at your own risk!
