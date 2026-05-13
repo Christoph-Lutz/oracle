@@ -111,7 +111,7 @@ class FixedViewDefinitionsPrinter(gdb.Command):
             gdb.COMMAND_USER
         )
 
-    def _read_cstring(self, addr, maxlen=8192):
+    def _read_cstring(self, addr, maxlen=16384):
         if addr == 0:
             return None
 
