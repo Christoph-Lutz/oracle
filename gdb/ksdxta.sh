@@ -111,9 +111,8 @@ class CmdPrinter(gdb.Command):
         args = shlex.split(cmd_args)
 
         # Print header 
-        #if not CmdPrinter.header_printed:
         if not self.HEADER_PRINTED:
-            print(f"\n")
+            print()
             if self.COMPACT:
                 print(
                     f"{'Command':<20} "
