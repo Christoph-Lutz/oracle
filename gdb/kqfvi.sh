@@ -34,16 +34,6 @@ if [[ ! -x "$ORACLE_HOME/bin/oracle" ]] ; then
     exit 1
 fi
 
-if [[ ! -x "$ORACLE_HOME/bin/oracle" ]] ; then
-    printf "\nOracle executable not found: $ORACLE_HOME/bin/oracle. Aborting.\n\n"
-    exit 1
-fi
-
-if [[ ! -x "$ORACLE_HOME/bin/oracle" ]] ; then
-    printf "\nOracle executable not found: $ORACLE_HOME/bin/oracle. Aborting.\n\n"
-    exit 1
-fi
-
 if [[ ! -x "$ORACLE_HOME/bin/oraversion" ]] ; then
     printf "\nOraversion executable not found: $ORACLE_HOME/bin/oraversion. Aborting.\n\n"
     exit 1
@@ -77,7 +67,8 @@ else
 fi
 
 # gdb script
-SCRIPT="$(cat <<EOF
+GDB_FILE="/tmp/$$.gdb"
+GDB_SCRIPT="$(cat <<EOF
 
 set confirm off
 set pagination off
@@ -218,8 +209,21 @@ EOF
 )"
 
 # Pipe the script into gdb and format the output
-echo "$SCRIPT" | gdb -q |  grep -vE '^[[:space:]]*\(gdb\)|^[[:space:]]*$'
-ret=$?
+#echo "$SCRIPT" | gdb -q |  grep -vE '^[[:space:]]*\(gdb\)|^[[:space:]]*$'
+#ret=$?
+#echo
+#exit $ret
+
+# Create a temporary script file and run it in gdb
+echo "$GDB_SCRIPT" | sed '/^[[:space:]]*$/d' > $GDB_FILE
+
+if [[ -f "$GDB_FILE" ]] ; then
+    gdb -q -x "$GDB_FILE"
+    rm -f "$GDB_FILE"
+else
+    echo "gdb file not found: $GDB_FILE"
+    exit 1
+fi
 
 echo
-exit $ret
+exit 0
