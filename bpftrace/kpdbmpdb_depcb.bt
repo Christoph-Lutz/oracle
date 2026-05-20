@@ -1,0 +1,141 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Illustrate how the parameter callback function 
+ *   kpdbmpdb_depcb computes the default value of
+ *   the target_pdbs parameter.
+ *
+ * Date:
+ *   May-20 2026
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *
+ * Tested on:
+ *   Oracle 19.26 / Exadata 25.2.1
+ *   Oracle 23.26 / Exadata 25.2.1
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ * 
+ *   Use at your own risk!
+ */
+
+#define MAX_PDBS       4096     /* maximum nr of pdbs    */
+#define MAX_PDBS_DIV   (1<<29)  /* 2^29 = 512M           */
+#define KSPTII_ELM_SZ  0x58     /* param table elem size */
+
+BEGIN
+{
+    printf("Tracing... Hit ^C to stop.\n\n");
+
+    if (str($1) == "verbose" || str($1) == "v" || str($1) == "yes" || str($1) == "y") {
+        @OPT_VERBOSE = 1
+    }
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kpdbmpdb_depcb
+{
+    @in_trace[pid] = 1;
+    printf("%ld %s -> kpdbmpdb_depcb\n", pid, comm);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kpdbmpdb_depcb
+{
+    if (@sga_sz[pid]) {
+        $target_pdbs = (@sga_sz[pid] / MAX_PDBS_DIV) <= 4096 ? (@sga_sz[pid] / MAX_PDBS_DIV) : 4096;
+
+        printf("%ld %s       target_pdbs = sga_size / (2^29)\n", pid, comm);
+        printf("%ld %s                   = %lu / %lu\n", pid, comm, @sga_sz[pid], MAX_PDBS_DIV);
+        printf("%ld %s                   = %lu\n", pid, comm, $target_pdbs);
+        printf("%ld %s       target_pdbs = min(%lu, 4096)\n", pid, comm, $target_pdbs);
+        printf("%ld %s                   = %lu\n", pid, comm, $target_pdbs);
+    }
+
+    printf("%ld %s       param value = %u\n", pid, comm, *(uint32 *) @lrmpsva[pid]);
+    printf("%ld %s <- kpdbmpdb_depcb: 0x%lx (%lu)\n\n", pid, comm, retval, retval);
+
+    delete(@in_trace[pid]);
+
+    /* Set in kmgsb_get_sga_size retprobe */
+    delete(@sga_sz[pid]);
+
+    /* Set in lrmpsva retprobe */
+    delete(@lrmpsva[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kspges
+/ @in_trace[pid] /
+{
+    $ksptii = (uint64) uaddr("ksptii");
+    $idx    = (uint64) (arg0 - 1);
+    $off    = (uint64) ($idx * KSPTII_ELM_SZ);
+    $str_p  = *(uint64 **) uptr($ksptii + $off);
+
+    printf("%ld %s    -> kspges: %lu\n", pid, comm, arg0);
+    printf("%ld %s       prm_idx: %u (x$ksppi.indx=%u: %s)\n", pid, comm, arg0, $idx, str($str_p));
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kspges
+/ @in_trace[pid] /
+{
+    printf("%ld %s    <- kspges: 0x%lx (%lu)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kspgip
+/ @in_trace[pid] /
+{
+    $ksptii = (uint64) uaddr("ksptii");
+    $idx    = (uint64) (arg0 - 1);
+    $off    = (uint64) ($idx * KSPTII_ELM_SZ);
+    $str_p  = *(uint64 **) uptr($ksptii + $off);
+
+    printf("%ld %s    -> kspgip: %lu\n", pid, comm, arg0);
+    printf("%ld %s       prm_idx: %u (x$ksppi.indx=%u: %s)\n", pid, comm, arg0, $idx, str($str_p));
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kspgip
+/ @in_trace[pid] /
+{
+    printf("%ld %s    <- kspgip: 0x%lx (%lu)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kmgsb_get_sga_size
+/ @in_trace[pid] /
+{
+    printf("%ld %s    -> kmgsb_get_sga_size\n", pid, comm);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kmgsb_get_sga_size
+/ @in_trace[pid] /
+{
+    @sga_sz[pid] = (uint64) retval;
+    printf("%ld %s    <- kmgsb_get_sga_size: 0x%lx (%lu)\n", pid, comm, retval, retval);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:lrmpsva
+/ @in_trace[pid] /
+{
+   /*
+    * Note: the parameter value is stored
+    * at a memory address allocated by lrmpsva.
+    * We store the address in a map here, so
+    * that we can show the value it stores in
+    * the kpdbmpdb_depcb retprobe.
+    * The second parameter to lrmpsva (arg1)
+    * seems to define the size of the allocation,
+    * e.g. 4 or 8 bytes, but we're not concerned
+    * about this here.
+    */
+   @lrmpsva[pid] = (uint64) retval;
+}
+
+
+END 
+{
+    clear(@in_trace);
+    clear(@sga_sz);
+    clear(@OPT_VERBOSE);
+}
