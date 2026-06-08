@@ -1,0 +1,54 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Measure the elapsed time of Oracle function
+ *   kkscsSearchChildList. This can be used to 
+ *   measure how long Oracle needs to scan a child
+ *   cursor list.
+ *
+ * Date:
+ *   Jun-08 2026
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *
+ * Tested on:
+ *   Oracle 23.26.0 / Exadata 25.2.1
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ * 
+ *   Use at your own risk!
+ */
+
+BEGIN
+{
+    printf("Tracing... Hit ^C to stop.\n\n");
+
+    if (str($1) == "verbose" || str($1) == "v" || str($1) == "yes" || str($1) == "y") {
+        @OPT_VERBOSE = 1;
+    }
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kkscsSearchChildList
+/ pid == $1 /
+{
+    @in_trace[pid] = 1;
+    @start[pid] = nsecs;
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kkscsSearchChildList
+/ @in_trace[pid] /
+{
+    $ela_ns = (nsecs - @start[pid]);
+    printf("%ld %s kkscsSearchChildList: completed in %lu ns (%lu us)\n\n", pid, comm, $ela_ns, ($ela_ns/1e3));
+    delete(@in_trace[pid]);
+}
+
+END 
+{
+    clear(@in_trace);
+    clear(@start);
+}
