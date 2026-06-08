@@ -1,0 +1,342 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Demonstrate how Oracle scans the child cursor list 
+ *   under a parent cursor and how newly created child 
+ *   cursors are linked into the parent's child cursor
+ *   list.
+ *
+ * Date:
+ *   May-29 2026
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./kkscsSearchChildList.bt <pid> [<verbose>?]
+ *
+ * Tested on:
+ *   Oracle 23.26.0 / Exadata 25.2.1
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ * 
+ *   Use at your own risk!
+ */
+
+/* 
+ * cshsl is the doubly linked list run-
+ * nning through the kkscs structures.
+ */
+struct cshsl {                          
+    struct cshsl *next;
+    struct cshsl *prev;
+};
+
+#define KKSCS_FLG_OFF          0x20        /* flg offset in kkscs          */
+#define KKSCS_CNO_OFF          0x22        /* cno offset in kkscs          */
+#define KKSCS_CSHSL_OFF        0x50        /* cshsl offset in kkscs        */
+#define KKSCS_CSHSL_NEXT_OFF   0x50        /* cshsl->next offset in kkscs  */
+#define KKSCS_CSHSL_PREV_OFF   0x58        /* cshsl->prev offset in kkscs  */
+#define KKSCS_HD_OFF           0x78        /* hd offset in kkscs           */
+#define KKSCS_PDBUID_OFF       0x90        /* pdbuid offset in kkscs       */
+
+#define CSHSL_CLD_OFF          0x2e        /* cld offset from cshsl        */
+#define CSHSL_FLG_OFF          0x30        /* flg offset from cshsl        */
+
+#define XSC_KGLHDPAR_OFF       0x30        /* kglhdpar offset in xsc       */
+#define XSC_KGLLKADR_OFF       0x38        /* kgllkadr offset in xsc       */
+#define XSC_PI_OFF             0x40        /* pi offset in xsc             */
+
+#define PI_HT_OFFSET           0x60        /* ht offset in pi              */
+
+#define KZXDCCNUM              0x70079edc  /* kzxdccnum_                   */
+
+BEGIN
+{
+    printf("\nTracing... Hit ^C to stop.\n\n");
+
+    if ($# < 1 || $# > 2) {
+        printf("Usage: ./kkscsSearchChildList.bt <pid> [<verbose>?]\n");
+        exit();
+    }
+
+    if (str($2) == "verbose" || str($2) == "v" || str($2) == "yes" || str($2) == "y") {
+        @OPT_VERBOSE = 1;
+    }
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kkscsSearchChildList
+/ pid == $1 /
+{
+    @in_trace[pid] = 1;
+    @ts_start[pid] = nsecs;
+
+    $xsc = (uint64) uptr(arg2);
+    $pi = *(uint64 *) uptr($xsc + XSC_PI_OFF);
+    $ht = *(uint64 *) uptr($pi + PI_HT_OFFSET);
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s -> kkscsSearchChildList: %p, %p, xsc=%p, flag=0x%lx, ...\n", pid, comm, arg0, arg1, arg2, arg3);
+    }
+
+    printf("%ld %s    kkscsSearchChildList: Parent ready for search (kglkdadr=%p, kglhdpar=%p)\n", 
+           pid, comm, *(uint64 *) ($xsc + XSC_KGLLKADR_OFF), *(uint64 *) ($xsc + XSC_KGLHDPAR_OFF));
+
+ 
+    /* 
+     * Set in kkshGetNextChild retprobe. 
+     * Clean up the end-of-list marker
+     * and the last node pointer here in 
+     * the entry probe when a new scan
+     * starts.
+     */
+    delete(@cshsl_last[pid]);
+    delete(@cshsl_end[pid]);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kkscsSearchChildList
+/ @in_trace[pid] /
+{
+    $ela_ns = (nsecs - @ts_start[pid]);
+
+    printf("%ld %s    kkscsSearchChildList: complete: inspected %lu children in %lu ns (%lu us)\n", 
+           pid, comm, @checks[pid], $ela_ns, ($ela_ns/1e3));
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s <- kkscsSearchChildList: ret=0x%lx (%ld)\n\n", pid, comm, retval, retval);
+    } else {
+        printf("\n");
+    }
+
+    /* Set in kkscsCheckCursor retprobe */
+    delete(@checks[pid]);
+
+    /* Set in kpdbNameHash */
+    delete(@pdb_name_p[pid]);
+
+    delete(@ts_start[pid]);
+    delete(@in_trace[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kpdbNameHash
+/ @in_trace[pid] && !@pdb_name_p[pid] /
+{
+    @pdb_name_p[pid] = (uint64) arg0; 
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s -> kpdbNameHash: %p, 0x%lx\n", pid, comm, arg0, arg1);
+    }
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kpdbNameHash
+/ @in_trace[pid] && @pdb_name_p[pid] /
+{
+    printf("%ld %s    kpdbNameHash: pdb_name is %s (hsh=%p)\n", pid, comm, str(uptr(@pdb_name_p[pid])), retval);
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s <- kpdbNameHash: 0x%lx (%ld)\n", pid, comm, retval, retval);
+    }    
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kkshGetNextChild
+/ @in_trace[pid] && !@cshsl_end[pid] /
+{
+    @hash[pid]     = (uint64) arg0;
+    @ht[pid]       = (uint64) arg1;
+    @cur_hbk[pid]  = (uint64) arg2;
+    @cs[pid]       = (uint64) arg3;
+    @cs_prev[pid]  = *(uint64 *) uptr(arg3);
+    @cno_prev[pid] = *(uint16 *) uptr(@cs_prev[pid] + KKSCS_CNO_OFF);
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s -> kkshGetNextChild: hsh=%p, ht=%p, cur_hbk=%p, cs=%p, ...\n",
+               pid, comm, arg0, arg1, arg2, arg3);
+    }
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kkshGetNextChild
+/ @in_trace[pid] && !@cshsl_end[pid] /
+{
+    $cs       = *(uint64 *) uptr(@cs[pid]);
+    $cshbk    = *(uint64 *) uptr($cs + KKSCS_CSHSL_OFF);
+    $csflg    = *(uint8 *) uptr($cs + KKSCS_FLG_OFF);
+    $cshsl    = (struct cshsl *) uptr($cs + KKSCS_CSHSL_OFF);
+    $cno      = *(uint16 *) uptr($cs + KKSCS_CNO_OFF);
+    $hd       = *(uint64 *) uptr($cs + KKSCS_HD_OFF);
+    $pdbuid   = *(uint32 *) uptr($cs + KKSCS_PDBUID_OFF);
+    $cs_next  = ((*(uint64 *) uptr($cs + KKSCS_CSHSL_NEXT_OFF)) - KKSCS_CSHSL_NEXT_OFF);
+    $cno_next = *(uint16 *) uptr($cs_next + KKSCS_CNO_OFF);
+
+    /* 
+     * We've reached the end of the linked list
+     * when the next pointer points to the head
+     * of the list (cur_hbk). In that case, set
+     * a "end of list reached" flag in @cshsl_end,
+     * and save the last entry in the @cshsl_last 
+     * map.
+     */
+    if ($cshsl->next == *(uint64 *) @cur_hbk[pid]) {
+        @cshsl_end[pid]  = 1;
+        @cshsl_last[pid] = $cshsl;
+    }
+
+    if (!@OPT_VERBOSE) {
+        printf("%ld %s    kkshGetNextChild: Iterating child #%u (cs=%p, pdbuid=%u)\n", pid, comm, $cno, $cs, $pdbuid);
+    }
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s    kkshGetNextChild: *ht=0x%lx (pdbuid=%u)\n", pid, comm, *(uint64 *) @ht[pid], $pdbuid);
+        printf("%ld %s    kkshGetNextChild: *cur_hbk=0x%lx\n", pid, comm, *(uint64 *) @cur_hbk[pid]);
+
+        printf("%ld %s    kkshGetNextChild: cshsl=%p[%p,%p]\n", pid, comm, $cshsl, $cshsl->prev, $cshsl->next); 
+        printf("%ld %s    kkshGetNextChild: cshbk=0x%lx\n", pid, comm, $cshbk);
+
+        printf("%ld %s    kkshGetNextChild: prev: cs=%p, cno=%u\n", pid, comm, @cs_prev[pid], @cno_prev[pid]);
+        printf("%ld %s    kkshGetNextChild: curr: cs=%p, cno=%u\n", pid, comm, $cs, $cno);
+
+        if ($cshsl->next == *(uint64 *) @cur_hbk[pid]) {
+            printf("%ld %s    kkshGetNextChild: next: *cur_hbk=%p (end of list)\n", pid, comm, $cshsl->next);
+        }
+        else {
+            printf("%ld %s    kkshGetNextChild: next: cs=%p, cno=%u\n", pid, comm, $cs_next, $cno_next);
+        }
+
+        printf("%ld %s <- kkshGetNextChild: ret=0x%lx (%ld)\n\n", pid, comm, retval, retval);
+    }
+    
+    delete(@hash[pid]);
+    delete(@ht[pid]);
+    delete(@cur_hbk[pid]);
+    delete(@cs[pid]);
+    delete(@cs_prev[pid]);
+    delete(@cno_prev[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kkscsCheckCursor
+/ @in_trace[pid] /
+{
+    @checks[pid]++;
+
+    /* cs is passed in param7 via stack */
+    $rsp    = (uint64) reg("sp");
+    $cs     = *(uint64 *) ($rsp + 0x8);
+
+    $pdbuid = *(uint32 *) uptr($cs + KKSCS_PDBUID_OFF);
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s -> kkscsCheckCursor: %p, %p, xsc=%p, %p, 0x%lx, %p, ...\n", 
+               pid, comm, arg0, arg1, arg2, arg3, arg4, arg5);
+    }
+
+    printf("%ld %s    kkscsCheckCursor: next child is #%u (cs=%p, pdbuid=%u)\n", 
+           pid, comm, *(uint16 *) ($cs + KKSCS_CNO_OFF), $cs, $pdbuid);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kkscsCheckCursor
+/ @in_trace[pid] /
+{
+    if (@OPT_VERBOSE) {
+        printf("%ld %s <- kkscsCheckCursor: ret=0x%lx (%ld)\n\n", pid, comm, retval, retval);
+    }
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kkscsPruneChild
+/ @in_trace[pid] /
+{
+    $xsc = (uint64) arg1;
+    $cs  = (uint64) arg2;
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s -> kkscsPruneChild: %p, xsc=%p, cs=%p, flg=%p\n", pid, comm, arg0, $xsc, $cs, arg3);
+    }
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kkscsPruneChild
+/ @in_trace[pid] /
+{
+    if (retval) {
+        printf("%ld %s    kkscsPruneChild: Child was pruned\n", pid, comm);    
+    }
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s <- kkscsPruneChild: ret=0x%lx (%ld)\n", pid, comm, retval, retval);
+    }
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kkshhcins
+/ pid == $1 /
+{
+    @in_kkshhcins[pid] = 1;
+
+    @cshsl[pid]      = (struct cshsl *) arg2;
+    @cshsl_next[pid] = @cshsl[pid]->next;
+    @cshsl_prev[pid] = @cshsl[pid]->prev;
+
+    @cshsl_last_next[pid] = @cshsl_last[pid]->next;
+    @cshsl_last_prev[pid] = @cshsl_last[pid]->prev;
+
+    $bi  = (uint64) uptr(arg2 - KKSCS_CSHSL_OFF);
+    $cld = *(uint16 *) uptr(arg2 - CSHSL_CLD_OFF);
+    $flg = *(uint8 *)  uptr(arg2 - CSHSL_FLG_OFF);
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s -> kkshhcins: %p, %p, cshsl=%p, %p\n", pid, comm, arg0, arg1, arg2, arg3);
+    }
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s    kkshhcins: insert child into hash table bi=%p cld=%u flg=%x\n", pid, comm, $bi, $cld, $flg);
+        printf("%ld %s    kkshhcins: kzxdccnum=%u\n", pid, comm, *(uint32 *) uptr(KZXDCCNUM));
+        printf("%ld %s    kkshhcins: cld=%u\n", pid, comm, *(uint16 *) uptr(arg2 - CSHSL_CLD_OFF));
+    }
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kkshhcins
+/ @in_kkshhcins[pid] /
+{
+    $cshsl      = @cshsl[pid];
+    $cshsl_last = @cshsl_last[pid];
+
+    if (@OPT_VERBOSE) {
+        printf("%ld %s    kkshhcins: prev: cshsl=%p[%p,%p] cshsl=%p[%p,%p]\n", 
+               pid, comm, @cshsl_last[pid], @cshsl_last_prev[pid], @cshsl_last_next[pid], $cshsl_last, $cshsl_last->prev, $cshsl_last->next);
+
+        printf("%ld %s    kkshhcins: curr: cshsl=%p[%p,%p] cshsl=%p[%p,%p]\n", 
+               pid, comm, @cshsl[pid], @cshsl_prev[pid], @cshsl_next[pid], $cshsl, $cshsl->prev, $cshsl->next);
+
+        printf("%ld %s <- kkshhcins: ret=0x%lx (%ld)\n\n", pid, comm, retval, retval);
+    }
+
+    /* Set in the kkshGetNextChild retprobe */
+    delete(@cshsl_end[pid]);
+    delete(@cshsl_last[pid]);
+
+    delete(@cshsl[pid]);
+    delete(@cshsl_next[pid]);
+    delete(@cshsl_prev[pid]);
+    delete(@cshsl_last_next[pid]);
+    delete(@cshsl_last_prev[pid]);
+    delete(@in_kkshhcins[pid]);
+}
+
+END 
+{
+    clear(@OPT_VERBOSE);
+    clear(@in_trace);
+    clear(@ts_start);
+    clear(@pdb_name_p);
+    clear(@hash);
+    clear(@ht);
+    clear(@cur_hbk);
+    clear(@cs);
+    clear(@cs_prev);
+    clear(@cno_prev);
+    clear(@checks);
+    clear(@cshsl);
+    clear(@cshsl_next);
+    clear(@cshsl_prev);
+    clear(@cshsl_end);
+    clear(@cshsl_last);
+    clear(@cshsl_last_next);
+    clear(@cshsl_last_prev);
+}
