@@ -1,0 +1,321 @@
+#!/usr/bin/env -S bpftrace --no-warnings 
+/*
+ * Purpose:
+ *   Trace kksCursorTrace to see which CURSORTRACE settings it 
+ *   changes in the background. The script dumps the global and 
+ *   local CURSORTRACE settings tables when kksCursorTrace is
+ *   called.
+ *
+ * Date:
+ *   Jul-23 2026
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   BPFTRACE_LOG_SIZE=100000000 ./kksCursorTrace-2326.bt [<verbose>?]
+ *
+ * Tested on:
+ *   Oracle 23.26.0 / Exadata 25.2.1
+ *
+ * Notes:
+ *   The maximum number of PDBs supported by the script is limited 
+ *   to 256. The reason for this is that the bpf verifier cannot 
+ *   cope with more (looping over thousands of PDBs leads to a state 
+ *   explosion). 
+ *
+ *   Adjust the ORACLE_HOME path for your environment.
+ * 
+ *   Use at your own risk!
+ * 
+ * Background information:
+ *   You can enable the cursortrace event with commands like the following:
+ *
+ *     SQL> alter session set events 'immediate trace name cursortrace level &lvl, address &addr';
+ *     SQL> alter system set events 'immediate trace name cursortrace level &lvl, address &addr';
+ *
+ *   To dump and display the current global and local cursortrace settings execute:
+ *
+ *     SQL> alter system set events 'immediate trace name cursortrace level 0xffffffff, address 1';
+ */
+
+#define MAX_PDBS          256        /* max number of pdbs (bpf limit!)         */
+
+#define TLS_SADDR_OFF     0x00f410   /* saddr offset in thread local storage    */
+#define TLS_PDB_AREA_OFF  0x00f550   /* pdb area pointer offset in tls          */
+
+#define KSUSE_HT_LCL_OFF  0x017c0    /* local hash table offset in ksuse        */
+#define KSUSE_CON_ID_OFF  0x00a8c    /* con_id offset in ksuse                  */
+
+#define HT_MAX_ENTRIES    0x00003    /* max entries in global and local ht      */
+
+#define HT_GBL_PTR_OFF    0x97070    /* global hash table pointer offset        */
+#define HT_GBL_OFF        0x97080    /* global hash table offset                */
+#define HT_GBL_ALL_OFF    0x00000    /* trace 'all' flag offset in global table */
+#define HT_GBL_CNT_OFF    0x0001c    /* entry count offset in global hash table */
+#define HT_GBL_FLG_OFF    0x00004    /* flag offset in global hash table        */
+#define HT_GBL_HSH_OFF    0x00008    /* hash offset in global hash table        */
+
+#define HT_LCL_ALL_OFF    0x00158    /* trace 'all' flag offset in local table  */
+#define HT_LCL_CNT_OFF    0x00174    /* entry count offset in local hash table  */
+#define HT_LCL_FLG_OFF    0x0015c    /* flag offset in local hash table         */ 
+#define HT_LCL_HSH_OFF    0x00160    /* hash offset in local hash table         */
+
+#define KSMSGAPDBAREAS    0x70001798 /* address of ksmsgapdbareas_              */
+
+BEGIN
+{
+    printf("Tracing... Hit ^C to stop.\n\n");
+
+    if (str($1) == "verbose" || str($1) == "v" || str($1) == "yes" || str($1) == "y") {
+        @OPT_VERBOSE = 1;
+    }
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kksCursorTrace
+{
+    @in_trace[pid] = 1;
+
+    @sql_hash[pid]       = (uint64) arg1;
+    @fs[pid]             = uptr(curtask->thread.fsbase);
+    @saddr[pid]          = *(uint64 *) uptr(@fs[pid] - TLS_SADDR_OFF);
+    @con_id[pid]         = *(uint16 *) uptr(@saddr[pid] + KSUSE_CON_ID_OFF);
+    @ksmsgapdbareas[pid] = *(uint64 *) uptr(KSMSGAPDBAREAS);
+
+    $off1 = *(uint64 *) (@fs[pid] - 0xf550);
+    $off2 = *(uint64 *) ($off1 + 0x97070);
+    $off3 = *(uint64 *) ($off1 + 0x97080);
+
+    printf("%ld %s -> kksCursorTrace: lvl=0x%lx (%u), hsh=0x%lx (%u)\n", pid, comm, arg0, arg0, arg1, arg1);
+
+    /* Global cursortrace settings (before) */
+    $i=1;
+    while ($i < MAX_PDBS) {
+        $pdb_area = *(uint64 *) uptr(@ksmsgapdbareas[pid] + ($i * 0x8));
+
+        if ($pdb_area == 0) {
+            break;
+        }
+   
+        $ht_gbl_p         = (uint64) ($pdb_area + HT_GBL_PTR_OFF);
+        @ht_gbl_p[pid,$i] = $ht_gbl_p;
+        $ht_gbl           = *(uint64 *) uptr($ht_gbl_p);
+        @ht_gbl[pid,$i]   = (uint64) $ht_gbl;
+
+        /* map key: pid, con_id */
+        @all_gbl[pid,$i] = *(uint32 *) uptr($ht_gbl);
+        @cnt_gbl[pid,$i] = *(uint32 *) uptr($ht_gbl + HT_GBL_CNT_OFF);
+
+        /* map key: pid, con_id, idx */
+        @hsh_gbl[pid,$i,0] = *(uint32 *) uptr($ht_gbl + HT_GBL_HSH_OFF + (0 * 8));
+        @hsh_gbl[pid,$i,1] = *(uint32 *) uptr($ht_gbl + HT_GBL_HSH_OFF + (1 * 8));
+        @hsh_gbl[pid,$i,2] = *(uint32 *) uptr($ht_gbl + HT_GBL_HSH_OFF + (2 * 8));
+
+        @flg_gbl[pid,$i,0] = *(uint32 *) uptr($ht_gbl + HT_GBL_FLG_OFF + (0 * 8));
+        @flg_gbl[pid,$i,1] = *(uint32 *) uptr($ht_gbl + HT_GBL_FLG_OFF + (1 * 8));
+        @flg_gbl[pid,$i,2] = *(uint32 *) uptr($ht_gbl + HT_GBL_FLG_OFF + (2 * 8));
+
+        $i++;
+    }
+
+    /* Local cursortrace settings (before) */
+    @ht_lcl[pid]    = *(uint64 *) uptr(@saddr[pid]  + KSUSE_HT_LCL_OFF);
+    @all_lcl[pid]   = *(uint32 *) uptr(@ht_lcl[pid] + HT_LCL_ALL_OFF);
+    @cnt_lcl[pid]   = *(uint32 *) uptr(@ht_lcl[pid] + HT_LCL_CNT_OFF);
+
+    @hsh_lcl[pid,0] = *(uint32 *) uptr(@ht_lcl[pid] + HT_LCL_HSH_OFF + (0 * 8));
+    @hsh_lcl[pid,1] = *(uint32 *) uptr(@ht_lcl[pid] + HT_LCL_HSH_OFF + (1 * 8));
+    @hsh_lcl[pid,2] = *(uint32 *) uptr(@ht_lcl[pid] + HT_LCL_HSH_OFF + (2 * 8));
+
+    @flg_lcl[pid,0] = *(uint32 *) uptr(@ht_lcl[pid] + HT_LCL_FLG_OFF + (0 * 8));
+    @flg_lcl[pid,1] = *(uint32 *) uptr(@ht_lcl[pid] + HT_LCL_FLG_OFF + (1 * 8));
+    @flg_lcl[pid,2] = *(uint32 *) uptr(@ht_lcl[pid] + HT_LCL_FLG_OFF + (2 * 8));
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kksCursorTrace
+/ @in_trace[pid] /
+{
+    /* 
+     * When verbose mode is used, show the 
+     * memory addresses of the pdb areas, 
+     * the global ht ptr, and the global ht.
+     */
+    if (@OPT_VERBOSE) {
+
+        /* Show the tls variable values */
+        printf("\n%ld %s    tls:\n", pid, comm);
+        printf("%ld %s     fs=%p\n",  pid, comm, @fs[pid]); 
+        printf("%ld %s     saddr=%p\n", pid, comm, @saddr[pid]);
+        printf("%ld %s     pdb_area_p=%p (con_id=%u)\n\n", pid, comm, *(uint64 *) uptr(@fs[pid] - TLS_PDB_AREA_OFF), @con_id[pid]);
+
+        /* Show the sga pdb areas */
+        printf("%ld %s    ksmsgapdbareas:\n", pid, comm);
+
+        $i=1;
+        while ($i < MAX_PDBS) {
+            $pdb_area = *(uint64 *) uptr(@ksmsgapdbareas[pid] + ($i * 0x8));
+
+            if ($pdb_area == 0) {
+                break;
+            }
+ 
+            printf("%ld %s     [%3u]: 0x%09lx\n", pid, comm, $i, $pdb_area);
+            printf("%ld %s            +0x%lx: *0x%09lx=0x%09lx", pid, comm, HT_GBL_PTR_OFF, @ht_gbl_p[pid,$i], @ht_gbl[pid,$i]);
+              
+            $ht_gbl = *(uint64 *) uptr(@ht_gbl_p[pid,$i]);
+
+            if (@ht_gbl[pid,$i] != $ht_gbl) {
+                printf(" => 0x%09lx", $ht_gbl);
+            }
+            printf("\n");
+
+            printf("%ld %s            +0x%lx: *0x%09lx=0x%09lx\n", pid, comm, HT_GBL_OFF, ($pdb_area + HT_GBL_OFF), *(uint64 *) uptr($pdb_area + HT_GBL_OFF));
+
+            $i++;
+        }
+        printf("\n");
+
+        /* Show the hash bucket calculation */
+        $bucket = (@sql_hash[pid] % HT_MAX_ENTRIES);
+        $idx    = $bucket + 1;
+
+        printf("%ld %s    bucket calculation:\n", pid, comm);
+        printf("%ld %s     bucket =(hsh % 3) = (%u % 3) = %u\n", pid, comm, @sql_hash[pid], $bucket);
+        printf("%ld %s     index = bucket + 1 = %u + 1 = %u\n", pid, comm, $bucket, ($bucket + 1)); 
+    }
+
+    printf("\n%ld %s    The CURSORTRACE event settings are as follows:\n", pid, comm);
+
+    /* 
+     * When in cdb$root, iterate over all the 
+     * global hash tables in all pdbs, but only
+     * print the pdb hash tables that differ 
+     * from the cdb$root hash table.
+     */
+    if (@con_id[pid] == 1) {
+        $cdb_area = *(uint64 *) uptr(@ksmsgapdbareas[pid] + (1 * 0x8));
+        $ht_cdb   = *(uint64 *) ($cdb_area + HT_GBL_PTR_OFF);
+
+        $i=1;
+        while ($i < MAX_PDBS) {
+            $pdb_area = *(uint64 *) uptr(@ksmsgapdbareas[pid] + ($i * 0x8));
+
+            if ($pdb_area == 0) {
+                break;
+            }
+
+            $ht_gbl   = *(uint64 *) ($pdb_area + HT_GBL_PTR_OFF);
+            $all_gbl  = *(uint32 *) uptr($ht_gbl);
+            $cnt_gbl  = *(uint32 *) uptr($ht_gbl + HT_GBL_CNT_OFF);
+
+            $hsh_gbl1 = *(uint32 *) uptr($ht_gbl + HT_GBL_HSH_OFF + (0 * 8));
+            $hsh_gbl2 = *(uint32 *) uptr($ht_gbl + HT_GBL_HSH_OFF + (1 * 8));
+            $hsh_gbl3 = *(uint32 *) uptr($ht_gbl + HT_GBL_HSH_OFF + (2 * 8));
+
+            $flg_gbl1 = *(uint32 *) uptr($ht_gbl + HT_GBL_FLG_OFF + (0 * 8));
+            $flg_gbl2 = *(uint32 *) uptr($ht_gbl + HT_GBL_FLG_OFF + (1 * 8));
+            $flg_gbl3 = *(uint32 *) uptr($ht_gbl + HT_GBL_FLG_OFF + (2 * 8));
+
+            if (($i == 1) || ($ht_gbl && ($ht_gbl != $ht_cdb))) {
+                printf("%ld %s     CON_ID=%u Global (instance wide):\n", pid, comm, $i);
+                printf("%ld %s      flg_all=0x%09lx                    flg_all=0x%09lx\n", pid, comm, @all_gbl[pid,$i], $all_gbl);
+                printf("%ld %s      ht_gbl=0x%09lx                     ht_gbl=0x%09lx\n", pid, comm, @ht_gbl[pid,$i], $ht_gbl);
+                printf("%ld %s      ht_cnt=%u                               ht_cnt=%u\n", pid, comm, @cnt_gbl[pid,$i], $cnt_gbl);
+                printf("%ld %s      1. hash=0x%09lx flg=0x%09lx    1. hash=0x%09lx flg=0x%09lx\n", pid, comm, @hsh_gbl[pid,$i,0], @flg_gbl[pid,$i,0], $hsh_gbl1, $flg_gbl1);
+                printf("%ld %s      2. hash=0x%09lx flg=0x%09lx    2. hash=0x%09lx flg=0x%09lx\n", pid, comm, @hsh_gbl[pid,$i,1], @flg_gbl[pid,$i,1], $hsh_gbl2, $flg_gbl2);
+                printf("%ld %s      3. hash=0x%09lx flg=0x%09lx    3. hash=0x%09lx flg=0x%09lx\n\n", pid, comm, @hsh_gbl[pid,$i,2], @flg_gbl[pid,$i,2], $hsh_gbl3, $flg_gbl3);
+            }
+
+            $i++;
+        }
+    /*
+     * When in a pdb, only print 
+     * the pdb's global hash table.
+     */
+    } else {
+        $cid = @con_id[pid];
+        $pdb_area = *(uint64 *) uptr(@ksmsgapdbareas[pid] + ($cid * 0x8));
+        $ht_gbl   = *(uint64 *) ($pdb_area + HT_GBL_PTR_OFF);
+
+        $all_gbl = *(uint32 *) uptr($ht_gbl);
+        $cnt_gbl = *(uint32 *) uptr($ht_gbl + HT_GBL_CNT_OFF);
+
+        $hsh_gbl1 = *(uint32 *) uptr($ht_gbl + HT_GBL_HSH_OFF + (0 * 8));
+        $hsh_gbl2 = *(uint32 *) uptr($ht_gbl + HT_GBL_HSH_OFF + (1 * 8));
+        $hsh_gbl3 = *(uint32 *) uptr($ht_gbl + HT_GBL_HSH_OFF + (2 * 8));
+
+        $flg_gbl1 = *(uint32 *) uptr($ht_gbl + HT_GBL_FLG_OFF + (0 * 8));
+        $flg_gbl2 = *(uint32 *) uptr($ht_gbl + HT_GBL_FLG_OFF + (1 * 8));
+        $flg_gbl3 = *(uint32 *) uptr($ht_gbl + HT_GBL_FLG_OFF + (2 * 8));
+
+        printf("%ld %s     CON_ID=%u Global (instance wide):\n", pid, comm, $cid);
+        printf("%ld %s      flg_all=0x%09lx                    flg_all=0x%09lx\n", pid, comm, @all_gbl[pid,$cid], $all_gbl);
+        printf("%ld %s      ht_gbl=0x%09lx                     ht_gbl=0x%09lx\n", pid, comm, @ht_gbl[pid,$cid], $ht_gbl);
+        printf("%ld %s      ht_cnt=%u                               ht_cnt=%u\n", pid, comm, @cnt_gbl[pid,$cid], $cnt_gbl);
+        printf("%ld %s      1. hash=0x%09lx flg=0x%09lx    1. hash=0x%09lx flg=0x%09lx\n", pid, comm, @hsh_gbl[pid,$cid,0], @flg_gbl[pid,$cid,0], $hsh_gbl1, $flg_gbl1);
+        printf("%ld %s      2. hash=0x%09lx flg=0x%09lx    2. hash=0x%09lx flg=0x%09lx\n", pid, comm, @hsh_gbl[pid,$cid,1], @flg_gbl[pid,$cid,1], $hsh_gbl2, $flg_gbl2);
+        printf("%ld %s      3. hash=0x%09lx flg=0x%09lx    3. hash=0x%09lx flg=0x%09lx\n\n", pid, comm, @hsh_gbl[pid,$cid,2], @flg_gbl[pid,$cid,2], $hsh_gbl3, $flg_gbl3);
+    }
+
+    /* Local cursortrace settings (after) */
+    $all_lcl  = *(uint32 *) uptr(@ht_lcl[pid] + HT_LCL_ALL_OFF);
+    $cnt_lcl  = *(uint32 *) uptr(@ht_lcl[pid] + HT_LCL_CNT_OFF);
+
+    $hsh_lcl1 = *(uint32 *) uptr(@ht_lcl[pid] + HT_LCL_HSH_OFF + (0 * 8));
+    $hsh_lcl2 = *(uint32 *) uptr(@ht_lcl[pid] + HT_LCL_HSH_OFF + (1 * 8));
+    $hsh_lcl3 = *(uint32 *) uptr(@ht_lcl[pid] + HT_LCL_HSH_OFF + (2 * 8));
+
+    $flg_lcl1 = *(uint32 *) uptr(@ht_lcl[pid] + HT_LCL_FLG_OFF + (0 * 8));
+    $flg_lcl2 = *(uint32 *) uptr(@ht_lcl[pid] + HT_LCL_FLG_OFF + (1 * 8));
+    $flg_lcl3 = *(uint32 *) uptr(@ht_lcl[pid] + HT_LCL_FLG_OFF + (2 * 8));
+
+    printf("%ld %s     Local (session wide):\n", pid, comm);
+    printf("%ld %s      flg_all=0x%09lx                    flg_all=0x%09lx\n", pid, comm, @all_lcl[pid], $all_lcl);
+    printf("%ld %s      ht_lcl=0x%09lx                     ht_lcl=0x%09lx\n", pid, comm, @ht_lcl[pid], @ht_lcl[pid]);
+    printf("%ld %s      ht_cnt=%u                               ht_cnt=%u\n", pid, comm, @cnt_lcl[pid], $cnt_lcl);
+    printf("%ld %s      1. hash=0x%09lx flg=0x%09lx    1. hash=0x%09lx flg=0x%09lx\n", pid, comm, @hsh_lcl[pid,0], @flg_lcl[pid,0], $hsh_lcl1, $flg_lcl1);
+    printf("%ld %s      2. hash=0x%09lx flg=0x%09lx    2. hash=0x%09lx flg=0x%09lx\n", pid, comm, @hsh_lcl[pid,1], @flg_lcl[pid,1], $hsh_lcl2, $flg_lcl2);
+    printf("%ld %s      3. hash=0x%09lx flg=0x%09lx    3. hash=0x%09lx flg=0x%09lx\n\n", pid, comm, @hsh_lcl[pid,2], @flg_lcl[pid,2], $hsh_lcl3, $flg_lcl3);
+
+    printf("%ld %s <- kksCursorTrace\n\n", pid, comm);
+
+    delete(@in_trace[pid]);
+    delete(@sql_hash[pid]);
+    delete(@fs[pid]);
+    delete(@saddr[pid]);
+    delete(@con_id[pid]);
+    delete(@ksmsgapdbareas[pid]);
+
+    clear(@ht_gbl_p);
+    clear(@ht_gbl);
+    clear(@cnt_gbl);
+    clear(@all_gbl);
+    clear(@flg_gbl);
+    clear(@hsh_gbl);
+
+    delete(@ht_lcl[pid]);
+    delete(@all_lcl[pid]);
+    delete(@cnt_lcl[pid]);
+    clear(@hsh_lcl);
+    clear(@flg_lcl);
+}
+
+END 
+{
+    clear(@OPT_VERBOSE);
+    clear(@in_trace);
+    clear(@sql_hash);
+    clear(@fs);
+    clear(@saddr);
+    clear(@con_id);
+    clear(@ksmsgapdbareas);
+    clear(@ht_gbl_p);
+    clear(@ht_gbl);
+    clear(@cnt_gbl);
+    clear(@all_gbl);
+    clear(@ht_lcl);
+    clear(@all_lcl);
+    clear(@cnt_lcl);
+    clear(@hsh_lcl);
+    clear(@flg_lcl);
+}
