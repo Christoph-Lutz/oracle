@@ -40,6 +40,6 @@ begin
     dbms_output.put_line('Prefix  : ' ||rawtohex(l_pfx));
     dbms_output.put_line('Key     : ' ||rawtohex(l_key));
     dbms_output.put_line('Secret  : ' ||rawtohex(l_sec));
-    dbms_output.put_line('Pwd     : ' ||utl_raw.cast_to_varchar2(l_pwd));
+    dbms_output.put_line('Pwd     : ' ||utl_i18n.raw_to_char(l_pwd));
 end;
 /

@@ -33,7 +33,7 @@ with
                  key => l_key,
                  iv  => l_iv);
 
-    return utl_raw.cast_to_varchar2(l_pwd);
+    return utl_i18n.raw_to_char(l_pwd);
   end;
 select 
     username,
