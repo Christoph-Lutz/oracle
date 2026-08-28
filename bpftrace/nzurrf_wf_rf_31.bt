@@ -1,0 +1,275 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *   Probe the nzurrf_wf_31, nzurrf_rf_31, and related
+ *   helper functions to illustrate how Oracle 26ai pro-
+ *   tects auto-login wallets (cwallet.sso) with a random 
+ *   16-byte password and encrypts (obfuscates) it using 
+ *   a random 128-bit AES key.
+ *
+ * Date:
+ *   Aug-28 2026
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage: 
+ *   ./nzurrf_wf_rf_31.bt <pid>
+ *
+ * Tested on:
+ *   Oracle 23.26.0 / Exadata 25.2.6.0.0
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *
+ *   Use at your own risk!
+ */
+
+BEGIN
+{
+    if ($# != 1) {
+        printf("\nUsage: ./nzurrf_wf_rf_31.bt <pid>\n\n");
+        exit();
+    }
+
+    printf("Tracing, hit ^C to stop ...\n\n");
+}
+
+/* nzurrf_wf_a31 writes a new auto-login wallet */
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzurrf_wf_31
+/ pid == $1 /
+{
+    @in_trace_wf[pid] = 1;
+
+    printf("\n%ld %s -> nzurrf_wf_31\n", pid, comm);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzurrf_wf_31
+/ @in_trace_wf[pid] /
+{
+    printf("%ld %s <- nzurrf_wf_31: 0x%lx (%d)\n", pid, comm, retval, retval);
+
+    delete(@in_trace_wf[pid]);
+}
+
+/* nzurrf_rf_a31 reads an existing auto-login wallet */
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzurrf_rf_31
+/ pid == $1 /
+{
+    @in_trace_rf[pid] = 1;
+
+    printf("\n%ld %s -> nzurrf_rf_31\n", pid, comm);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzurrf_rf_31
+/ @in_trace_rf[pid] /
+{
+    printf("%ld %s <- nzurrf_rf_31: 0x%lx (%d)\n", pid, comm, retval, retval);
+
+    delete(@in_trace_rf[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzurcsh
+/ @in_trace_wf[pid] /
+{
+    $buf = (uint64) arg3;
+    printf("%ld %s -> nzurcsh: ?, ?, ? buf=%p, num=%d\n", pid, comm, arg3, arg4);
+
+    printf("%ld %s    buf e: 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($buf + 0),  *(uint8 *) uptr($buf + 1),  *(uint8 *) uptr($buf + 2),  *(uint8 *) uptr($buf + 3),
+           *(uint8 *) uptr($buf + 4),  *(uint8 *) uptr($buf + 5),  *(uint8 *) uptr($buf + 6),  *(uint8 *) uptr($buf + 7),
+           *(uint8 *) uptr($buf + 8),  *(uint8 *) uptr($buf + 9),  *(uint8 *) uptr($buf + 10), *(uint8 *) uptr($buf + 11),
+           *(uint8 *) uptr($buf + 12), *(uint8 *) uptr($buf + 13), *(uint8 *) uptr($buf + 14), *(uint8 *) uptr($buf + 15)
+    );
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzurcsh
+/ @in_trace_wf[pid] /
+{
+    printf("%ld %s <- nzurcsh: 0x%lx (%d)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzurcsc
+/ @in_trace_rf[pid] /
+{
+    $buf = (uint64) arg3;
+    printf("%ld %s -> nzurcsc: ...\n", pid, comm);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzurcsc
+/ @in_trace_rf[pid] /
+{
+    printf("%ld %s <- nzurcsc: 0x%lx (%d)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzty_random_get
+/ @in_trace_wf[pid] /
+{
+    @buf_nzty[pid] = (uint64) arg1;
+    printf("%ld %s -> nzty_random_get: ?, buf=%p, num=%d\n", pid, comm, arg1, arg2);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzty_random_get
+/ @in_trace_wf[pid] /
+{
+    $buf = (uint64) @buf_nzty[pid];
+
+    printf("%ld %s    buf r: 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($buf + 0),  *(uint8 *) uptr($buf + 1),  *(uint8 *) uptr($buf + 2),  *(uint8 *) uptr($buf + 3),
+           *(uint8 *) uptr($buf + 4),  *(uint8 *) uptr($buf + 5),  *(uint8 *) uptr($buf + 6),  *(uint8 *) uptr($buf + 7),
+           *(uint8 *) uptr($buf + 8),  *(uint8 *) uptr($buf + 9),  *(uint8 *) uptr($buf + 10), *(uint8 *) uptr($buf + 11),
+           *(uint8 *) uptr($buf + 12), *(uint8 *) uptr($buf + 13), *(uint8 *) uptr($buf + 14), *(uint8 *) uptr($buf + 15)
+    );
+
+    printf("%ld %s <- nzty_random_get: 0x%lx\n", pid, comm, retval);
+
+    delete(@buf_nzty[pid])
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzty_encrypt
+/ @in_trace_wf[pid] /
+{
+    $iv = (uint64) arg5;
+
+    printf("%ld %s -> nzty_encrypt: ?, ?, ?, buf=0x%lx, num=%d, iv=0x%lx, ...\n", pid, comm, arg3, arg4, arg5);
+
+    printf("%ld %s    iv e: 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($iv + 0),  *(uint8 *) uptr($iv + 1),  *(uint8 *) uptr($iv + 2),  *(uint8 *) uptr($iv + 3),
+           *(uint8 *) uptr($iv + 4),  *(uint8 *) uptr($iv + 5),  *(uint8 *) uptr($iv + 6),  *(uint8 *) uptr($iv + 7),
+           *(uint8 *) uptr($iv + 8),  *(uint8 *) uptr($iv + 9),  *(uint8 *) uptr($iv + 10), *(uint8 *) uptr($iv + 11),
+           *(uint8 *) uptr($iv + 12), *(uint8 *) uptr($iv + 13), *(uint8 *) uptr($iv + 14), *(uint8 *) uptr($iv + 15)
+    );
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzty_encrypt
+/ @in_trace_wf[pid] /
+{
+    printf("%ld %s <- nzty_encrypt: 0x%lx (%d)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzty_decrypt
+/ @in_trace_rf[pid] /
+{
+    $iv = (uint64) arg5;
+
+    printf("%ld %s -> nzty_decrypt: ?, ?, ?, ?, ?, iv=0x%lx, ...\n", pid, comm, arg5);
+
+    printf("%ld %s    iv e: 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($iv + 0),  *(uint8 *) uptr($iv + 1),  *(uint8 *) uptr($iv + 2),  *(uint8 *) uptr($iv + 3),
+           *(uint8 *) uptr($iv + 4),  *(uint8 *) uptr($iv + 5),  *(uint8 *) uptr($iv + 6),  *(uint8 *) uptr($iv + 7),
+           *(uint8 *) uptr($iv + 8),  *(uint8 *) uptr($iv + 9),  *(uint8 *) uptr($iv + 10), *(uint8 *) uptr($iv + 11),
+           *(uint8 *) uptr($iv + 12), *(uint8 *) uptr($iv + 13), *(uint8 *) uptr($iv + 14), *(uint8 *) uptr($iv + 15)
+    );
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzty_decrypt
+/ @in_trace_rf[pid] /
+{
+    printf("%ld %s <- nzty_decrypt: 0x%lx (%d)\n", pid, comm, retval, retval);
+}
+
+/* 
+ * Note: 
+ * Only trace calls to set_encrypt_keys with bits = 128
+ * to filter out calls that are not of interest.
+ */
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:aesni_set_encrypt_key
+/ (@in_trace_wf[pid] || @in_trace_rf[pid]) && arg1 == 128 /
+{
+    @uk[pid] = (uint64) arg0;
+    $a0 = (uint64) arg0;
+
+    printf("%ld %s -> aesni_set_encrypt_key: userKey=%p, bits=%d, key=%p\n", pid, comm, arg0, arg1, arg2);
+
+    printf("%ld %s    uk e : 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($a0 + 0),  *(uint8 *) uptr($a0 + 1),  *(uint8 *) uptr($a0 + 2),  *(uint8 *) uptr($a0 + 3),
+           *(uint8 *) uptr($a0 + 4),  *(uint8 *) uptr($a0 + 5),  *(uint8 *) uptr($a0 + 6),  *(uint8 *) uptr($a0 + 7),
+           *(uint8 *) uptr($a0 + 8),  *(uint8 *) uptr($a0 + 9),  *(uint8 *) uptr($a0 + 10), *(uint8 *) uptr($a0 + 11),
+           *(uint8 *) uptr($a0 + 12), *(uint8 *) uptr($a0 + 13), *(uint8 *) uptr($a0 + 14), *(uint8 *) uptr($a0 + 15)
+    );
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:aesni_set_encrypt_key
+/ (@in_trace_wf[pid] || @in_trace_rf[pid]) && @uk[pid] /
+{
+    printf("%ld %s <- aesni_set_encrypt_key: 0x%lx (%d)\n", pid, comm, retval, retval);
+
+    delete(@uk[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:RAND_bytes_ex
+/ @in_trace_wf[pid] /
+{
+    $ctx = (uint64) arg0;
+    @buf_ossl[pid] = (uint64) arg1;
+    $num = (uint32) arg2;
+
+    printf("%ld %s -> RAND_btyes_ex: ctx=%p, buf=%p, num=%d\n", pid, comm, $ctx, @buf_ossl[pid], $num);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:RAND_bytes_ex
+/ @in_trace_wf[pid] /
+{
+    $buf = (uint64) @buf_ossl[pid];
+
+    printf("%ld %s    buf r: 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($buf + 0),  *(uint8 *) uptr($buf + 1),  *(uint8 *) uptr($buf + 2),  *(uint8 *) uptr($buf + 3),
+           *(uint8 *) uptr($buf + 4),  *(uint8 *) uptr($buf + 5),  *(uint8 *) uptr($buf + 6),  *(uint8 *) uptr($buf + 7),
+           *(uint8 *) uptr($buf + 8),  *(uint8 *) uptr($buf + 9),  *(uint8 *) uptr($buf + 10), *(uint8 *) uptr($buf + 11),
+           *(uint8 *) uptr($buf + 12), *(uint8 *) uptr($buf + 13), *(uint8 *) uptr($buf + 14), *(uint8 *) uptr($buf + 15)
+    );
+
+    printf("%ld %s <- RAND_bytes_ex: 0x%lx (%d)\n", pid, comm, retval, retval);
+
+    delete(@buf_ossl[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:aesni_cbc_encrypt
+/ @in_trace_wf[pid] || @in_trace_rf[pid] /
+{
+    $a0 = (uint64) arg0;
+    $a4 = (uint64) arg4;
+    @out[pid] = (uint64) arg1;
+
+    printf("%ld %s -> aesni_cbc_encrypt: in=%p, out=%p, length=%d, key=%p, ivec=%p, enc=%d\n", pid, comm, arg0, arg1, arg2, arg3, arg4, arg5);
+
+    printf("%ld %s    in e : 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($a0 + 0),  *(uint8 *) uptr($a0 + 1),  *(uint8 *) uptr($a0 + 2),  *(uint8 *) uptr($a0 + 3),
+           *(uint8 *) uptr($a0 + 4),  *(uint8 *) uptr($a0 + 5),  *(uint8 *) uptr($a0 + 6),  *(uint8 *) uptr($a0 + 7),
+           *(uint8 *) uptr($a0 + 8),  *(uint8 *) uptr($a0 + 9),  *(uint8 *) uptr($a0 + 10), *(uint8 *) uptr($a0 + 11),
+           *(uint8 *) uptr($a0 + 12), *(uint8 *) uptr($a0 + 13), *(uint8 *) uptr($a0 + 14), *(uint8 *) uptr($a0 + 15)
+    );
+
+    printf("%ld %s    iv e : 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($a4 + 0),  *(uint8 *) uptr($a4 + 1),  *(uint8 *) uptr($a4 + 2),  *(uint8 *) uptr($a4 + 3),
+           *(uint8 *) uptr($a4 + 4),  *(uint8 *) uptr($a4 + 5),  *(uint8 *) uptr($a4 + 6),  *(uint8 *) uptr($a4 + 7),
+           *(uint8 *) uptr($a4 + 8),  *(uint8 *) uptr($a4 + 9),  *(uint8 *) uptr($a4 + 10), *(uint8 *) uptr($a4 + 11),
+           *(uint8 *) uptr($a4 + 12), *(uint8 *) uptr($a4 + 13), *(uint8 *) uptr($a4 + 14), *(uint8 *) uptr($a4 + 15)
+    );
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:aesni_cbc_encrypt
+/ @in_trace_wf[pid] || @in_trace_rf[pid] /
+{
+    $a1 = (uint64) @out[pid];
+
+    printf("%ld %s    out r: 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($a1 + 0),  *(uint8 *) uptr($a1 + 1),  *(uint8 *) uptr($a1 + 2),  *(uint8 *) uptr($a1 + 3),
+           *(uint8 *) uptr($a1 + 4),  *(uint8 *) uptr($a1 + 5),  *(uint8 *) uptr($a1 + 6),  *(uint8 *) uptr($a1 + 7),
+           *(uint8 *) uptr($a1 + 8),  *(uint8 *) uptr($a1 + 9),  *(uint8 *) uptr($a1 + 10), *(uint8 *) uptr($a1 + 11),
+           *(uint8 *) uptr($a1 + 12), *(uint8 *) uptr($a1 + 13), *(uint8 *) uptr($a1 + 14), *(uint8 *) uptr($a1 + 15)
+    );
+
+    printf("%ld %s <- aesni_cbc_encrypt\n", pid, comm);
+    delete(@out[pid]);
+}
+
+END
+{
+   clear(@in_trace_wf);
+   clear(@in_trace_rf);
+   clear(@out);
+   clear(@buf_nzty);
+   clear(@uk);
+   clear(@buf_ossl);
+}
