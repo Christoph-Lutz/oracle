@@ -136,7 +136,7 @@ if $ORACLE_HOME/bin/orapki wallet change_pwd \
 then
     printf "Changed extracted ewallet.p12 password\n\n"
 else
-    prinf "Failed to change extracted ewallet.p12 password\n\n"
+    printf "Failed to change extracted ewallet.p12 password\n\n"
     exit 1
 fi
 
