@@ -19,7 +19,7 @@
 #   Oracle 23.26.0 / OEL 8.10
 #
 # Usage:
-#   ./ssoLocalDecrypt26aiPassword.sh <wallet_root>
+#   ./ssoLocalDecrypt26aiPassword.sh <wallet_root> [<hostname>] [<username>] [<machine_id>]
 #
 
 # -------------------------------------------
@@ -27,22 +27,29 @@
 # -------------------------------------------
 readonly KEY_OFF=16
 readonly KEY_LEN=32
-readonly HOST_NAME="$(hostname)"
-readonly USER_NAME="$(whoami)"
-readonly MACHINE_ID="$(grep -v '^$' /etc/machine-id)"
 
 # -------------------------------------------
 # Script inputs
 # -------------------------------------------
-WALLET_ROOT="$1"
+readonly WALLET_ROOT="$1"
+
+if [[ $# -eq 4 ]] ; then
+  readonly HOST_NAME="$2"
+  readonly USER_NAME="$3"
+  readonly MACHINE_ID="$4"
+else 
+  readonly HOST_NAME="$(hostname)"
+  readonly USER_NAME="$(whoami)"
+  readonly MACHINE_ID="$(grep -v '^$' /etc/machine-id)"
+fi
 
 # -------------------------------------------
 # Checks
 # -------------------------------------------
 echo 
 
-if [[ $# -ne 1 ]] ; then
-    printf "Usage: $0 <wallet_root>\n\n"
+if [[ $# -ne 1 && $# -ne 4 ]] ; then
+    printf "Usage: $0 <wallet_root> [<hostname>] [<username>] [<machine_id>]\n\n"
     exit 1
 fi
 
