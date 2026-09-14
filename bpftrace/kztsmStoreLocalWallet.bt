@@ -1,0 +1,534 @@
+#!/usr/bin/env -S bpftrace --no-warnings
+/*
+ * Purpose:
+ *  Probe the kztsmStoreLocalWallet, nurrf_rf_32, and
+ *  related helper functions to illustrate how Oracle
+ *  26ai protects local auto-login wallets (cwallet.sso)
+ *  with a password that is derived from a hmac-sha256 
+ *  that uses the following inputs:
+ *    msg = sha256(hostname, username, machine id)
+ *    key = randomly generated 32-byte valu
+ *
+ *  Oracle 26ai encodes the hmac-sha256 output using 
+ *  base64 and uses it as the password to protect the 
+ *  ewallet.p12 contents embedded in the cwallt.sso 
+ *  file.
+ *
+ * Date:
+ *   Sep-01 2026
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./kztsmStoreLocalWallet.bt <pid>
+ *
+ * Tested on:
+ *   Oracle 23.26.0 / Exadata 25.2.6
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ *
+ *   Use at your own risk!
+ */
+
+struct ossl_param_st {
+    const char *key;             /* the name of the parameter               */
+    unsigned int data_type;      /* declare what kind of content is in data */
+    void *data;                  /* value being passed in or out            */
+    size_t data_size;            /* data size                               */
+    size_t return_size;          /* returned size                           */
+};
+
+BEGIN
+{
+    printf("Tracing, hit ^C to stop ...\n\n");
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kztsmStoreLocalWallet
+/ pid == $1 /
+{
+    @in_trace[pid] = 1;
+    printf("%ld %s -> kztsmStoreLocalWallet: %p, %p, %p, %p, %p, %p\n", pid, comm, arg0, arg1, arg2, arg3, arg4, arg5);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kztsmStoreLocalWallet
+/ @in_trace[pid] /
+{
+    printf("%ld %s <- kztsmStoreLocalWallet: 0x%lx (%d)\n", pid, comm, retval, retval); 
+    delete(@in_trace[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzurrf_rf_32
+/ @in_trace[pid] /
+{
+    printf("%ld %s -> nzurrf_rf_32: %p, %p, %p, %p, %p\n", pid, comm, arg0, arg1, arg2, arg3, arg4);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzurrf_rf_32
+/ @in_trace[pid] /
+{
+    printf("%ld %s <- nzurrf_rf_32: 0x%lx (%d)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzty_random_get
+/ @in_trace[pid] /
+{
+    @in_nzty_rand[pid] = 1;
+    @buf_nzty[pid] = (uint64) arg1;
+
+    printf("%ld %s -> nzty_random_get: %p, buf=%p, num=%d\n", pid, comm, arg0, arg1, arg2);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzty_random_get
+/ @in_trace[pid] /
+{
+    $buf = (uint64) @buf_nzty[pid];
+
+    printf("%ld %s    buf r: 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($buf + 0),  *(uint8 *) uptr($buf + 1),  *(uint8 *) uptr($buf + 2),  *(uint8 *) uptr($buf + 3),
+           *(uint8 *) uptr($buf + 4),  *(uint8 *) uptr($buf + 5),  *(uint8 *) uptr($buf + 6),  *(uint8 *) uptr($buf + 7),
+           *(uint8 *) uptr($buf + 8),  *(uint8 *) uptr($buf + 9),  *(uint8 *) uptr($buf + 10), *(uint8 *) uptr($buf + 11),
+           *(uint8 *) uptr($buf + 12), *(uint8 *) uptr($buf + 13), *(uint8 *) uptr($buf + 14), *(uint8 *) uptr($buf + 15)
+    );
+
+    printf("%ld %s           0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($buf + 16), *(uint8 *) uptr($buf + 17), *(uint8 *) uptr($buf + 18), *(uint8 *) uptr($buf + 19),
+           *(uint8 *) uptr($buf + 20), *(uint8 *) uptr($buf + 21), *(uint8 *) uptr($buf + 22), *(uint8 *) uptr($buf + 23),
+           *(uint8 *) uptr($buf + 24), *(uint8 *) uptr($buf + 25), *(uint8 *) uptr($buf + 26), *(uint8 *) uptr($buf + 27),
+           *(uint8 *) uptr($buf + 28), *(uint8 *) uptr($buf + 29), *(uint8 *) uptr($buf + 30), *(uint8 *) uptr($buf + 31)
+    );
+
+    printf("%ld %s <- nzty_random_get: 0x%lx\n", pid, comm, retval);
+
+    delete(@in_nzty_rand[pid]);
+    delete(@buf_nzty[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:RAND_bytes_ex
+/ @in_nzty_rand[pid] /
+{
+    @buf_rand[pid] = (uint64) arg1;
+
+    printf("%ld %s -> RAND_bytes_ex: ctx=%p, buf=%p, num=%d\n", pid, comm, arg0, arg1, arg2);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:RAND_bytes_ex
+/ @in_nzty_rand[pid] && @buf_rand[pid] /
+{
+    $buf = (uint64) @buf_rand[pid];
+
+    printf("%ld %s    buf r: 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($buf + 0),  *(uint8 *) uptr($buf + 1),  *(uint8 *) uptr($buf + 2),  *(uint8 *) uptr($buf + 3),
+           *(uint8 *) uptr($buf + 4),  *(uint8 *) uptr($buf + 5),  *(uint8 *) uptr($buf + 6),  *(uint8 *) uptr($buf + 7),
+           *(uint8 *) uptr($buf + 8),  *(uint8 *) uptr($buf + 9),  *(uint8 *) uptr($buf + 10), *(uint8 *) uptr($buf + 11),
+           *(uint8 *) uptr($buf + 12), *(uint8 *) uptr($buf + 13), *(uint8 *) uptr($buf + 14), *(uint8 *) uptr($buf + 15)
+    );
+
+    printf("%ld %s           0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($buf + 16), *(uint8 *) uptr($buf + 17), *(uint8 *) uptr($buf + 18), *(uint8 *) uptr($buf + 19),
+           *(uint8 *) uptr($buf + 20), *(uint8 *) uptr($buf + 21), *(uint8 *) uptr($buf + 22), *(uint8 *) uptr($buf + 23),
+           *(uint8 *) uptr($buf + 24), *(uint8 *) uptr($buf + 25), *(uint8 *) uptr($buf + 26), *(uint8 *) uptr($buf + 27),
+           *(uint8 *) uptr($buf + 28), *(uint8 *) uptr($buf + 29), *(uint8 *) uptr($buf + 30), *(uint8 *) uptr($buf + 31)
+    );
+
+    printf("%ld %s <- RAND_bytes_ex: 0x%lx (%d)\n", pid, comm, retval, retval);
+
+    delete(@buf_rand[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzur_getssvdata
+/ @in_trace[pid] /
+{
+    @system_data[pid] = (uint64) arg4;
+
+    printf("%ld %s -> nzur_getssvdata: %p, %p, %p, %p, system_data=%p\n", pid, comm, arg0, arg1, arg2, arg3, arg4);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzur_getssvdata
+/ @in_trace[pid] /
+{
+    printf("%ld %s    system_data r: %s\n", pid, comm, str(uptr(@system_data[pid])));
+    printf("%ld %s <- nzur_getssvdata: 0x%lx (%d)\n", pid, comm, retval, retval);
+
+    delete(@system_data[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ssv_get
+/ @in_trace[pid] /
+{
+    @ssv_str[pid] = (uint64) arg3;
+
+    printf("%ld %s -> ssv_get: 0x%lx, 0x%lx, 0x%lx, str=0x%lx, len=%d, 0x%lx\n", pid, comm, arg0, arg1, arg2, arg3, arg4, arg5);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ssv_get
+/ @in_trace[pid] /
+{
+    printf("%ld %s <- ssv_get: 0x%lx (%d)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ssv_get_hostname
+/ @in_trace[pid] /
+{
+    printf("%ld %s -> ssv_get_hostname: str=0x%lx, len=%d\n", pid, comm, arg0, arg1);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ssv_get_hostname
+/ @in_trace[pid] /
+{
+    printf("%ld %s    str r: %s\n", pid, comm, str(uptr(@ssv_str[pid])));
+    printf("%ld %s <- ssv_get_hostname: 0x%lx (%d)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ssv_get_username
+/ @in_trace[pid] /
+{
+    printf("%ld %s -> ssv_get_username: str=0x%lx, len=%d\n", pid, comm, arg0, arg1);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ssv_get_username
+/ @in_trace[pid] /
+{
+    printf("%ld %s    str r: %s\n", pid, comm, str(uptr(@ssv_str[pid])));
+    printf("%ld %s <- ssv_get_username: 0x%lx (%d)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ssv_get_machine_id
+/ @in_trace[pid] /
+{
+    printf("%ld %s -> ssv_get_machine_id: %p, str=0x%lx, len=%d\n", pid, comm, arg0, arg1, arg2);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ssv_get_machine_id
+/ @in_trace[pid] /
+{
+    printf("%ld %s    str r: %s\n", pid, comm, str(uptr(@ssv_str[pid])));
+    printf("%ld %s <- ssv_get_machine_id: 0x%lx (%d)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzty_digest
+/ @in_trace[pid] /
+{
+    @in_digest[pid] = 1;
+
+    printf("%ld %s -> nzty_digest: %p, %p, digest=%p, cnt=%u, %p, %p\n", pid, comm, arg0, arg1, arg2, arg3, arg4, arg5);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzty_digest
+/ @in_digest[pid] /
+{
+    printf("%ld %s <- nzty_digest: 0x%lx (%d)\n", pid, comm, retval, retval);
+
+    delete(@in_digest[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:EVP_DigestInit
+/ @in_digest[pid] /
+{
+    printf("%ld %s -> EVP_DigestInit: ctx=%p, type=%p (*type=%d)\n", pid, comm, arg0, arg1, *(uint32 *) arg1);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:EVP_DigestInit
+/ @in_digest[pid] /
+{
+    printf("%ld %s <- EVP_DigestInit: 0x%lx (%d)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:EVP_DigestUpdate
+/ @in_digest[pid] /
+{
+    printf("%ld %s -> EVP_DigestUpdate: ctx=%p, d=%p, cnt=%u\n", pid, comm, arg0, arg1, arg2);
+    printf("%ld %s    d e:  %s\n", pid, comm, str(uptr(arg1)));
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:EVP_DigestUpdate
+/ @in_digest[pid] /
+{
+    printf("%ld %s <- EVP_DigestUpdate: 0x%lx (%d)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:EVP_DigestFinal
+/ @in_digest[pid] /
+{
+    @md[pid] = (uint64) arg1;
+    @s[pid] = (uint64) arg2;
+
+    printf("%ld %s -> EVP_DigestFinal: ctx=%p, md=%p, s=%p\n", pid, comm, arg0, arg1, arg2);
+    printf("%ld %s    s e : %u\n", pid, comm, *(uint32 *) arg2);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:EVP_DigestFinal
+/ @in_digest[pid] /
+{
+    $md = (uint64) @md[pid];
+    $s = (uint64) @s[pid];
+
+    printf("%ld %s    s r : %u\n", pid, comm, *(uint32 *) $s);
+
+    printf("%ld %s    md r: 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($md + 0),  *(uint8 *) uptr($md + 1),  *(uint8 *) uptr($md + 2),  *(uint8 *) uptr($md + 3),
+           *(uint8 *) uptr($md + 4),  *(uint8 *) uptr($md + 5),  *(uint8 *) uptr($md + 6),  *(uint8 *) uptr($md + 7),
+           *(uint8 *) uptr($md + 8),  *(uint8 *) uptr($md + 9),  *(uint8 *) uptr($md + 10), *(uint8 *) uptr($md + 11),
+           *(uint8 *) uptr($md + 12), *(uint8 *) uptr($md + 13), *(uint8 *) uptr($md + 14), *(uint8 *) uptr($md + 15)
+    );
+
+    printf("%ld %s          0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($md + 16), *(uint8 *) uptr($md + 17), *(uint8 *) uptr($md + 18), *(uint8 *) uptr($md + 19),
+           *(uint8 *) uptr($md + 20), *(uint8 *) uptr($md + 21), *(uint8 *) uptr($md + 22), *(uint8 *) uptr($md + 23),
+           *(uint8 *) uptr($md + 24), *(uint8 *) uptr($md + 25), *(uint8 *) uptr($md + 26), *(uint8 *) uptr($md + 27),
+           *(uint8 *) uptr($md + 28), *(uint8 *) uptr($md + 29), *(uint8 *) uptr($md + 30), *(uint8 *) uptr($md + 31)
+    );
+
+    printf("%ld %s <- EVP_DigestFinal: 0x%lx (%d)\n", pid, comm, retval, retval);
+
+    delete(@md[pid]);
+    delete(@s[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzty_hmac256
+/ @in_trace[pid] /
+{
+    @in_hmac256[pid] = 1;
+    $a1 = (uint64) arg1;
+
+    $rsp = (uint64) reg("sp");
+    $a6  = *(uint64 *) ($rsp + 0x8);
+
+    printf("%ld %s -> nzty_hmac256: %p, key=%p, %d, data=%p, %d, %p, %p\n", pid, comm, arg0, arg1, arg2, arg3, arg4, arg5, $a6);
+
+    printf("%ld %s    key e: 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($a1 + 0),  *(uint8 *) uptr($a1 + 1),  *(uint8 *) uptr($a1 + 2),  *(uint8 *) uptr($a1 + 3),
+           *(uint8 *) uptr($a1 + 4),  *(uint8 *) uptr($a1 + 5),  *(uint8 *) uptr($a1 + 6),  *(uint8 *) uptr($a1 + 7),
+           *(uint8 *) uptr($a1 + 8),  *(uint8 *) uptr($a1 + 9),  *(uint8 *) uptr($a1 + 10), *(uint8 *) uptr($a1 + 11),
+           *(uint8 *) uptr($a1 + 12), *(uint8 *) uptr($a1 + 13), *(uint8 *) uptr($a1 + 14), *(uint8 *) uptr($a1 + 15)
+    );
+
+    printf("%ld %s           0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($a1 + 16), *(uint8 *) uptr($a1 + 17), *(uint8 *) uptr($a1 + 18), *(uint8 *) uptr($a1 + 19),
+           *(uint8 *) uptr($a1 + 20), *(uint8 *) uptr($a1 + 21), *(uint8 *) uptr($a1 + 22), *(uint8 *) uptr($a1 + 23),
+           *(uint8 *) uptr($a1 + 24), *(uint8 *) uptr($a1 + 25), *(uint8 *) uptr($a1 + 26), *(uint8 *) uptr($a1 + 27),
+           *(uint8 *) uptr($a1 + 28), *(uint8 *) uptr($a1 + 29), *(uint8 *) uptr($a1 + 30), *(uint8 *) uptr($a1 + 31)
+    );
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzty_hmac256
+/ @in_hmac256[pid] /
+{
+    printf("%ld %s <- nzty_hmac256: 0x%lx (%d)\n", pid, comm, retval, retval);
+
+    delete(@in_hmac256[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:EVP_MAC_CTX_set_params
+/ @in_trace[pid] /
+{
+    @params[pid] = (struct ossl_param_st *) arg1;
+
+    $p0 = (struct ossl_param_st *)  @params[pid];
+    $p1 = (struct ossl_param_st *) (@params[pid] + 1);
+    $p2 = (struct ossl_param_st *) (@params[pid] + 2);
+
+    printf("%ld %s -> EVP_MAC_CTX_set_params: ctx=%p, params=%p\n", pid, comm, arg0, arg1);
+
+    printf("%ld %s    OSSL_PARAMS:\n", pid, comm);
+
+    printf("%ld %s      p0->key e        : %s\n", pid, comm, str(uptr($p0->key)));
+    printf("%ld %s      p0->data e       : %s\n", pid, comm, str(uptr($p0->data)));
+    printf("%ld %s      p0->data_size e  : %u\n", pid, comm, $p0->data_size);
+
+    printf("%ld %s      p1->key e        : %s\n", pid, comm, str(uptr($p1->key)));
+    printf("%ld %s      p1->data e       : %p\n", pid, comm, $p1->data);
+    printf("%ld %s      p1->data_size e  : %u\n", pid, comm, $p1->data_size);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:EVP_MAC_CTX_set_params
+/ @in_trace[pid] /
+{
+    printf("%ld %s <- EVP_MAC_CTX_set_params 0x%lx (%d)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:EVP_MAC_init
+/ @in_hmac256[pid] /
+{
+    $key = (uint64) arg1;
+
+    printf("%ld %s -> EVP_MAC_init: ctx=%p, key=0x%lx, keylen=%u, params=0x%lx\n", pid, comm, arg0, arg1, arg2, arg3);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:EVP_MAC_init
+/ @in_hmac256[pid] /
+{
+    printf("%ld %s <- EVP_MAC_init: 0x%lx (%d)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:EVP_MAC_update
+/ @in_hmac256[pid] /
+{
+    $d = (uint64) arg1;
+
+    printf("%ld %s -> EVP_MAC_update ctx=%p, data=%p, datalen=%u\n", pid, comm, arg0, arg1, arg2);
+
+    printf("%ld %s    data e: 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($d + 0),  *(uint8 *) uptr($d + 1),  *(uint8 *) uptr($d + 2),  *(uint8 *) uptr($d + 3),
+           *(uint8 *) uptr($d + 4),  *(uint8 *) uptr($d + 5),  *(uint8 *) uptr($d + 6),  *(uint8 *) uptr($d + 7),
+           *(uint8 *) uptr($d + 8),  *(uint8 *) uptr($d + 9),  *(uint8 *) uptr($d + 10), *(uint8 *) uptr($d + 11),
+           *(uint8 *) uptr($d + 12), *(uint8 *) uptr($d + 13), *(uint8 *) uptr($d + 14), *(uint8 *) uptr($d + 15)
+    );
+
+    printf("%ld %s            0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($d + 16), *(uint8 *) uptr($d + 17), *(uint8 *) uptr($d + 18), *(uint8 *) uptr($d + 19),
+           *(uint8 *) uptr($d + 20), *(uint8 *) uptr($d + 21), *(uint8 *) uptr($d + 22), *(uint8 *) uptr($d + 23),
+           *(uint8 *) uptr($d + 24), *(uint8 *) uptr($d + 25), *(uint8 *) uptr($d + 26), *(uint8 *) uptr($d + 27),
+           *(uint8 *) uptr($d + 28), *(uint8 *) uptr($d + 29), *(uint8 *) uptr($d + 30), *(uint8 *) uptr($d + 31)
+    );
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:EVP_MAC_update
+/ @in_hmac256[pid] /
+{
+    printf("%ld %s <- EVP_MAC_update: 0x%lx (%d)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:EVP_MAC_final
+/ @in_hmac256[pid] /
+{
+    @out_mac[pid] = (uint64) arg1;
+
+    printf("%ld %s -> EVP_MAC_final ctx=%p, out=%p, outl=%p, outsize=%u\n", pid, comm, arg0, arg1, arg2, arg3);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:EVP_MAC_final
+/ @in_hmac256[pid] /
+{
+    $out = (uint64) @out_mac[pid];
+
+    printf("%ld %s    out r: 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($out + 0),  *(uint8 *) uptr($out + 1),  *(uint8 *) uptr($out + 2),  *(uint8 *) uptr($out + 3),
+           *(uint8 *) uptr($out + 4),  *(uint8 *) uptr($out + 5),  *(uint8 *) uptr($out + 6),  *(uint8 *) uptr($out + 7),
+           *(uint8 *) uptr($out + 8),  *(uint8 *) uptr($out + 9),  *(uint8 *) uptr($out + 10), *(uint8 *) uptr($out + 11),
+           *(uint8 *) uptr($out + 12), *(uint8 *) uptr($out + 13), *(uint8 *) uptr($out + 14), *(uint8 *) uptr($out + 15)
+    );
+
+    printf("%ld %s           0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($out + 16), *(uint8 *) uptr($out + 17), *(uint8 *) uptr($out + 18), *(uint8 *) uptr($out + 19),
+           *(uint8 *) uptr($out + 20), *(uint8 *) uptr($out + 21), *(uint8 *) uptr($out + 22), *(uint8 *) uptr($out + 23),
+           *(uint8 *) uptr($out + 24), *(uint8 *) uptr($out + 25), *(uint8 *) uptr($out + 26), *(uint8 *) uptr($out + 27),
+           *(uint8 *) uptr($out + 28), *(uint8 *) uptr($out + 29), *(uint8 *) uptr($out + 30), *(uint8 *) uptr($out + 31)
+    );
+
+    printf("%ld %s <- EVP_MAC_final 0x%lx (%d)\n", pid, comm, retval, retval);
+
+    delete(@out_mac[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzbc_der_to_b64
+/ @in_trace[pid] /
+{
+    @in_b64[pid] = 1;
+    printf("%ld %s -> nzbc_der_to_b64: %p, f=%p, n=%u, %p, %p\n", pid, comm, arg0, arg1, arg2, arg3, arg4);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:nzbc_der_to_b64
+/ @in_b64[pid] /
+{
+    printf("%ld %s <- nzbc_der_to_b64: 0x%lx (%d)\n", pid, comm, retval, retval);
+    delete(@in_b64[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:EVP_EncodeBlock
+/ @in_b64[pid] /
+{
+    @t[pid] = (uint64) arg0;
+    $f = (uint64) arg1;
+
+    printf("%ld %s -> EVP_EncodeBlock: t=%p, f=%p, n=%u\n", pid, comm, arg0, arg1, arg2);
+
+    printf("%ld %s    f e: 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($f + 0),  *(uint8 *) uptr($f + 1),  *(uint8 *) uptr($f + 2),  *(uint8 *) uptr($f + 3),
+           *(uint8 *) uptr($f + 4),  *(uint8 *) uptr($f + 5),  *(uint8 *) uptr($f + 6),  *(uint8 *) uptr($f + 7),
+           *(uint8 *) uptr($f + 8),  *(uint8 *) uptr($f + 9),  *(uint8 *) uptr($f + 10), *(uint8 *) uptr($f + 11),
+           *(uint8 *) uptr($f + 12), *(uint8 *) uptr($f + 13), *(uint8 *) uptr($f + 14), *(uint8 *) uptr($f + 15)
+    );
+
+    printf("%ld %s         0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($f + 16), *(uint8 *) uptr($f + 17), *(uint8 *) uptr($f + 18), *(uint8 *) uptr($f + 19),
+           *(uint8 *) uptr($f + 20), *(uint8 *) uptr($f + 21), *(uint8 *) uptr($f + 22), *(uint8 *) uptr($f + 23),
+           *(uint8 *) uptr($f + 24), *(uint8 *) uptr($f + 25), *(uint8 *) uptr($f + 26), *(uint8 *) uptr($f + 27),
+           *(uint8 *) uptr($f + 28), *(uint8 *) uptr($f + 29), *(uint8 *) uptr($f + 30), *(uint8 *) uptr($f + 31)
+    );
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:EVP_EncodeBlock
+/ @in_b64[pid] /
+{
+    $t = (uint64) @t[pid];
+
+    printf("%ld %s    t r: 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($t + 0),  *(uint8 *) uptr($t + 1),  *(uint8 *) uptr($t + 2),  *(uint8 *) uptr($t + 3),
+           *(uint8 *) uptr($t + 4),  *(uint8 *) uptr($t + 5),  *(uint8 *) uptr($t + 6),  *(uint8 *) uptr($t + 7),
+           *(uint8 *) uptr($t + 8),  *(uint8 *) uptr($t + 9),  *(uint8 *) uptr($t + 10), *(uint8 *) uptr($t + 11),
+           *(uint8 *) uptr($t + 12), *(uint8 *) uptr($t + 13), *(uint8 *) uptr($t + 14), *(uint8 *) uptr($t + 15)
+    );
+
+    printf("%ld %s         0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($t + 16), *(uint8 *) uptr($t + 17), *(uint8 *) uptr($t + 18), *(uint8 *) uptr($t + 19),
+           *(uint8 *) uptr($t + 20), *(uint8 *) uptr($t + 21), *(uint8 *) uptr($t + 22), *(uint8 *) uptr($t + 23),
+           *(uint8 *) uptr($t + 24), *(uint8 *) uptr($t + 25), *(uint8 *) uptr($t + 26), *(uint8 *) uptr($t + 27),
+           *(uint8 *) uptr($t + 28), *(uint8 *) uptr($t + 29), *(uint8 *) uptr($t + 30), *(uint8 *) uptr($t + 31)
+    );
+
+    printf("%ld %s <- EVP_EncodeBlock: 0x%lx (%d)\n", pid, comm, retval, retval);
+
+    delete(@t[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:PKCS12_pbe_crypt_ex
+/ @in_trace[pid] /
+{
+    $a1     = (uint64) arg1; 
+    $rsp    = (uint64) reg("sp");
+    $en_de  = *(uint64 *) ($rsp + 0x10);
+
+    printf("%ld %s -> PKCS12_pbe_crypt_ex: algor=%p, pass=%p, passlen=%d, ... en_de=%u\n", pid, comm, arg0, arg1, (int32) arg2, $en_de);
+
+    printf("%ld %s    pass e      : 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($a1 + 0),  *(uint8 *) uptr($a1 + 1),  *(uint8 *) uptr($a1 + 2),  *(uint8 *) uptr($a1 + 3),
+           *(uint8 *) uptr($a1 + 4),  *(uint8 *) uptr($a1 + 5),  *(uint8 *) uptr($a1 + 6),  *(uint8 *) uptr($a1 + 7),
+           *(uint8 *) uptr($a1 + 8),  *(uint8 *) uptr($a1 + 9),  *(uint8 *) uptr($a1 + 10), *(uint8 *) uptr($a1 + 11),
+           *(uint8 *) uptr($a1 + 12), *(uint8 *) uptr($a1 + 13), *(uint8 *) uptr($a1 + 14), *(uint8 *) uptr($a1 + 15)
+    );
+
+    printf("%ld %s                : 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n", pid, comm,
+           *(uint8 *) uptr($a1 + 16), *(uint8 *) uptr($a1 + 17), *(uint8 *) uptr($a1 + 18), *(uint8 *) uptr($a1 + 19),
+           *(uint8 *) uptr($a1 + 20), *(uint8 *) uptr($a1 + 21), *(uint8 *) uptr($a1 + 22), *(uint8 *) uptr($a1 + 23),
+           *(uint8 *) uptr($a1 + 24), *(uint8 *) uptr($a1 + 25), *(uint8 *) uptr($a1 + 26), *(uint8 *) uptr($a1 + 27),
+           *(uint8 *) uptr($a1 + 28), *(uint8 *) uptr($a1 + 29), *(uint8 *) uptr($a1 + 30), *(uint8 *) uptr($a1 + 31)
+    );
+
+    printf("%ld %s    pass e (str): %s\n", pid, comm, str(uptr(arg1)));
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/lib/libnnzsrv.so:PKCS12_pbe_crypt_ex
+/ @in_trace[pid] /
+{
+    printf("%ld %s <- PKCS12_pbe_crypt_ex: 0x%lx (%d)\n", pid, comm, retval, retval);
+}
+
+END
+{
+   clear(@in_trace);
+   clear(@in_nzty_rand);
+   clear(@ssv_str);
+   clear(@in_digest);
+   clear(@buf_nzty);
+   clear(@buf_rand);
+   clear(@system_data);
+   clear(@md);
+   clear(@s);
+   clear(@out_mac);
+   clear(@t);
+   clear(@in_hmac256);
+   clear(@in_b64);
+   clear(@params);
+}
