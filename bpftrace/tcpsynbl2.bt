@@ -1,0 +1,60 @@
+#!/usr/bin/env bpftrace
+/*
+ * tcpsynbl - Show TCP SYN backlog as a histogram.
+ *
+ * See BPF Performance Tools, Chapter 10, for an explanation of this tool.
+ *
+ * Copyright (c) 2019 Brendan Gregg.
+ * Licensed under the Apache License, Version 2.0 (the "License").
+ * This was originally created for the BPF Performance Tools book
+ * published by Addison Wesley. ISBN-13: 9780136554820
+ * When copying or porting, include this comment.
+ *
+ * 19-Apr-2019  Brendan Gregg   Created this.
+ * 14-Feb-2020  Christoph Lutz  Print laddr/lport details on socket overflow.
+ */
+
+#include <net/sock.h>
+#include <linux/socket.h>
+#include <linux/tcp.h>
+
+
+BEGIN
+{
+	printf("Tracing SYN backlog size. Ctrl-C to end.\n");
+}
+
+kprobe:tcp_v4_syn_recv_sock,
+kprobe:tcp_v6_syn_recv_sock
+{
+	$sock = (struct sock *)arg0;
+	@backlog[$sock->sk_max_ack_backlog & 0xffffffff] =
+	    hist($sock->sk_ack_backlog);
+	if ($sock->sk_ack_backlog > $sock->sk_max_ack_backlog) {
+		$af = $sock->__sk_common.skc_family;
+		if ($af == AF_INET) {
+			$ireq = (struct inet_request_sock *)arg2;
+			$raddr = ntop($af, $ireq -> ir_rmt_addr);
+			$laddr = ntop($af, $ireq -> ir_loc_addr);
+			$lport = $ireq -> ir_num;
+			/* 
+			 * Notes:  
+			 *  - rport is big endian, flip it. 
+			 *  - rport seems to have a bogus value
+			 *    (maybe because it hasn't been initialized
+                         *    at this stage?)
+			 */
+			 $rport = $ireq -> ir_rmt_port;                 
+			 $rport = ($rport >> 8) | (($rport << 8) & 0xff00);
+			 
+                        time("%Y-%m-%d %H:%M:%S dropping SYN: ");
+			printf("%s -> %s:%d (bl: %d, max_bl: %d)\n", $raddr, $laddr, $lport, 
+				$sock->sk_ack_backlog, $sock->sk_max_ack_backlog);
+		}
+	}
+}
+
+END
+{
+	printf("\n@backlog[backlog limit]: histogram of backlog size\n");
+}
