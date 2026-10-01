@@ -1,0 +1,673 @@
+#!/usr/bin/env -S bpftrace --no-warnings 
+/*
+ * Purpose:
+ *   Trace kcrfw_defer_write to illustrate how Pipelined Log
+ *   Writes can defer a log write request until either a time-
+ *   out or a target write size threshold is exceeded. Both
+ *   thresholds are dynamically computed at runtime.
+ *
+ * Date:
+ *   Oct-12 2025
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./kcrfw_defer_write.bt <oracle_sid>
+ *
+ * Tested on:
+ *   Oracle 19.26 / Exadata 25.1.7 (X10M)
+ *
+ * Notes:
+ *   Adjust the ORACLE_HOME path for your environment.
+ * 
+ *   Use at your own risk!
+ */
+
+#include <stdint.h>
+
+/* Addresses and offsets my change in every RU!                                      */
+#define KSPSSIDST                  0x60009628  /* oracle sid name                    */
+
+#define KCRF_SLAVE_INFO            0x60022008  /* kcrf_slave_info_                   */
+#define KCRF_FAST_SYNC             0x60021f1c  /* kcrf_fast_sync_                    */
+#define KCRF_OLRW_ENABLED          0x3         /* olrw enabled (kcrf_slave_info_)    */
+
+#define KLASSVP7                   0x6005dc00  /* klassvp7_: alwe info               */
+#define KLASSVP8                   0x6005dc08  /* klassvp8_: olrw info               */
+
+#define KCRFWSLV_LGWR_MODE         0x6002200c  /* lgwr mode (0=serial, 1=parallel)   */
+#define KCRFWSLV_MAX_LOG_WRITE_PAR 0x60022274  /* max_log_write_parallelism          */
+#define KCRFWSLV_MAX_OUT_LOG_WRI   0x6002202c  /* max_outstanding_log_writes         */
+#define KCRFWSLV_MY_INFO_TLS_OFF   0xec80      /* kcrfw_slave_my_info tls offset     */ 
+
+#define ALWE_FLG_NORMAL_PHASE      0x1         /* alwe normal phase                  */
+#define ALWE_FLG_EVAL_PHASE        0x2         /* alwe evaluation phase              */
+#define ALWE_FLG_LFS               0x10        /* alwe log file sync adj             */
+#define ALWE_MIN_WRITE_THRESH      0x20        /* alwe minimum write threshold (32)  */
+
+#define OLRW_FLG_ENABLED           0x1         /* olrw enabled                       */
+#define OLRW_FLG_THICK_MODE        0x4         /* olrw thick mode                    */
+
+#define KSUSE_TLS_OFF              0xff78      /* ksuse tls offset                   */
+#define KSUSE_STATS_OFF            0x7f8       /* ksuse stats array offset           */
+
+#define STA_REDO_THIN_OL_ALL       1974        /* adapt. ol writes thin mode (all)   */
+#define STA_REDO_THIN_OL_SZ        1975        /* adapt. ol writes thin mode (size)  */
+#define STA_REDO_THICK_OL_ALL      1977        /* adapt. ol writes thick mode (all)  */
+#define STA_REDO_THICK_OL_SZ       1978        /* adapt. ol writes thick mode (size) */
+
+#define THICK_MODE_SZ_INC          0x40        /* thick mode size increment          */
+#define THICK_MODE_SZ_DEC          0x40        /* thick mode size decrement          */
+
+#define SKIP_KCRF_FAST_SYNC        0x1         /* fast sync                          */
+#define SKIP_KCRF_SLAVE_INFO_OLRW  0x2         /* olwr enabled                       */
+#define SKIP_LGWR_MODE             0x3         /* lgwr mode not parallel             */
+#define SKIP_KCRFSPIC_BLKS         0x4         /* kcrfspic.blks empty                */
+#define SKIP_MAX_OUT_LOG_WRI       0x5         /* max outstanding lgwr writes < 2    */
+
+struct alwe_info {
+    uint32_t eval_intvl_us;                    /* klassvp7[0]                        */
+    uint32_t blocks_per_sec;                   /* klassvp7[1]                        */
+    uint64_t epoch_ts_prv;                     /* klassvp7[2]                        */
+    uint64_t normal_writes;                    /* klassvp7[4]                        */
+    uint32_t seqno;                            /* klassvp7[6]                        */
+    uint32_t eval_fraction;                    /* klassvp7[7]                        */
+    int64_t  eval_writes;                      /* klassvp7[8]                        */
+    uint64_t blocks;                           /* klassvp7[10]                       */
+    int64_t  blocks_fraction;                  /* klassvp7[12]                       */
+    uint64_t pic_start;                        /* klassvp7[14]                       */
+    uint64_t ow_blocks;                        /* klassvp7[16]                       */
+    uint64_t tot_blocks;                       /* klassvp7[18]                       */
+    uint64_t tot_time;                         /* klassvp7[20]                       */
+    uint64_t epoch_ts;                         /* klassvp7[22]                       */
+    uint32_t unknown1;                         /* klassvp7[24]                       */
+    uint32_t unknown2;                         /* klassvp7[25]                       */
+    uint32_t unknown3;                         /* klassvp7[26]                       */
+    uint32_t unknown4;                         /* klassvp7[27]                       */
+    uint32_t lfs_factor;                       /* klassvp7[28]                       */
+    int32_t  anomalies;                        /* klassvp7[29]                       */
+    int32_t  ol_writes;                        /* klassvp7[30]                       */
+    int32_t  flags;                            /* klassvp7[31]                       */
+};
+
+struct olrw_info {
+    uint32_t flags;                            /* klassvp8[0]                        */
+    uint32_t write_sz;                         /* klassvp8[1]                        */
+    uint32_t stall_sz;                         /* klassvp8[2]                        */ 
+    uint32_t write_sz_prv;                     /* klassvp8[3]                        */ 
+    uint32_t poke_pct;                         /* klassvp8[4]                        */ 
+    uint32_t tgt_log_write_sz;                 /* klassvp8[5]                        */
+    uint32_t tgt_log_write_tmo;                /* klassvp8[6]                        */
+    uint32_t thin_p1;                          /* klassvp8[7]                        */
+    uint32_t wait_zone_start;                  /* klassvp8[8]                        */
+    uint32_t thin_p2;                          /* klassvp8[9]                        */
+    uint32_t wait_min_sz;                      /* klassvp8[10]                       */
+    uint32_t thin_p3;                          /* klassvp8[11]                       */
+    uint32_t wait_max_sz;                      /* klassvp8[12]                       */
+    uint32_t thin_p4;                          /* klassvp8[13]                       */
+    uint32_t wait_min_tmo_usec;                /* klassvp8[14]                       */
+    uint32_t thin_p5;                          /* klassvp8[15]                       */
+    uint32_t wait_max_tmo_usec;                /* klassvp8[16]                       */
+    uint32_t thick_p1;                         /* klassvp8[17]                       */
+    uint32_t fallback_zone_end;                /* klassvp8[18]                       */
+    uint32_t thick_p2;                         /* klassvp8[19]                       */ 
+    uint32_t overflow_zone_start;              /* klassvp8[20]                       */
+    uint32_t thick_p3;                         /* klassvp8[21]                       */
+    uint32_t thick_min_sz;                     /* klassvp8[22]                       */
+    uint32_t thick_p4;                         /* klassvp8[23]                       */
+    uint32_t thick_max_sz;                     /* klassvp8[24]                       */
+    uint32_t thick_tmo_usec;                   /* klassvp8[25]                       */
+    uint32_t arbiter;                          /* klassvp8[26]                       */
+    uint32_t opt_numgrps;                      /* klassvp8[27]                       */
+    uint32_t opt_grp_sz;                       /* klassvp8[28]                       */
+};
+
+BEGIN
+{
+    if ($# < 1 || $# > 2) {
+        printf("\nUsage: ./kcrfw_defer-write.bt <oracle_sid> [<verbose>?]\n");
+        exit();
+    }
+
+    if (str($2) == "yes" || str($2) == "y" || str($2) == "verbose") {
+        @OPT_VERBOSE = 1;
+    }
+
+    @STR_SKIP[SKIP_KCRF_FAST_SYNC]       = "fast sync active";
+    @STR_SKIP[SKIP_KCRF_SLAVE_INFO_OLRW] = "olrw not enabled";
+    @STR_SKIP[SKIP_LGWR_MODE]            = "lgwr mode not parallel";
+    @STR_SKIP[SKIP_KCRFSPIC_BLKS]        = "kcrfpic: no redo blocks";
+    @STR_SKIP[SKIP_MAX_OUT_LOG_WRI]      = "max out log wries < 2";
+
+    printf("\nTracing ... Hit Ctrl + C to stop.\n\n");
+}
+
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_defer_write
+/ str(uptr(KSPSSIDST)) == str($1) /
+{
+    @in_trace[pid] = 1;
+
+    $alwe = *(struct alwe_info **) uptr(KLASSVP7); 
+    $olrw = *(struct olrw_info **) uptr(KLASSVP8);
+
+    @fast_sync[pid]           = *(uint32 *) uptr(KCRF_FAST_SYNC);
+    @lgwr_mode[pid]           = *(uint32 *) uptr(KCRFWSLV_LGWR_MODE);
+    @kcrf_slave_info[pid]     = *(uint32 *) uptr(KCRF_SLAVE_INFO);
+    @max_out_lw[pid]          = *(uint32 *) uptr(KCRFWSLV_MAX_OUT_LOG_WRI);
+
+    @alwe_flags[pid]          = $alwe->flags;
+    @pic_start[pid]           = $alwe->pic_start;
+
+    @olrw_flags[pid]          = $olrw->flags;
+    @write_sz[pid]            = $olrw->write_sz;
+    @wait_zone_start[pid]     = $olrw->wait_zone_start;
+    @wait_min_tmo_usec[pid]   = $olrw->wait_min_tmo_usec;
+    @wait_max_tmo_usec[pid]   = $olrw->wait_max_tmo_usec;
+    @wait_min_sz[pid]         = $olrw->wait_min_sz;
+    @wait_max_sz[pid]         = $olrw->wait_max_sz;
+    @fallback_zone_end[pid]   = $olrw->fallback_zone_end;
+    @overflow_zone_start[pid] = $olrw->overflow_zone_start;
+    @thick_min_sz[pid]        = $olrw->thick_min_sz;
+    @thick_max_sz[pid]        = $olrw->thick_max_sz;
+    @thick_tmo_usec[pid]      = $olrw->thick_tmo_usec;
+    @arbiter[pid]             = $olrw->arbiter;
+
+    @fsbase[pid]              = uptr(curtask->thread.fsbase);
+    @saddr[pid]               = *(uint64 *) uptr(@fsbase[pid] - KSUSE_TLS_OFF);
+    @stats[pid]               = *(uint64 *) uptr(@saddr[pid] + KSUSE_STATS_OFF);
+    @ol_thin_writes_all[pid]  = *(uint64 *) uptr(@stats[pid] + STA_REDO_THIN_OL_ALL * 8);
+    @ol_thin_writes_sz[pid]   = *(uint64 *) uptr(@stats[pid] + STA_REDO_THIN_OL_SZ * 8);
+    @ol_thick_writes_all[pid] = *(uint64 *) uptr(@stats[pid] + STA_REDO_THICK_OL_ALL * 8);
+    @ol_thick_writes_sz[pid]  = *(uint64 *) uptr(@stats[pid] + STA_REDO_THICK_OL_SZ * 8);
+
+    printf("***** %s", strftime("%Y-%m-%d %H:%M:%S.%f\n", nsecs));
+
+    printf("%ld %s -> kcrfw_defer_write\n", pid, comm);
+    printf("%ld %s    fast_sync = %u\n", pid, comm, @fast_sync[pid]);
+    printf("%ld %s    kcrf_slave_info = %u\n", pid, comm, @kcrf_slave_info[pid]);
+    printf("%ld %s    lgwr_mode = %u\n", pid, comm, @lgwr_mode[pid]);
+    printf("%ld %s    max_outstanding_log_writes = %u\n", pid, comm, @max_out_lw[pid]);
+    printf("%ld %s    alwe_flags = %p\n", pid, comm, @alwe_flags[pid]);
+    printf("%ld %s    olrw_flags = %p\n", pid, comm, @olrw_flags[pid]);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_defer_write
+/ @in_trace[pid] / 
+{
+    $alwe = *(struct alwe_info **) uptr(KLASSVP7); 
+    $olrw = *(struct olrw_info **) uptr(KLASSVP8);
+    $lgwr_mode = *(uint32 *) uptr(KCRFWSLV_LGWR_MODE);
+
+    @ol_thin_writes_all_e[pid]  = *(uint64 *) uptr(@stats[pid] + STA_REDO_THIN_OL_ALL * 8);
+    @ol_thin_writes_sz_e[pid]   = *(uint64 *) uptr(@stats[pid] + STA_REDO_THIN_OL_SZ * 8);
+    @ol_thick_writes_all_e[pid] = *(uint64 *) uptr(@stats[pid] + STA_REDO_THICK_OL_ALL * 8);
+    @ol_thick_writes_sz_e[pid]  = *(uint64 *) uptr(@stats[pid] + STA_REDO_THICK_OL_SZ * 8);
+
+    /* Spin wait is enabled when olrw is enabled */
+    $spin_wait = (@olrw_flags[pid] & OLRW_FLG_ENABLED) ? 1 : 0;
+
+    $skip = 0;
+    if (@fast_sync[pid]) {
+        $skip = SKIP_KCRF_FAST_SYNC;
+    }
+
+    if (!$skip && !@lgwr_mode[pid]) {
+        $skip = SKIP_LGWR_MODE;
+    }
+
+    if (!$skip && (@kcrf_slave_info[pid] != KCRF_OLRW_ENABLED)) {
+        $skip = SKIP_KCRF_SLAVE_INFO_OLRW;
+    }
+ 
+    if (!$skip && @max_out_lw[pid] < 2) {
+        $skip = SKIP_MAX_OUT_LOG_WRI;
+    }
+
+    if($skip) {
+        printf("%ld %s    Skip: reason: %s\n", pid, comm, @STR_SKIP[$skip]);
+    }
+
+    /* OLRW thin mode */
+    if (!$skip && !(@olrw_flags[pid] & OLRW_FLG_THICK_MODE)) {
+
+        /* 
+         * Thin mode wait zone:
+         * We are in the wait zone when at least two worker
+         * groups are busy (assuming _lgwr_thin_mode_config
+         * defaults). 
+         * Technically, this is defined as the case when
+         * the wait zone start index (wait_zone_start) is 
+         * within the high busy group range (hi_busy_grp_num) 
+         * and hi_busy_grp_num is not -1 (meaning there are 
+         * no idle worker groups).
+         *
+         * Note: @hi_busy_grp_num[pid] is set in the kcrfw_
+         * slave_queue_hi_busy_group retprobe.
+         */
+        if ((@hi_busy_grp_num[pid] != (-1)) &&
+            (@wait_zone_start[pid] <= @hi_busy_grp_num[pid]))
+        {
+
+            /* Increment arbiter if all lg worker groups are busy */
+            if ((@max_out_lw[pid] - 1) == @hi_busy_grp_num[pid]) {
+                $arbiter = @arbiter[pid] + 1;
+                printf("%ld %s    thin: changed arbiter: old=%u, new=%u\n", pid, comm, (@arbiter[pid]), $arbiter);
+            }
+
+            /* 
+             * Remain in thin mode if the arbiter is below 3 and
+             * adjust the tmo_usec and write_sz values as per the
+             * formulas below (the values vary based on the hi_
+             * busy_grp_num; that is, when hi_busy_grp_num changes
+             * the timeout may increase or decrease accordingly).
+             */
+            if ($arbiter <= 2) {
+
+                if ((@wait_zone_start[pid] + 1) == @max_out_lw[pid]) {
+                    $tmo_inc = 0;
+                    $write_sz_inc = 0;
+                }
+                else {
+                    $tmo_inc = (@wait_max_tmo_usec[pid] - @wait_min_tmo_usec[pid]) / 
+                               ((@max_out_lw[pid] - @wait_zone_start[pid]) - 1);
+
+                    $write_sz_inc = (@wait_max_sz[pid] - @wait_min_sz[pid]) / 
+                                    ((@max_out_lw[pid] - @wait_zone_start[pid]) - 1)
+                } 
+
+                @tmo_usec_adj[pid] = ((@hi_busy_grp_num[pid] - @wait_zone_start[pid]) * 
+                                     $tmo_inc + @wait_min_tmo_usec[pid]);
+
+                @write_sz_adj[pid] = ((@hi_busy_grp_num[pid] - @wait_zone_start[pid]) *
+                                     $write_sz_inc + @wait_min_sz[pid]);
+
+                printf("%ld %s    OLRW: thin: wait zone: hi_busy_grp_num=%d, arbiter=%u, tmo_usec=%u, write_sz=%u\n",
+                       pid, comm, @hi_busy_grp_num[pid], $arbiter, @tmo_usec_adj[pid], @write_sz_adj[pid]);
+            }
+            /* Switch to thick mode if arbiter is greater than 2 */
+            else {
+                @tmo_usec_adj[pid] = @thick_tmo_usec[pid];
+                @write_sz_adj[pid] = ((@wait_max_sz[pid] * @max_out_lw[pid]) + @thick_min_sz[pid]) / 2;
+                @write_sz_adj[pid] = @write_sz_adj[pid] < @thick_min_sz[pid] ? @thick_min_sz[pid] : @write_sz_adj[pid];
+                @write_sz_adj[pid] = @write_sz_adj[pid] > @thick_max_sz[pid] ? @thick_max_sz[pid] : @write_sz_adj[pid];
+
+                /* 
+                 * Note: 
+                 * The oracle alwe trace output always shows
+                 * hi_busy_grp_num as -1 at this stage. 
+                 */
+                printf("%ld %s    OLRW: thin: switching to thick mode: hi_busy_grp_num=%d, arbiter=%u, tmo_usec=%u, write_sz=%u\n",
+                       pid, comm, -1, $arbiter, @thick_tmo_usec[pid], @write_sz_adj[pid]);
+            }
+        }
+        /* 
+         * Thin mode nowait zone:
+         * We are in nowait zone when none of the worker
+         * groups are busy (indicated by hi_busy_group_num
+         * set to -1).
+         * In the no wait zone, the tmo_usec and write_sz 
+         * values are set to 0. If they are 0, lgwr will 
+         * not wait (s. also wait check further down below).
+         */
+        else {
+            @tmo_usec_adj[pid] = 0;
+            @write_sz_adj[pid] = 0;
+
+            printf("%ld %s    OLRW: thin: nowait zone: hi_busy_grp_num=%d, tmo_usec=%u, write_sz=%u\n",
+                   pid, comm, @hi_busy_grp_num[pid], @tmo_usec_adj[pid], @write_sz_adj[pid]);
+        }
+    } /* End thin mode */
+
+    /* OLRW thick mode */
+    if (!$skip && (@olrw_flags[pid] & OLRW_FLG_THICK_MODE)) {
+
+        @tmo_usec_adj[pid] = @thick_tmo_usec[pid]; 
+
+        $write_sz = @write_sz[pid] < @thick_min_sz[pid] ? @thick_min_sz[pid] : @write_sz[pid];
+
+        /* 
+         * Thick mode fallback zone:
+         * Retain the target size and increment the arbiter,
+         * unless the hi_busy_grp_num falls within the over-
+         * flow zone (special case). 
+         * If in the overflow zone, increase the target size; 
+         * if not, increment the arbiter and switch back to 
+         * thin mode if it exceeds the threshold of 2.
+         */
+        if ($write_sz <= @thick_min_sz[pid]) {
+
+            /* Are we in overflow zone? */
+            if ((@hi_busy_grp_num[pid] != -1) && 
+                (@hi_busy_grp_num[pid] > @fallback_zone_end[pid]) &&
+                (@hi_busy_grp_num[pid] >= @overflow_zone_start[pid]))
+            {
+                 @write_sz_adj[pid] = (@thick_max_sz[pid] > $write_sz && @thick_max_sz[pid] <= $write_sz + THICK_MODE_SZ_INC) 
+                                    ?  @thick_max_sz[pid] 
+                                    :  $write_sz + THICK_MODE_SZ_INC;
+            }
+            /* 
+             * Not in overflow zone, so switch back to 
+             * thin mode if the arbiter is greater than 2. 
+             */
+            else {
+                $arbiter = @arbiter[pid] + 1;
+                printf("%ld %s    thick: changed arbiter: old=%u, new=%u\n", pid, comm, (@arbiter[pid]), $arbiter);
+
+                @write_sz_adj[pid] = $write_sz;
+
+                if ($arbiter > 2) {
+                    @tmo_usec_adj[pid] = 0;
+                    @write_sz_adj[pid] = 0;
+ 
+                    printf("%ld %s    OLRW: thick: switching to thin mode: hi_busy_grp_num=%d, arbiter=%u, tmo_usec=%u, write_sz=%u\n",
+                           pid, comm, @hi_busy_grp_num[pid], $arbiter, @thick_tmo_usec[pid], $write_sz);
+                }
+            }
+        }
+        /* Thick mode core zone: decrease the target size */
+        else if ((@hi_busy_grp_num[pid] == -1) || 
+                 (@hi_busy_grp_num[pid] < @overflow_zone_start[pid])) 
+        {
+            @write_sz_adj[pid] = (@thick_min_sz[pid] < $write_sz && @thick_min_sz[pid] >= $write_sz - THICK_MODE_SZ_DEC) 
+                               ?  @thick_min_sz[pid] 
+                               :  $write_sz - THICK_MODE_SZ_DEC;
+        }
+        /* Thick mode overflow zone: increase the target size */
+        else {
+            @write_sz_adj[pid] = (@thick_max_sz[pid] > $write_sz && @thick_max_sz[pid] <= $write_sz + THICK_MODE_SZ_INC) 
+                               ?  @thick_max_sz[pid] 
+                               :  $write_sz + THICK_MODE_SZ_INC;
+        }
+
+        if (@write_sz_adj[pid] > @write_sz[pid]) {
+            $str_adj = "increase";
+        }
+        else if (@write_sz_adj[pid] < @write_sz[pid]) {
+            $str_adj = "decrease";
+        }
+        else {
+            $str_adj = "retain";
+        }
+
+        printf("%ld %s    OLRW: thick: hi_busy_grp_num=%d, arbiter=%u, tmo_usec=%u, %s write_sz=%u\n",
+               pid, comm, @hi_busy_grp_num[pid], $arbiter, @thick_tmo_usec[pid], $str_adj, @write_sz_adj[pid]);
+
+    } /* End of thick mode */
+
+    if (!$skip) {
+
+        /* Check if lgwr needs to wait */
+        if (!($olrw->flags & OLRW_FLG_THICK_MODE)) {
+            /* Thin mode */
+            @wait[pid] = @hi_busy_grp_num[pid] != (-1) ? (@wait_zone_start[pid] <= @hi_busy_grp_num[pid]) : 0;
+        }
+        else {
+            /* Thick mode */
+            @wait[pid] = @hi_busy_grp_num[pid] == (-1) ? (~$olrw->flags & 0x40) >> 6 : 1;
+        }
+
+        $str_mode = ($olrw->flags & OLRW_FLG_THICK_MODE) ? "thick" : "thin";
+
+        if ( @tmo_usec_adj[pid] == 0 || 
+             @write_sz_adj[pid] == 0 || 
+             @wait[pid]         == 0 || 
+             @is_target_sz[pid])
+        {
+            printf("%ld %s    OLRW: %s: no need to wait: tmo_usec=%u, write_sz=%u, isempty=n/a, numwrite=%d, is_target_sz=%s\n",
+                   pid, comm, $str_mode, @tmo_usec_adj[pid], @write_sz_adj[pid], @max_out_lw[pid], (@is_target_sz[pid] ? "T" : "F"));
+        }
+        else {
+            if ($spin_wait) {
+
+                /* Note: 
+                 * is_target_sz2 is set in the second
+                 * kcrfw_target_size retprobe further
+                 * down below.
+                 */
+                $str_target_sz = @is_target_sz2[pid] ? "T" : "F";
+
+                $str_timeout = @tmo_usec_elapsed[pid] >= @tmo_usec_adj[pid] ? "T" : "F";
+
+                printf("%ld %s    OLRW: %s about to spin: tmo_usec=%u, write_sz=%u, hi_busy_grp_num=%d\n",
+                       pid, comm, $str_mode, @tmo_usec_adj[pid], @write_sz_adj[pid], @hi_busy_grp_num[pid]);
+
+                /* Print part 1 ... */
+                printf("%ld %s    OLRW: %s finished spin: tmo_usec=%u, write_sz=%u, tmo_usec_elapsed=%lu ", 
+                       pid, comm, $str_mode, @tmo_usec_adj[pid], @write_sz_adj[pid], @tmo_usec_elapsed[pid]);
+
+                /* ... and part 2 */
+                printf("hi_busy_grp_num=%u, is_target_size=%s, no_wait_grps_are_idle=n/a, timeout=%s\n",
+                       @hi_busy_grp_num[pid], $str_target_sz, $str_timeout);
+
+                printf("%ld %s    spin_cnt=%u\n", pid, comm, @spin_cnt[pid]);
+            }
+            else {
+                printf("%ld %s    OLRW: about to sleep: tmo_usec=%u, write_sz=%u\n",
+                       pid, comm, @tmo_usec_adj[pid], @write_sz_adj[pid]);
+            }
+        }
+
+        printf("%ld %s    %-25s %16s %16s %16s\n", pid, comm, "alwe stats", "begin", "end", "diff");
+        printf("%ld %s    %-25s %16ld %16ld %16ld\n", pid, comm, "  write_sz", @write_sz[pid], $olrw->write_sz, ($olrw->write_sz - @write_sz[pid]));
+        printf("%ld %s    %-25s %16ld %16ld %16ld\n", pid, comm, "  arbiter", @arbiter[pid], $olrw->arbiter, ($olrw->arbiter - @arbiter[pid]));
+
+        printf("%ld %s    %-25s %16p %16p %16s\n", pid, comm, "  olrw_flags", @olrw_flags[pid], $olrw->flags, "n/a");
+        printf("%ld %s    %-25s %8s%u%u%u%u%u%u%u%u %8s%u%u%u%u%u%u%u%u %16s\n", pid, comm, "  olrw flag bits", "",
+                      @olrw_flags[pid] & 0x80 ? 1 : 0,
+                      @olrw_flags[pid] & 0x40 ? 1 : 0,
+                      @olrw_flags[pid] & 0x20 ? 1 : 0,
+                      @olrw_flags[pid] & 0x10 ? 1 : 0,
+                      @olrw_flags[pid] & 0x08 ? 1 : 0,
+                      @olrw_flags[pid] & 0x04 ? 1 : 0,
+                      @olrw_flags[pid] & 0x02 ? 1 : 0,
+                      @olrw_flags[pid] & 0x01 ? 1 : 0,
+                      "",
+                      $olrw->flags     & 0x80 ? 1 : 0,
+                      $olrw->flags     & 0x40 ? 1 : 0,
+                      $olrw->flags     & 0x20 ? 1 : 0,
+                      $olrw->flags     & 0x10 ? 1 : 0,
+                      $olrw->flags     & 0x08 ? 1 : 0,
+                      $olrw->flags     & 0x04 ? 1 : 0,
+                      $olrw->flags     & 0x02 ? 1 : 0,
+                      $olrw->flags     & 0x01 ? 1 : 0,
+                      "n/a");
+    }
+
+    if (!$skip) {
+        printf("%ld %s    %-25s %16s %16s %16s\n", pid, comm, "session stats", "begin", "end", "diff");
+
+        /* Thin mode stat counters */
+        if (!($olrw->flags & OLRW_FLG_THICK_MODE)) {
+            printf("%ld %s    %-25s %16ld %16ld %16ld\n", pid, comm, "  adapt. olw thin (all)", 
+                    @ol_thin_writes_all[pid], @ol_thin_writes_all_e[pid], (@ol_thin_writes_all_e[pid] - @ol_thin_writes_all[pid]));
+
+            printf("%ld %s    %-25s %16ld %16ld %16ld\n", pid, comm, "  adapt. olw thin (size)", 
+                   @ol_thin_writes_sz[pid], @ol_thin_writes_sz_e[pid], (@ol_thin_writes_sz_e[pid] - @ol_thin_writes_sz[pid]));
+        }
+        /* Thick mode stat counters */
+        else {
+            printf("%ld %s    %-25s %16ld %16ld %16ld\n", pid, comm, "  adapt. olw thick (all)", 
+                    @ol_thick_writes_all[pid], @ol_thick_writes_all_e[pid], (@ol_thick_writes_all_e[pid] - @ol_thick_writes_all[pid]));
+
+            printf("%ld %s    %-25s %16ld %16ld %16ld\n", pid, comm, "  adapt. olw thick (size)", 
+                   @ol_thick_writes_sz[pid], @ol_thick_writes_sz_e[pid], (@ol_thick_writes_sz_e[pid] - @ol_thick_writes_sz[pid]));
+        }
+    }
+
+    printf("%ld %s <- kcrfw_defer_write\n\n", pid, comm);
+
+    delete(@in_trace[pid]);
+    delete(@write_sz[pid]);
+    delete(@fast_sync[pid]);
+    delete(@kcrf_slave_info[pid]);
+    delete(@lgwr_mode[pid]);
+    delete(@max_out_lw[pid]);
+    delete(@pic_start[pid]);
+    delete(@alwe_flags[pid]);
+
+    delete(@wait_max_sz[pid]);
+    delete(@wait_max_tmo_usec[pid]);
+    delete(@wait_min_sz[pid]);
+    delete(@wait_min_tmo_usec[pid]);
+    delete(@wait_zone_start[pid]);
+    delete(@fallback_zone_end[pid]);
+    delete(@overflow_zone_start[pid]);
+    delete(@thick_min_sz[pid]);
+    delete(@thick_max_sz[pid]);
+    delete(@thick_tmo_usec[pid]);
+    delete(@olrw_flags[pid]);
+    delete(@hi_busy_grp_num[pid]);
+    delete(@arbiter[pid]);
+
+    delete(@fsbase[pid]);
+    delete(@saddr[pid]);
+    delete(@stats[pid]);
+    delete(@ol_thin_writes_all[pid]);
+    delete(@ol_thin_writes_sz[pid]);
+    delete(@ol_thick_writes_all[pid]);
+    delete(@ol_thick_writes_sz[pid]);
+    delete(@ol_thin_writes_all_e[pid]);
+    delete(@ol_thin_writes_sz_e[pid]);
+    delete(@ol_thick_writes_all_e[pid]);
+    delete(@ol_thick_writes_sz_e[pid]);
+
+    delete(@tmo_usec_adj[pid]);
+    delete(@write_sz_adj[pid]);
+    delete(@wait[pid]);
+
+    delete(@hi_busy_grp_checks[pid]);
+    delete(@is_target_sz[pid]);
+    delete(@is_target_sz2[pid]);
+    delete(@is_target_sz_checks[pid]);
+    delete(@spin_cnt[pid]);
+    delete(@tmo_usec_elapsed[pid]);
+}
+
+/* 
+ * Note: 
+ * Only trace the first call to kcrfw_slave_queue_hi_busy_group
+ * (when it is called on kcrfw_defer_write function entry).
+ */
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_slave_queue_hi_busy_group
+/ @in_trace[pid] && !@hi_busy_grp_checks[pid] /
+{
+    printf("%ld %s    -> kcrfw_slave_queue_hi_busy_group\n", pid, comm);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_slave_queue_hi_busy_group
+/ @in_trace[pid] && !@hi_busy_grp_checks[pid] /
+{
+    @hi_busy_grp_checks[pid]++;
+    @hi_busy_grp_num[pid] = (int32) retval;
+    printf("%ld %s    <- kcrfw_slave_queue_hi_busy_group: 0x%x (%d)\n", pid, comm, retval, retval);
+}
+
+/* 
+ * Note: 
+ * Only trace the first call to kcrfw_is_target_size 
+ * (when it is called to check if lgwr needs to wait).
+ */
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_is_target_size
+/ @in_trace[pid] && !@is_target_sz_checks[pid] /
+{
+    printf("%ld %s    -> kcrfw_is_target_size: sz=%lu\n", pid, comm, arg0);
+}
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_is_target_size
+/ @in_trace[pid] && !@is_target_sz_checks[pid] /
+{
+    @is_target_sz_checks[pid]++;
+    @is_target_sz[pid] = retval ? 1 : 0;
+    printf("%ld %s    <- kcrfw_is_target_size: 0x%x (%d)\n", pid, comm, retval, retval);
+}
+
+/* Note:
+ * 2nd kcrfw_is_target_size retprobe that fires after
+ * the previous uprobe/retprobe has fired at least
+ * once. This is to measure invocations of this 
+ * funtions from the kcrfw_defer_wirte wait loop.
+ */
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kcrfw_is_target_size
+/ @in_trace[pid] && @is_target_sz_checks[pid] /
+{
+    @is_target_sz2[pid] = retval ? 1 : 0;
+}
+
+/* 
+ * Every call to kgslwait_resource_time_waited_usecs 
+ * returns the accumulated wait time in us (for a re-
+ * source?). 
+ * We can make use of this by simply tracing every call 
+ * to this function while in kcrfw_defer_write and log 
+ * the current wait time (retval) in a map on return. 
+ * Similarly, we can use the number of calls to this 
+ * function as a proxy for the number of spins, as this 
+ * function only gets called in the kcrfw_defer_write
+ * wait loops.
+ */
+/*
+uprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kgslwait_resource_time_waited_usecs
+/ @in_trace[pid] /
+{
+    printf("%ld %s -> kgslwait_resource_time_waited_usecs: 0x%lx, 0x%lx, 0x%lx\n", pid, comm, arg0, arg1, arg2);
+}
+*/
+
+uretprobe:/u01/app/oracle/product/19.0.0.0/dbhome_1926_1/bin/oracle:kgslwait_resource_time_waited_usecs
+/ @in_trace[pid] /
+{
+    @spin_cnt[pid]++;
+    @tmo_usec_elapsed[pid] = retval;
+    // printf("%ld %s <- kgslwait_resource_time_waited_usecs: 0x%lx (%lu)\n", pid, comm, retval, retval);
+}
+
+END
+{
+    clear(@in_trace);
+    clear(@fast_sync);
+    clear(@kcrf_slave_info);
+    clear(@lgwr_mode);
+    clear(@max_out_lw);
+    clear(@alwe_flags);
+    clear(@pic_start);
+    clear(@STR_SKIP);
+
+    clear(@write_sz);
+    clear(@wait_max_sz);
+    clear(@wait_max_tmo_usec);
+    clear(@wait_min_sz);
+    clear(@wait_min_tmo_usec);
+    clear(@wait_zone_start);
+    clear(@fallback_zone_end); 
+    clear(@overflow_zone_start);
+    clear(@thick_min_sz);
+    clear(@thick_max_sz);
+    clear(@thick_tmo_usec);
+    clear(@olrw_flags);
+    clear(@hi_busy_grp_num);
+    clear(@arbiter);
+
+    clear(@fsbase);
+    clear(@saddr);
+    clear(@stats);
+    clear(@ol_thin_writes_all);
+    clear(@ol_thin_writes_sz);
+    clear(@ol_thick_writes_all);
+    clear(@ol_thick_writes_sz);
+    clear(@ol_thin_writes_all_e);
+    clear(@ol_thin_writes_sz_e);
+    clear(@ol_thick_writes_all_e);
+    clear(@ol_thick_writes_sz_e);
+
+    clear(@tmo_usec_adj);
+    clear(@write_sz_adj);
+    clear(@wait);
+
+    clear(@hi_busy_grp_checks);
+    clear(@is_target_sz);
+    clear(@is_target_sz2);
+    clear(@is_target_sz_checks);
+    clear(@spin_cnt);
+    clear(@tmo_usec_elapsed);
+}
