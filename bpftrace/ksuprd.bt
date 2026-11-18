@@ -1,0 +1,301 @@
+#!/usr/bin/env -S bpftrace --no-warnings --unsafe
+/*
+ * Purpose:
+ *   Illustrate how Oracle determines the default
+ *   number of processes at instance startup when
+ *   the processes parameter is not set.
+ *
+ * Date:
+ *   Sep-19 2026
+ *
+ * Author:
+ *   Christoph Lutz
+ *
+ * Usage:
+ *   ./ksuprd.bt
+ *
+ * Tested on:
+ *   Oracle 23.26.0 / Exadata 25.2.1
+ *
+ * Notes:
+ *
+ *   Adjust the ORACLE_HOME path for your environment.
+ * 
+ *   Use at your own risk!
+ */
+
+#define KSPPI_PROCESSES  0x38  /* ksppi idx processes */
+#define KSPPI_DYN_PROCS  0x44  /* ksppi idx dyn procs */
+#define KSPPI_CPU_COUNT  0x8f  /* ksppi idx cpu_count */
+
+BEGIN
+{
+    printf("Tracing... Hit ^C to stop.\n\n");
+
+    if (str($1) == "verbose" || str($1) == "v" || str($1) == "yes" || str($1) == "y") {
+        @OPT_VERBOSE = 1;
+    }
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksuprd
+{
+    @in_trace[pid] = 1;
+    printf("%ld %s -> ksuprd: ...\n", pid, comm);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksuprd
+/ @in_trace[pid] /
+{
+    $cpu_count_s = @cpu_count_s[pid];
+    $num_cores   = @num_cores[pid];
+    $num_cpus    = @num_cpus[pid];
+
+    /* Parameter processes not configured */
+    if (!@proc_prm[pid]) {
+
+        /* Parameter _enable_dynamic_processes not configured */
+        if(!@proc_dyn_prm[pid]) {
+            printf("%ld %s    Parameter processes not configured, deriving default value ...\n", pid, comm);
+            printf("%ld %s    Formula:\n", pid, comm);
+            printf("%ld %s      cpu_count_s = %s\n", pid, comm, $cpu_count_s);
+            printf("%ld %s      num_cores   = %u\n", pid, comm, $num_cores);
+            printf("%ld %s      num_cpus    = %u\n", pid, comm, $num_cpus);
+
+            printf("%ld %s      processes   = cpu_count * (cores/cpu) * 80 + 40 =\n", pid, comm); 
+            printf("%ld %s                    %s * (%u/%u) * 80 + 40 = ", pid, comm, $cpu_count_s, $num_cores, $num_cpus);
+
+            /*
+             *  Note: Oracle converts the cpu_count_s
+             * (string value) to a double value 
+             * internally. Since, bpftrace doesn't 
+             * support floating point numbers, we 
+             * can't use the Oracle internal value 
+             * and so just pass the cpu_count_s 
+             * string value to bash using system()  
+             * to do a proper floating point calc-
+             * ulation.
+             */
+            system("echo \"%s * (%d/%d) * 80 + 40\" | bc -l | xargs printf \"%.0f\"", $cpu_count_s, $num_cores, $num_cpus);
+            printf("\n");
+        }
+        /* Processes _enable_dynamic_processes is configured */
+        else {
+            printf("%ld %s    Parameter processes not configured, but _enable_dynamic_processes set ...\n", pid, comm);
+        }
+    } 
+    /* Parameter processes is configured */
+    else {
+        printf("%ld %s    Parameter processes configured, using specified value ...\n", pid, comm);
+    }
+
+    printf("%ld %s    Effective value:\n", pid, comm);
+    printf("%ld %s      processes   = %u\n", pid, comm, *(uint32 *) @lrmpsva[pid]);
+
+    printf("%ld %s <- ksuprd: 0x%lx (%ld)\n", pid, comm, retval, retval);
+
+    /* Set in kspges retprobe */
+    delete(@proc_prm[pid]);
+
+    /* Set in kspgip retprobe */
+    delete(@proc_dyn_prm[pid]);
+
+    /* Set in kspgsp retprobe */
+    delete(@cpu_count_s[pid]);
+
+    /* Set in skgpnumcpu retprobe */
+    delete(@num_cpus[pid]);
+
+    /* Set in skgpcorecpu retprobe */
+    delete(@num_cores[pid]);
+
+    /* Set in lrmpsva retprobe */
+    delete(@lrmpsva[pid]);
+
+    delete(@in_trace[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kspges
+/ @in_trace[pid] && (arg0 == KSPPI_PROCESSES) /
+{
+    @in_kspges[pid] = 1;
+
+    printf("%ld %s -> kspges: %u\n", pid, comm, arg0);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kspges
+/ @in_kspges[pid] /
+{
+    @proc_prm[pid] = (uint32) retval;
+
+    printf("%ld %s <- kspges: 0x%x (%d)\n", pid, comm, retval, retval);
+
+    delete(@in_kspges[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kspgip
+/ @in_trace[pid] && (arg0 == KSPPI_DYN_PROCS) /
+{
+    @in_kspgip[pid] = 1;
+
+    printf("%ld %s -> kspgip: %u, %u\n", pid, comm, arg0, arg1);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kspgip
+/ @in_kspgip[pid] /
+{
+    @proc_dyn_prm[pid] = (uint32) retval;
+
+    printf("%ld %s <- kspgip: 0x%x (%d)\n", pid, comm, retval, retval);
+
+    delete(@in_kspgip[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kspGetInstType
+/ @in_trace[pid] /
+{
+    printf("%ld %s -> kspGetInstType\n", pid, comm);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kspGetInstType
+/ @in_trace[pid] /
+{
+    printf("%ld %s <- kspGetInstType: 0x%x (%u)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksb_cpu_core_count_available_nfy
+/ @in_trace[pid] && !@proc_prm[pid] /
+{
+    @in_core_cnt_nfy[pid] = 1;
+
+    printf("%ld %s -> ksb_cpu_core_count_available_nfy\n", pid, comm);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksb_cpu_core_count_available_nfy
+/ @in_core_cnt_nfy[pid] /
+{
+    printf("%ld %s <- ksb_cpu_core_count_available_nfy: 0x%lx (%ld)\n", pid, comm, retval, retval);
+
+    delete(@in_core_cnt_nfy[pid]);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksbcpu_parse_value
+/ @in_core_cnt_nfy[pid] /
+{
+    printf("%ld %s -> ksbcpu_parse_value\n", pid, comm);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ksbcpu_parse_value
+/ @in_core_cnt_nfy[pid] /
+{
+    printf("%ld %s <- ksbcpu_parse_value: 0x%lx (%ld)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:skgpnumcpu
+/ @in_core_cnt_nfy[pid] /
+{
+    printf("%ld %s -> skgpnumcpu: 0x%lx, 0x%lx\n", pid, comm, arg0, arg1);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:skgpnumcpu
+/ @in_core_cnt_nfy[pid] /
+{
+    @num_cpus[pid] = (uint64) retval;
+    printf("%ld %s <- skgpnumcpu: 0x%lx (%ld)\n", pid, comm, retval, retval);
+}
+
+uprobe:/lib64/libc.so.6:sysconf
+/ @in_core_cnt_nfy[pid] /
+{
+    printf("%ld %s -> sysconf: %u\n", pid, comm, arg0);
+}
+
+uretprobe:/lib64/libc.so.6:sysconf
+/ @in_core_cnt_nfy[pid] /
+{
+    printf("%ld %s <- sysconf: 0x%x (%d)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:skgpcorecpu
+/ @in_core_cnt_nfy[pid] /
+{
+    @in_skgpcorecpu[pid] = 1;
+
+    printf("%ld %s -> skgpcorecpu: 0x%lx, 0x%lx\n", pid, comm, arg0, arg1);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:skgpcorecpu
+/ @in_core_cnt_nfy[pid] /
+{
+    @num_cores[pid] = (uint64) retval;
+
+    printf("%ld %s <- skgpcorecpu: 0x%lx (%ld)\n", pid, comm, retval, retval);
+
+    delete(@in_skgpcorecpu[pid]);
+}
+
+/* Only execute this probe when called from skgpcorecpu and if not called yet */
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ssOswFopen
+/ @in_skgpcorecpu[pid] && !@ssOswFopen[pid] /
+{
+    printf("%ld %s -> ssOswFopen: %s, \"%s\"\n", pid, comm, str(uptr(arg0)), str(uptr(arg1)));
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:ssOswFopen
+/ @in_skgpcorecpu[pid] && !@ssOswFopen[pid] /
+{
+    @ssOswFopen[pid]++;
+
+    printf("%ld %s <- ssOswFopen: 0x%x (%d)\n", pid, comm, retval, retval);
+}
+
+uprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kspgsp
+/ @in_core_cnt_nfy[pid] && (arg0 == KSPPI_CPU_COUNT) /
+{
+    @in_kspgsp[pid] = 1;
+    @p3[pid] = (uint64) arg2;
+
+    printf("%ld %s -> kspgsp: %u, ...\n", pid, comm, arg0);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:kspgsp
+/ @in_kspgsp[pid] /
+{
+    @cpu_count_s[pid] = str(uptr(*(uint64 *) @p3[pid]));
+
+    printf("%ld %s <- kspgsp: 0x%x (%d)\n", pid, comm, retval, retval);
+
+    delete(@in_kspgsp[pid]);
+}
+
+uretprobe:/u01/app/oracle/product/26.0.0.0/dbhome_260_1/bin/oracle:lrmpsva
+/ @in_trace[pid] /
+{
+   /*
+    * Note: the parameter value is stored
+    * at a memory address allocated by lrmpsva.
+    * We store the address in a map here, so
+    * that we can show the value it stores in
+    * the kpdbmpdb_depcb retprobe.
+    * The second parameter to lrmpsva (arg1)
+    * seems to define the size of the allocation,
+    * e.g. 4 or 8 bytes, but we're not concerned
+    * about this here.
+    */
+    @lrmpsva[pid] = (uint64) retval;
+}
+
+END 
+{
+    clear(@OPT_VERBOSE);
+    clear(@cpu_count_s);
+    clear(@in_trace);
+    clear(@in_kspges);
+    clear(@in_core_cnt_nfy);
+    clear(@in_skgpcorecpu);
+    clear(@p3);
+    clear(@proc_prm);
+    clear(@proc_dyn_prm);
+    clear(@num_cpus);
+    clear(@num_cores);
+    clear(@ssOswFopen);
+}
